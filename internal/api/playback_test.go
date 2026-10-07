@@ -30,6 +30,7 @@ type fakeStreams struct {
 	lastPath  string
 	lastMode  streaming.PlaybackMode
 	lastStart float64
+	stopped   []string
 	startErr  error
 	servedOut string
 }
@@ -60,6 +61,10 @@ func (f *fakeStreams) Session(id string) (*streaming.Session, bool) {
 		return nil, false
 	}
 	return &streaming.Session{ID: id}, true
+}
+
+func (f *fakeStreams) Stop(id string) {
+	f.stopped = append(f.stopped, id)
 }
 
 func (f *fakeStreams) ServeFile(w http.ResponseWriter, _ *http.Request, sessionID, name string) {
@@ -483,6 +488,43 @@ func TestPlayback_StartSeconds(t *testing.T) {
 		}
 		if streams.started != 0 {
 			t.Error("a session was started for a start offset past the end of the media")
+		}
+	})
+}
+
+// TestStopStream covers the route a client uses to end a transcode at once.
+// Without it, changing quality or closing the player leaves ffmpeg encoding
+// frames nobody will watch until the idle reaper happens to notice.
+func TestStopStream(t *testing.T) {
+	t.Parallel()
+
+	t.Run("an existing session is stopped", func(t *testing.T) {
+		t.Parallel()
+
+		streams := &fakeStreams{}
+		env := newTestEnv(t, withStreams(streams))
+
+		recorder := env.do(t, http.MethodDelete, "/api/streams/fake-session", "")
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204 (body %s)", recorder.Code, recorder.Body.String())
+		}
+		if len(streams.stopped) != 1 || streams.stopped[0] != "fake-session" {
+			t.Errorf("stopped = %v, want [fake-session]", streams.stopped)
+		}
+	})
+
+	t.Run("an unknown session is a 404", func(t *testing.T) {
+		t.Parallel()
+
+		streams := &fakeStreams{}
+		env := newTestEnv(t, withStreams(streams))
+
+		recorder := env.do(t, http.MethodDelete, "/api/streams/not-a-session", "")
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404 (body %s)", recorder.Code, recorder.Body.String())
+		}
+		if len(streams.stopped) != 0 {
+			t.Errorf("stopped = %v, want nothing stopped", streams.stopped)
 		}
 	})
 }

@@ -987,6 +987,78 @@ img {
   margin-top: 0;
 }
 
+/* Audio and quality, sitting to the right of the transport. */
+.player-audio,
+.player-quality {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.volume {
+  width: 84px;
+  min-width: 60px;
+  height: 22px;
+  margin: 0;
+  accent-color: var(--brutal-accent);
+  cursor: pointer;
+}
+
+.volume:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.player-volume-level,
+.player-quality-note {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);
+  white-space: nowrap;
+  min-width: 3.2em;
+}
+
+.player-quality-note {
+  color: var(--brutal-accent-2);
+  min-width: 0;
+}
+
+/* Native select, restyled into the brutalist language — with explicit colours
+   so it does not fall back to the OS palette in dark mode. */
+.quality-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 5px 22px 5px 9px;
+  background: var(--brutal-surface);
+  color: var(--brutal-ink);
+  border: var(--brutal-line) solid var(--brutal-border-quiet);
+  border-radius: var(--brutal-radius);
+  box-shadow: var(--shadow-hard-sm);
+  font-family: var(--font-mono);
+  font-size: var(--step-xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: border-color 100ms ease, box-shadow 100ms ease;
+}
+
+.quality-select:hover:not(:disabled) {
+  border-color: var(--brutal-accent);
+  box-shadow: 4px 4px 0 var(--brutal-accent);
+}
+
+.quality-select:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+.quality-select option {
+  background: var(--brutal-surface);
+  color: var(--brutal-ink);
+}
+
 .player-chrome-title {
   font-weight: 800;
   font-size: var(--step-md);

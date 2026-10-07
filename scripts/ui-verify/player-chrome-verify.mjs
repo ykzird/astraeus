@@ -101,8 +101,24 @@ const SNAPSHOT = `(() => {
   const fullscreenPath = fullscreenButton ? fullscreenButton.querySelector("path") : null;
   const fullscreenIconD = fullscreenPath ? (fullscreenPath.getAttribute("d") || "").slice(0, 60) : null;
 
+  const mute = document.getElementById("player-mute");
+  const volume = document.getElementById("player-volume");
+  const quality = document.getElementById("player-quality");
+  const timeText = document.getElementById("player-time");
   return {
     hasVideo: !!video,
+    muted: video ? video.muted : null,
+    volume: video ? video.volume : null,
+    muteFound: !!mute,
+    mutePressed: mute ? mute.getAttribute("aria-pressed") : null,
+    muteLabel: mute ? (mute.getAttribute("aria-label") || "") : null,
+    volumeFound: !!volume,
+    volumeValue: volume ? Number(volume.value) : null,
+    qualityFound: !!quality,
+    qualityOptions: quality ? Array.from(quality.options).map((o) => ({ value: o.value, label: o.textContent.trim() })) : [],
+    qualityValue: quality ? quality.value : null,
+    timeText: timeText ? timeText.textContent.trim() : null,
+    storedAudio: (() => { try { return localStorage.getItem("astraeus.audio"); } catch (e) { return null; } })(),
     iconAudit: iconAudit,
     fullscreenIconD: fullscreenIconD,
     paused: video ? video.paused : null,
@@ -173,7 +189,23 @@ async function main() {
   }
 
   console.log("Pressing Play and waiting for the first frame...");
-  await cdp.click('[data-action="play"]');
+  // Start playback the way a person does: a real mouse click on the hero
+  // button, with the pointer left exactly where it clicked. That is what put
+  // the overlay under a stationary cursor and kept the bar on screen forever.
+  const heroBox = await cdp.eval(`(() => {
+    const b = document.querySelector('#canvas-content [data-action="play"]') ||
+              document.querySelector('[data-action="play"]');
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+  })()`);
+  if (heroBox) {
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await cdp.send("Input.dispatchMouseEvent", { type, x: heroBox.x, y: heroBox.y, button: "left", clickCount: 1 });
+    }
+  } else {
+    await cdp.click('[data-action="play"]');
+  }
   let state = null;
   const started = Date.now();
   while (Date.now() - started < TIMEOUT_S * 1000) {
@@ -186,6 +218,22 @@ async function main() {
     process.exit(1);
   }
   record("playback started", true, "currentTime=" + state.currentTime.toFixed(2));
+
+  /* ---- the reported bug: the bar must hide even if the mouse never moves ---- */
+  // Deliberately no pointer movement here.
+  await sleep(6000);
+  const untouched = await cdp.eval(SNAPSHOT);
+  record("the bar hides without the pointer ever moving (the reported bug)",
+    untouched.controlsVisible === false,
+    "still visible after 6s with the pointer untouched; overlayClass=" +
+      JSON.stringify(untouched.overlayClass));
+  if (untouched.controlsVisible === false) {
+    // Bring it back for the checks that follow.
+    const c = await cdp.eval(`(() => { const el = document.getElementById("player-layer"); const r = el.getBoundingClientRect(); return { x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2) }; })()`);
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1 });
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: c.x, y: c.y });
+    await sleep(600);
+  }
 
   /* ---- the chrome lives inside the player ---- */
   record("the player has exactly one play control",
@@ -274,6 +322,116 @@ async function main() {
   if (afterKey.paused) {
     await pressKey(cdp, " ", "Space", 32, " ");
     await sleep(600);
+  }
+
+  /* ---- audio controls ---- */
+  record("a mute control exists", state.muteFound === true,
+    "aria-pressed=" + JSON.stringify(state.mutePressed) + " label=" + JSON.stringify(state.muteLabel));
+
+  const beforeMute = await cdp.eval(SNAPSHOT);
+  await cdp.click("#player-mute");
+  await sleep(500);
+  const afterMute = await cdp.eval(SNAPSHOT);
+  record("the mute control mutes and unmutes the element",
+    afterMute.muted !== beforeMute.muted,
+    "muted " + beforeMute.muted + " -> " + afterMute.muted);
+  if (afterMute.muted) {
+    await cdp.click("#player-mute");
+    await sleep(400);
+  }
+
+  record("a volume control exists", state.volumeFound === true, "value=" + state.volumeValue);
+  const volumeSet = await cdp.eval(`(() => {
+    const v = document.getElementById("player-volume");
+    if (!v) return null;
+    v.value = "0.35";
+    v.dispatchEvent(new Event("input", { bubbles: true }));
+    v.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  })()`);
+  await sleep(500);
+  const afterVolume = await cdp.eval(SNAPSHOT);
+  record("the volume control drives the element and is remembered",
+    volumeSet === true && Math.abs((afterVolume.volume || 0) - 0.35) < 0.06 &&
+      typeof afterVolume.storedAudio === "string" && afterVolume.storedAudio.length > 0,
+    "video.volume=" + afterVolume.volume + " stored=" + JSON.stringify(afterVolume.storedAudio));
+
+  /* ---- quality control, and the resume it depends on ---- */
+  if (state.qualityFound) {
+    record("the quality menu offers more than one choice",
+      state.qualityOptions.length >= 2,
+      "options=" + JSON.stringify(state.qualityOptions.map((o) => o.label)));
+
+    // The readout is "current / total", so only the first half is the position.
+    const parseClock = (text) => {
+      if (!text) return null;
+      const current = String(text).split("/")[0].trim();
+      const parts = current.split(":").map((n) => Number(n));
+      if (!parts.length || parts.some((n) => Number.isNaN(n))) return null;
+      return parts.reduce((acc, n) => acc * 60 + n, 0);
+    };
+
+    // Seek well past anything the transcoder has produced. That has to
+    // re-negotiate at the offset rather than clamp, which is the same machinery
+    // a quality switch depends on.
+    const SEEK_TARGET = 600;
+    note("seeking to " + SEEK_TARGET + "s, past everything produced so far");
+    await cdp.eval(`(() => {
+      const seek = document.getElementById("player-seek");
+      if (!seek) return null;
+      seek.value = String(${SEEK_TARGET});
+      seek.dispatchEvent(new Event("input", { bubbles: true }));
+      seek.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()`);
+
+    let afterSeek = null;
+    const seekDeadline = Date.now() + 90000;
+    while (Date.now() < seekDeadline) {
+      afterSeek = await cdp.eval(SNAPSHOT);
+      if (afterSeek.readyState >= 2 && afterSeek.currentTime > 0.2) break;
+      await sleep(1500);
+    }
+    const seeked = parseClock(afterSeek ? afterSeek.timeText : null);
+    record("seeking past produced content resumes near the target",
+      seeked !== null && Math.abs(seeked - SEEK_TARGET) < 120,
+      "clock " + (afterSeek ? afterSeek.timeText : "?") + " (target " + SEEK_TARGET + "s)");
+
+    const before = seeked;
+
+    // Choose a different rendition, preferring the lowest to make the switch cheap.
+    const target = state.qualityOptions
+      .filter((o) => o.value && o.value !== state.qualityValue)
+      .sort((a, b) => Number(a.value) - Number(b.value))[0];
+    note("switching quality to " + (target ? target.label : "(none available)"));
+
+    if (target) {
+      await cdp.eval(`(() => {
+        const q = document.getElementById("player-quality");
+        q.value = ${JSON.stringify(target.value)};
+        q.dispatchEvent(new Event("change", { bubbles: true }));
+      })()`);
+
+      // A switch re-negotiates, so allow time for the new transcode to start.
+      let resumed = null;
+      const deadline = Date.now() + 90000;
+      while (Date.now() < deadline) {
+        resumed = await cdp.eval(SNAPSHOT);
+        if (resumed.readyState >= 2 && resumed.currentTime > 0.2) break;
+        await sleep(1500);
+      }
+      record("quality switching keeps playing",
+        resumed !== null && resumed.readyState >= 2 && resumed.currentTime > 0.2,
+        resumed ? "currentTime=" + (resumed.currentTime || 0).toFixed(2) + " readyState=" + resumed.readyState : "no state");
+
+      const after = parseClock(resumed ? resumed.timeText : null);
+      // The whole point of start_seconds: the viewer does not go back to the title card.
+      record("quality switching resumes near where the viewer was, not at zero",
+        before !== null && after !== null && after > 20 && Math.abs(after - before) < 120,
+        "clock " + (afterSeek ? afterSeek.timeText : "?") + " -> " + (resumed ? resumed.timeText : "?"));
+    }
+  } else {
+    note("no quality menu found (expected only for a transcoded session)");
   }
 
   /* ---- auto-hide while playing ---- */

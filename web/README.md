@@ -86,16 +86,19 @@ selected unless the server marks a track as default.
 ### Player chrome
 
 Every control — play/pause, restart, skip, stop, the seek bar with its time
-readout, the subtitle menu and the fullscreen toggle — is overlaid on the
-picture inside `#player-layer`, not parked in the context sidebar. The bar is a
-glass scrim so it stays legible over bright and dark frames, and it fades out
-after a few idle seconds while playing. It never hides on a paused frame, while
-the user's focus is inside it, or while the pointer is resting on it — and while
-hidden it is `inert`, so it can never become an invisible focus trap.
+readout, the subtitle menu, the volume slider and mute toggle, the quality menu
+and the fullscreen toggle — is overlaid on the picture inside `#player-layer`,
+not parked in the context sidebar. The bar is a glass scrim so it stays legible
+over bright and dark frames, and it fades out after a few idle seconds while
+playing. It never hides on a paused frame, while a **keyboard** focus is inside
+it, or while the pointer is resting on the control strips themselves — a pointer
+merely over the picture does not pin it, which is what used to leave the bar
+stuck open after clicking Play. While hidden it is `inert`, so it can never
+become an invisible focus trap.
 
 The context sidebar keeps only what is *informational*: the mode badge, the
 server's `decision.reasons`, media facts (container, codecs, resolution,
-duration) and the status note.
+duration, the height actually being decoded) and the status note.
 
 Fullscreen is requested on the player **container**, not the bare `<video>`, so
 the overlay travels with the picture. The button is driven from
@@ -106,10 +109,37 @@ Keyboard shortcuts, active while the player has focus (or nothing else does):
 when a modifier is held or focus is in a text field, and a focused button still
 gets its own Space. Esc is the browser's.
 
-**Seeking a segmented stream is bounded by the transcoder.** The server
-produces segments in order while playback runs, so the seek bar is bound to the
-live `seekable` range and grows as more is produced — seeking forward is limited
-to what already exists, and the UI says so.
+### Timeline, seeking and quality
+
+A playback session can start anywhere in the source: the request carries
+`start_seconds`, and the server echoes it back. **Media time 0 is source time
+`sessionStart`**, so the clock, the seek bar and the quality switch all speak in
+source seconds while only the `<video>` element deals in media time. The landing
+point is keyframe-aligned, so the true start can sit a second or two earlier
+than requested — the mapping is close, not exact.
+
+The seek bar spans the **whole film**, not just what has been produced:
+
+* inside the produced window it is an ordinary seek;
+* beyond it, the player re-negotiates with `start_seconds` at the target and
+  adopts the new session, which is what makes seeking into the unproduced part
+  of a film work at all. `#player-window` shows how far ahead the current
+  session can jump without re-buffering.
+
+The quality menu offers **Auto** plus the ladder heights below the source
+(1080/720/480/360), and re-negotiates with that `max_height` at the current
+source time. It is withheld entirely for `direct_play`, where nothing is
+re-encoded. A switch means a short re-buffer: the control shows a busy state and
+the player says "Resuming…" rather than looking broken.
+
+**Switching stops the old session on the server.** hls.js is destroyed and the
+element released, and then `DELETE /api/streams/{session_id}` cancels the old
+ffmpeg, waits for it to exit and removes its directory — so a quality change
+does not leave a second transcoder running. The same call is made on Stop, on
+leaving the entity, and on `pagehide`/`beforeunload` (as a `fetch` with
+`keepalive`, since a beacon cannot issue DELETE). Failures are swallowed: a
+session the idle reaper already collected answers 404, which is not worth
+surfacing, and the reaper remains the backstop.
 
 *Watch out:* `video.canPlayType('application/vnd.apple.mpegurl')` returns
 `"maybe"` in current Chromium (measured on 152) even though Blink cannot demux
@@ -136,3 +166,18 @@ explanation instead of a silently dead player.
   the player down so a stream never outlives the view that started it.
 * Subtitle appearance is not configurable (no font/size/background controls);
   the browser's own rendering is used as-is.
+* Source time is `media time + sessionStart`, and `sessionStart` is the offset
+  that was *requested*. The transcoder lands on the preceding keyframe, so a
+  resumed stream can really begin a second or two earlier; the clock is a close
+  approximation across a seek, not an exact one.
+* The quality ladder is fixed at 1080/720/480/360 and offers only heights
+  strictly below the source. There is no bitrate-only or codec choice.
+* Switching quality or seeking past the produced window re-buffers. The old
+  session is stopped explicitly, so the gap is the new transcode starting up,
+  not the previous one being cleaned up.
+* The bar's hover latch follows real pointer movement only, and is cleared both
+  when a move lands on the picture and when the pointer leaves the player — or
+  the window — altogether. The cost is that it cannot know a pointer is resting
+  on it until the user moves, and touch devices never latch at all: the bar
+  simply times out after an interaction. While pinned by focus or hover it
+  re-checks on a timer, so it cannot end up stuck open.

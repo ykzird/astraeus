@@ -38,6 +38,10 @@ type StreamManager interface {
 	// seek beyond produced content, or a quality change, needs.
 	StartAt(ctx context.Context, entityID, objectPath string, decision streaming.Decision, startSeconds float64) (*streaming.Session, error)
 	Session(id string) (*streaming.Session, bool)
+	// Stop ends a session and removes its output. Without this a client that
+	// changes quality leaves the old transcode running until the idle reaper
+	// notices, which means two encoders for the same viewer.
+	Stop(id string)
 	ServeFile(w http.ResponseWriter, r *http.Request, sessionID, name string)
 }
 
@@ -151,6 +155,7 @@ func (s *Server) Handler() http.Handler {
 	// Metrics live outside /api because that is the convention scrapers expect.
 	mux.Handle("GET /metrics", s.metrics.Handler())
 	mux.HandleFunc("GET /hls/{session}/{file}", s.handleStreamFile)
+	mux.HandleFunc("DELETE /api/streams/{id}", s.handleStopStream)
 
 	// A single catch-all. Registering "GET /" alongside "/api/" would be an
 	// ambiguous pattern set, so the root handler dispatches instead.
@@ -571,6 +576,30 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	response.SessionID = session.ID
 	response.URL = "/hls/" + session.ID + "/playlist.m3u8"
 	writeJSON(w, http.StatusOK, response)
+}
+
+// handleStopStream ends a streaming session immediately.
+//
+// Sessions are otherwise only reaped once idle, so without this a quality
+// change, or the viewer closing the player, leaves an ffmpeg process encoding
+// frames nobody will watch until the reaper catches up.
+func (s *Server) handleStopStream(w http.ResponseWriter, r *http.Request) {
+	if s.streams == nil {
+		writeError(w, http.StatusServiceUnavailable, "streaming_unavailable",
+			"segmented streaming is not configured on this server")
+		return
+	}
+
+	id := r.PathValue("id")
+	if _, ok := s.streams.Session(id); !ok {
+		writeError(w, http.StatusNotFound, "session_not_found",
+			"no streaming session with that id is running")
+		return
+	}
+
+	s.streams.Stop(id)
+	s.logger.InfoContext(r.Context(), "streaming session stopped by request", "session_id", id)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleObjectFile serves the original media file, which is what direct play

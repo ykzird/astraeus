@@ -299,14 +299,14 @@
     enrich: function () {
       return apiFetch("metadata/enrich", { method: "POST" });
     },
-    /* Negotiates delivery for one entity. The body is an optional client
-       capability description; omitted, the server assumes its browser profile.
-       We intentionally omit it and then check what we can actually play, so
-       the server's decision is always visible to the user. */
-    playback: function (entityId, capability) {
+    /* Negotiates delivery for one entity. The body is a client capability
+       manifest plus where in the source to begin; see playbackRequestBody().
+       A body replaces the server's browser defaults outright rather than
+       merging with them, so every request carries the full profile. */
+    playback: function (entityId, body) {
       return apiFetch("entities/" + encodeURIComponent(entityId) + "/playback", {
         method: "POST",
-        body: capability,
+        body: body,
       });
     },
   };
@@ -325,6 +325,9 @@
     busyAction: null,
     /* Everything the player knows. Replaced wholesale by resetPlayback(). */
     playback: emptyPlayback(),
+    /* Volume and mute outlive any one session, so they live here rather than
+       on `playback`, and are mirrored into localStorage. */
+    audio: loadAudioPreference(),
     filterIncomplete: false,
     loadToken: 0,
     retry: null,
@@ -339,6 +342,124 @@
              ready     — a source is attached; paused/playing tracked live
              segmented — server chose HLS and nothing here can demux it
              error     — negotiation, network or decode failure */
+  /* Volume and mute, remembered across sessions and reloads. Kept outside the
+     per-session playback state because a new film must not reset the volume. */
+  const AUDIO_STORAGE_KEY = "astraeus.audio";
+
+  function loadAudioPreference() {
+    const fallback = { volume: 1, muted: false };
+    try {
+      const raw = window.localStorage.getItem(AUDIO_STORAGE_KEY);
+      if (!raw) return fallback;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return fallback;
+      let volume = Number(parsed.volume);
+      if (!isFinite(volume) || volume < 0 || volume > 1) volume = 1;
+      return { volume: volume, muted: parsed.muted === true };
+    } catch (error) {
+      /* Private mode, a full quota or corrupt JSON: default quietly. */
+      return fallback;
+    }
+  }
+
+  function saveAudioPreference() {
+    try {
+      window.localStorage.setItem(AUDIO_STORAGE_KEY, JSON.stringify(state.audio));
+    } catch (error) {
+      /* Playback still works; we just forget the choice next time. */
+    }
+  }
+
+  function audioIsMuted() {
+    return state.audio.muted || state.audio.volume === 0;
+  }
+
+  /**
+   * Push the stored preference onto the element. Called on every start, so a
+   * rebuilt <video> can never come up at full volume, and once at init so the
+   * element is primed before anything plays.
+   */
+  function applyAudioPreference() {
+    const muted = audioIsMuted();
+    try {
+      /* Only assign on a real change: this runs on every timeupdate, and a
+         redundant write can fire volumechange each time. */
+      if (playerVideo.volume !== state.audio.volume) playerVideo.volume = state.audio.volume;
+      if (playerVideo.muted !== muted) playerVideo.muted = muted;
+    } catch (error) {
+      /* Some engines refuse volume before metadata; the next start retries. */
+    }
+    const slider = document.getElementById("player-volume");
+    if (slider) {
+      slider.value = String(state.audio.volume);
+      slider.setAttribute("aria-valuetext", muted ? "muted" : Math.round(state.audio.volume * 100) + "%");
+    }
+    const mute = document.getElementById("player-mute");
+    if (mute) {
+      const label = muted ? "Unmute" : "Mute";
+      mute.setAttribute("aria-pressed", muted ? "true" : "false");
+      mute.setAttribute("aria-label", label);
+      mute.title = label;
+      setIconButton(mute, muted ? "volume-mute" : "volume", null);
+    }
+    const level = document.getElementById("player-volume-level");
+    if (level) {
+      level.textContent = muted ? "Muted" : Math.round(state.audio.volume * 100) + "%";
+    }
+  }
+
+  function setVolume(value) {
+    const next = Number(value);
+    if (!isFinite(next)) return;
+    state.audio.volume = Math.min(1, Math.max(0, next));
+    /* Raising the level is an unmute; leaving it at zero is a mute. */
+    if (state.audio.volume > 0) state.audio.muted = false;
+    applyAudioPreference();
+  }
+
+  function toggleMute() {
+    const wasMuted = audioIsMuted();
+    state.audio.muted = !wasMuted;
+    /* Unmuting from silence has to restore an audible level. */
+    if (!state.audio.muted && state.audio.volume === 0) state.audio.volume = 1;
+    applyAudioPreference();
+    saveAudioPreference();
+  }
+
+  /* ── 4. State ────────────────────────────────────────────────────────── */
+
+  /**
+   * The body of a playback request.
+   *
+   * The endpoint decodes this straight into the client's capability manifest:
+   * sending a body replaces the server's browser defaults entirely, it does not
+   * merge with them, and Validate() rejects a manifest with no codec lists. So
+   * the full profile goes on every request, mirroring
+   * streaming.BrowserCapability() on the server.
+   *
+   * `maxHeight` is omitted for Auto, leaving the browser's real horizontal
+   * ceiling (1920) as the only limit — the server derives the height from the
+   * source's aspect ratio.
+   */
+  function playbackRequestBody(startSeconds, maxHeight) {
+    const body = {
+      containers: ["mp4", "webm", "hls"],
+      video_codecs: ["h264", "vp9", "av1"],
+      audio_codecs: ["aac", "opus", "mp3", "vorbis"],
+      max_width: 1920,
+      max_bitrate_kbps: 120000,
+      max_bit_depth: 8,
+      max_audio_channels: 2,
+      supports_hls: true,
+      subtitles: true,
+    };
+    if (typeof maxHeight === "number" && maxHeight > 0) body.max_height = maxHeight;
+    if (typeof startSeconds === "number" && isFinite(startSeconds) && startSeconds > 0) {
+      body.start_seconds = startSeconds;
+    }
+    return body;
+  }
+
   function emptyPlayback() {
     return {
       entityId: null,
@@ -365,6 +486,18 @@
       segmentedCause: null,
       seekableStart: 0,
       seekableEnd: 0,
+      /* Where this session begins in the source. Media time 0 is source time
+         `sessionStart`, so source time = media time + sessionStart. The server
+         also echoes it back; this is that value. */
+      sessionStart: 0,
+      /* The whole film's duration, from media_info — not what this session has
+         produced. The seek bar spans this. */
+      sourceDuration: 0,
+      /* Requested height cap (null = Auto) and what the server actually chose. */
+      maxHeight: null,
+      targetHeight: 0,
+      /* True while a quality change or an out-of-range seek is re-negotiating. */
+      qualityBusy: false,
       /* Subtitle tracks as the server described them. Only an entry carrying a
          `url` can actually be delivered; the rest are image-based. */
       subtitles: [],
@@ -1397,6 +1530,10 @@
                 text: (growing ? "produced " : "") + formatClock(duration),
               })
             : null,
+          /* What the server actually chose, when it is not the source height. */
+          pb.targetHeight > 0 && pb.targetHeight !== sourceHeightOf(pb)
+            ? el("span", { class: "chip", text: "playing at " + pb.targetHeight + "p" })
+            : null,
         ])
       );
     }
@@ -1775,7 +1912,22 @@
 
   const CONTROLS_HIDE_DELAY_MS = 3200;
   let controlsHideTimer = null;
-  let pointerInsideOverlay = false;
+  /* True only while the pointer rests on a *control strip*. The overlay fills
+     the whole player, so tracking the overlay itself pinned the bar open
+     whenever the player appeared under a stationary pointer — which is exactly
+     what happens when the hero Play button is clicked. */
+  let pointerInsideControls = false;
+  /* How the user last touched the page. `:focus-visible` alone is not enough:
+     Chrome matches it on a range input even after a mouse drag, which would pin
+     the bar for the rest of the session. */
+  let keyboardFocusActive = false;
+  const supportsFocusVisible =
+    typeof CSS !== "undefined" && typeof CSS.supports === "function" && CSS.supports("selector(:focus-visible)");
+
+  function controlStripOf(node) {
+    if (!(node instanceof Element)) return null;
+    return node.closest(".player-bar, .player-titlebar");
+  }
 
   /* ── hls.js: lazily loaded, single instance, always torn down ────────── */
 
@@ -1863,6 +2015,37 @@
     const info = pb && pb.mediaInfo;
     const value = info ? Number(info.duration_seconds) : NaN;
     return isFinite(value) && value > 0 ? value : 0;
+  }
+
+  /* ── Source timeline ─────────────────────────────────────────────────────
+     A session started at `start_seconds: S` has media time 0 at source time S.
+     Everything the viewer sees — the clock, the seek bar, the quality switch —
+     is therefore expressed in source time, and only the element talks in media
+     time. */
+
+  /** The whole film's length, in source seconds. */
+  function sourceDurationOf(pb) {
+    if (pb.sourceDuration > 0) return pb.sourceDuration;
+    const fromInfo = mediaInfoDuration(pb);
+    if (fromInfo > 0) return fromInfo;
+    /* Direct play has no media_info gap to fill: the element knows the file. */
+    if (!pb.segmented && isFinite(playerVideo.duration) && playerVideo.duration > 0) {
+      return playerVideo.duration + pb.sessionStart;
+    }
+    return 0;
+  }
+
+  /** Where the playhead is, in source seconds. */
+  function currentSourceTime(pb) {
+    const media = isFinite(playerVideo.currentTime) ? playerVideo.currentTime : 0;
+    return pb.sessionStart + media;
+  }
+
+  /** The part of the source this session can already reach without re-buffering. */
+  function producedWindow(pb) {
+    const bounds = seekableBounds();
+    if (!(bounds.end > 0)) return null;
+    return { from: pb.sessionStart + bounds.start, to: pb.sessionStart + bounds.end };
   }
 
   function handleHlsError(HlsCtor, instance, recovery, data) {
@@ -2087,38 +2270,42 @@
     const mediaLive = !!pb.url;
 
     const bounds = mediaLive ? seekableBounds() : { start: 0, end: 0 };
-    const seekable = mediaLive && bounds.end > 0;
     pb.seekableStart = bounds.start;
     pb.seekableEnd = bounds.end;
-    if (seekable) pb.duration = bounds.end;
+
+    /* Everything below is source time: the seek bar spans the whole film even
+       when this session has only produced part of it. */
+    const total = mediaLive ? sourceDurationOf(pb) : 0;
+    const now = mediaLive ? currentSourceTime(pb) : 0;
+    const produced = mediaLive ? producedWindow(pb) : null;
 
     if (seek) {
-      seek.disabled = !seekable;
-      if (seekable) {
-        seek.min = String(bounds.start);
-        seek.max = String(bounds.end);
+      seek.disabled = !mediaLive || pb.qualityBusy === true || !(total > 0);
+      if (total > 0) {
+        seek.min = "0";
+        seek.max = String(total);
         /* Never fight the user while the range itself has focus. */
         if (document.activeElement !== seek) {
-          seek.value = String(Math.min(Math.max(pb.currentTime, bounds.start), bounds.end));
+          seek.value = String(Math.min(Math.max(now, 0), total));
         }
       }
       seek.setAttribute(
         "aria-valuetext",
-        seekable
-          ? formatClock(pb.currentTime) + " of " + formatClock(bounds.end)
-          : "unavailable"
+        total > 0 ? formatClock(now) + " of " + formatClock(total) : "unavailable"
       );
     }
     if (time) {
-      time.textContent = seekable
-        ? formatClock(pb.currentTime) + " / " + formatClock(bounds.end)
-        : "0:00 / 0:00";
+      time.textContent =
+        total > 0
+          ? formatClock(now) + " / " + formatClock(total)
+          : "0:00 / 0:00";
     }
     if (window_) {
-      /* Only meaningful for a growing (segmented) stream. */
-      if (isEventPlaylistPlayback() && seekable) {
+      /* How far ahead this session can jump without re-buffering. Only worth
+         saying when that is less than the whole film. */
+      if (mediaLive && produced && total > 0 && produced.to < total - 1) {
         window_.hidden = false;
-        window_.textContent = "Growing · seekable to " + formatClock(bounds.end);
+        window_.textContent = "Produced to " + formatClock(produced.to);
       } else {
         window_.hidden = true;
         window_.textContent = "";
@@ -2129,6 +2316,8 @@
       setIconButton(toggle, playing ? "pause" : "play", playing ? "Pause" : "Play");
       toggle.setAttribute("aria-label", playing ? "Pause" : "Play");
     }
+    applyAudioPreference();
+    syncQualityControl();
     /* Fullscreen can be left with Esc or a swipe, so the button is driven from
        the document state rather than from what we last asked for. */
     const fullscreen = document.getElementById("player-fullscreen");
@@ -2255,11 +2444,13 @@
 
   function stopPlayback(options) {
     const opts = options || {};
+    /* Capture the session before the reset, so its transcoder can be stopped. */
+    const sessionId = state.playback.sessionId;
     /* Reset state BEFORE tearing the element down: with url already null, the
        teardown's own `error`/`emptied` events cannot be mistaken for a real
        playback failure. */
     state.playback = emptyPlayback();
-    closePlayerLayer();
+    closePlayerLayer(sessionId);
     resetActiveMedia();
     if (!opts.silent) render();
   }
@@ -2403,12 +2594,104 @@
         skip,
         stop,
         el("span", { class: "player-spacer" }),
+        buildPlayerQualityControl(pb, live),
+        buildPlayerVolumeControls(pb, live),
         fullscreen,
       ]),
       buildPlayerSubtitleRow(pb, live),
     ];
 
     return el("div", { class: "player-bar" }, rows);
+  }
+
+  /**
+   * Quality menu. Meaningless for direct play — nothing is re-encoded — so it
+   * is withheld there rather than offered as a control that does nothing.
+   */
+  function buildPlayerQualityControl(pb, live) {
+    if (pb.mode === "direct_play") return null;
+    const options = qualityOptions(pb);
+    if (!options.length) return null;
+
+    const busy = pb.qualityBusy === true;
+    const select = el("select", {
+      class: "quality-select",
+      id: "player-quality",
+      "data-focus-key": "quality",
+      "aria-label": "Playback quality",
+      "aria-busy": busy ? "true" : "false",
+      disabled: !live || busy,
+      title: busy ? "Switching quality…" : "Playback quality",
+    });
+    select.append(el("option", { value: "auto", text: "Auto" }));
+    for (const height of options) {
+      select.append(el("option", { value: String(height), text: height + "p" }));
+    }
+    const wanted = pb.maxHeight ? String(pb.maxHeight) : "auto";
+    select.value = options.some(function (height) { return String(height) === wanted; })
+      ? wanted
+      : "auto";
+
+    return el("span", { class: "player-quality" }, [
+      select,
+      /* A switch means a short re-buffer; say so instead of looking broken. */
+      busy ? el("span", { class: "player-quality-note", text: "Switching…" }) : null,
+    ]);
+  }
+
+  function buildPlayerVolumeControls(pb, live) {
+    const muted = audioIsMuted();
+    const mute = el("button", {
+      type: "button",
+      class: "btn btn-quiet",
+      id: "player-mute",
+      "data-action": "toggle-mute",
+      "data-focus-key": "mute",
+      "aria-pressed": muted ? "true" : "false",
+      "aria-label": muted ? "Unmute" : "Mute",
+      title: muted ? "Unmute" : "Mute",
+    });
+    setIconButton(mute, muted ? "volume-mute" : "volume", null);
+
+    const slider = el("input", {
+      type: "range",
+      class: "volume",
+      id: "player-volume",
+      "data-focus-key": "volume",
+      min: "0",
+      max: "1",
+      step: "0.01",
+      value: String(state.audio.volume),
+      disabled: !live,
+      "aria-label": "Volume",
+      "aria-valuetext": muted ? "muted" : Math.round(state.audio.volume * 100) + "%",
+    });
+
+    const level = el("span", {
+      class: "player-volume-level",
+      id: "player-volume-level",
+      text: muted ? "Muted" : Math.round(state.audio.volume * 100) + "%",
+    });
+
+    return el("span", { class: "player-audio" }, [mute, slider, level]);
+  }
+
+  /** Keep the quality menu in step with the session without rebuilding it. */
+  function syncQualityControl() {
+    const pb = state.playback;
+    const select = document.getElementById("player-quality");
+    if (!select) return;
+    const busy = pb.qualityBusy === true;
+    select.disabled = busy || !playbackIsLive(pb);
+    select.setAttribute("aria-busy", busy ? "true" : "false");
+    select.title = busy ? "Switching quality…" : "Playback quality";
+    const wanted = pb.maxHeight ? String(pb.maxHeight) : "auto";
+    if (select.value !== wanted) {
+      const has = Array.prototype.some.call(select.options, function (option) {
+        return option.value === wanted;
+      });
+      if (has) select.value = wanted;
+    }
   }
 
   function buildPlayerSubtitleRow(pb, live) {
@@ -2419,9 +2702,22 @@
 
   /* ── Overlay visibility ──────────────────────────────────────────────── */
 
+  /**
+   * True only when the bar should be pinned open by focus: the focus has to be
+   * inside the controls *and* have arrived by keyboard. A mouse click leaves
+   * focus on the button it pressed, and treating that as "the user is here"
+   * would keep the chrome up until they clicked elsewhere.
+   */
   function controlsHaveFocus() {
     const active = document.activeElement;
-    return !!active && playerOverlay.contains(active);
+    if (!active || !playerOverlay.contains(active)) return false;
+    if (!keyboardFocusActive) return false;
+    if (!supportsFocusVisible) return true;
+    try {
+      return active.matches(":focus-visible");
+    } catch (error) {
+      return true;
+    }
   }
 
   function applyControlsVisibility() {
@@ -2462,12 +2758,17 @@
   function maybeHideControls() {
     const pb = state.playback;
     if (!pb || !pb.url) return;
-    /* Three things keep the bar on screen: a paused frame, the user's focus
-       resting inside it, and the pointer hovering over it. */
-    if (playerVideo.paused || playerVideo.ended) return;
-    if (controlsHaveFocus()) return;
-    if (pointerInsideOverlay) return;
     if (pb.controlsVisible === false) return;
+    /* Never fade away on a paused frame; the play event re-arms on resume. */
+    if (playerVideo.paused || playerVideo.ended) return;
+    /* Focus or hover keeps the chrome up. Both can end without an event we are
+       guaranteed to see — a window that loses focus, a pointer that leaves the
+       window, a trackpad click that moves nothing — so re-check shortly rather
+       than giving up. Whatever pinned the bar cannot pin it forever. */
+    if (controlsHaveFocus() || pointerInsideControls) {
+      scheduleControlsHide();
+      return;
+    }
     pb.controlsVisible = false;
     applyControlsVisibility();
   }
@@ -2480,16 +2781,48 @@
   }
 
   /**
-   * Put the player surface away: no timer left running, no fullscreen left
-   * owned, no chrome left behind for the next session to inherit.
+   * Tell the server to stop a streaming session. `DELETE /api/streams/{id}`
+   * cancels ffmpeg, waits for it to exit and removes the session directory, so
+   * a switch or a teardown does not leave a transcoder running.
+   *
+   * Fire and forget: a session the idle reaper already collected answers 404,
+   * which is not worth surfacing, and a failure still leaves the reaper as a
+   * backstop. `keepalive` lets the request outlive the document.
    */
-  function closePlayerLayer() {
+  function releaseStreamSession(sessionId, keepalive) {
+    if (typeof sessionId !== "string" || !sessionId) return;
+    try {
+      const attempt = fetch(API_BASE + "streams/" + encodeURIComponent(sessionId), {
+        method: "DELETE",
+        keepalive: keepalive === true,
+      });
+      if (attempt && typeof attempt.catch === "function") {
+        attempt.catch(function () {
+          /* Already stopped, or offline: the reaper is the backstop. */
+        });
+      }
+    } catch (error) {
+      /* Teardown must never throw because of a best-effort cleanup. */
+    }
+  }
+
+  /**
+   * Put the player surface away: no timer left running, no fullscreen left
+   * owned, no chrome left behind for the next session to inherit, and no
+   * server-side transcoder left running.
+   */
+  function closePlayerLayer(explicitSessionId) {
     clearControlsHideTimer();
-    pointerInsideOverlay = false;
+    pointerInsideControls = false;
     exitFullscreenIfOwned();
     clear(playerOverlay);
     dom.playerLayer.hidden = true;
     setUnderlayInert(false);
+    /* Whoever caused the teardown, the server must stop producing. */
+    releaseStreamSession(
+      typeof explicitSessionId === "string" ? explicitSessionId : state.playback.sessionId,
+      false
+    );
   }
 
   /* ── Fullscreen ──────────────────────────────────────────────────────── */
@@ -2619,7 +2952,7 @@
     }
   }
 
-  function startVideo(url, entity) {
+  function startVideo(url, entity, autoplay) {
     const pb = state.playback;
     pb.status = "ready";
     pb.url = url;
@@ -2636,13 +2969,18 @@
         /* load() is best-effort; the error handler reports real failures. */
       }
     }
+    /* Volume travels with the player, not the session, so re-apply it here as
+       well as at init: a rebuilt element must never come up at full volume. */
+    applyAudioPreference();
     /* Attach tracks after load(): the load algorithm resets text tracks. The
        overlay is built afterwards so its subtitle selector already reflects
        the default selection. */
     applySubtitleTracks();
     renderPlayerChrome();
-    const attempt = playerVideo.play();
-    if (attempt && typeof attempt.catch === "function") attempt.catch(onPlayRejection);
+    if (autoplay !== false) {
+      const attempt = playerVideo.play();
+      if (attempt && typeof attempt.catch === "function") attempt.catch(onPlayRejection);
+    }
     showPlayerControls();
     render();
     focusTransportIfFocusWasLost();
@@ -2653,7 +2991,7 @@
    * other browser goes through the vendored hls.js over Media Source
    * Extensions. If neither is available we fall back to the honest message.
    */
-  async function startSegmented(url, entity) {
+  async function startSegmented(url, entity, autoplay) {
     const pb = state.playback;
     pb.segmented = true;
     pb.status = "loading";
@@ -2662,6 +3000,7 @@
     pb.controlsVisible = true;
     dom.playerLayer.hidden = false;
     setUnderlayInert(true);
+    applyAudioPreference();
     renderPlayerChrome();
     showPlayerControls();
     render();
@@ -2695,20 +3034,17 @@
     });
     instance.on(HlsCtor.Events.MANIFEST_PARSED, function () {
       if (instance !== hlsInstance) return;
-      const attempt = playerVideo.play();
-      if (attempt && typeof attempt.catch === "function") attempt.catch(onPlayRejection);
-      syncTransport();
-    });
-    /* The playlist grows as ffmpeg produces segments; keep the seek bar's
-       window current as each fragment lands. */
-    instance.on(HlsCtor.Events.FRAG_BUFFERED, syncTransport);
-    instance.on(HlsCtor.Events.LEVEL_UPDATED, syncTransport);
-    instance.on(HlsCtor.Events.LEVEL_LOADED, function (event, data) {
-      if (data && data.details && isFinite(data.details.totalduration) && data.details.totalduration > 0) {
-        state.playback.duration = data.details.totalduration;
+      if (autoplay !== false) {
+        const attempt = playerVideo.play();
+        if (attempt && typeof attempt.catch === "function") attempt.catch(onPlayRejection);
       }
       syncTransport();
     });
+    /* The playlist grows as ffmpeg produces segments; keep the seek bar's
+       produced window current as each fragment lands. */
+    instance.on(HlsCtor.Events.FRAG_BUFFERED, syncTransport);
+    instance.on(HlsCtor.Events.LEVEL_UPDATED, syncTransport);
+    instance.on(HlsCtor.Events.LEVEL_LOADED, syncTransport);
 
     pb.engine = "hls.js";
     pb.status = "ready";
@@ -2771,47 +3107,16 @@
     render();
 
     try {
-      /* No capability body: the server assumes its browser profile, and we
-         then check what this engine can actually demux. */
-      const result = await api.playback(entity.id);
+      /* Auto quality, from the top: the body still carries the full capability
+         manifest, because a body replaces the server's browser defaults. */
+      const result = await api.playback(entity.id, playbackRequestBody(0, null));
       /* Navigation or Stop may have replaced the session during the request. */
       if (state.playback !== session) return;
-      if (!result || typeof result.url !== "string" || !result.url) {
-        throw new ApiError("The playback endpoint returned no stream URL.", {
-          code: "unexpected_shape",
-        });
-      }
-      const decision = result.decision && typeof result.decision === "object" ? result.decision : null;
-      session.entityId = entity.id;
-      session.title = displayTitle(entity);
-      session.mode = result.mode || (decision ? decision.mode : null) || "unknown";
-      session.url = result.url;
-      session.sessionId = result.session_id || null;
-      session.objectId = result.object_id || null;
-      session.decision = decision;
-      session.mediaInfo = result.media_info && typeof result.media_info === "object" ? result.media_info : null;
-      session.subtitles = Array.isArray(result.subtitles) ? result.subtitles : [];
-      session.reasons = decision && Array.isArray(decision.reasons) ? decision.reasons : [];
-      session.error = null;
-
+      applyPlaybackResult(session, result, entity, { startSeconds: 0, maxHeight: null });
+      startSessionMedia(session, entity, true);
       if (session.mode === "direct_play") {
-        session.segmented = false;
-        startVideo(session.url, entity);
         setActionStatus("Playing “" + session.title + "” directly from the original file.", "ok");
-        return;
       }
-
-      if (nativeHlsSupport()) {
-        session.segmented = true;
-        startVideo(session.url, entity);
-        session.engine = "native-hls";
-        return;
-      }
-
-      /* Chromium/Firefox: hand the playlist to the vendored hls.js over MSE.
-         If that is impossible, startSegmented() falls back to the honest
-         message rather than attaching a source that cannot work. */
-      await startSegmented(session.url, entity);
     } catch (error) {
       if (state.playback !== session) return;
       session.status = "error";
@@ -2862,68 +3167,242 @@
 
   function restartPlayback() {
     if (!state.playback.url) return;
-    try {
-      playerVideo.currentTime = state.playback.seekableStart || 0;
-    } catch (error) {
-      /* Some sources are not seekable; the seek bar reflects that. */
-    }
+    seekToSource(0);
   }
 
   function skipForward() {
     seekBy(10);
   }
 
-  /** Relative seek, clamped to what the source can actually deliver. */
+  /** Relative seek, in source time. */
   function seekBy(delta) {
-    if (!state.playback.url) return;
-    const bounds = seekableBounds();
-    let target = playerVideo.currentTime + delta;
-    if (target < bounds.start) target = bounds.start;
-    /* Forward seeking cannot outrun the transcoder. */
-    if (bounds.end > 0 && target > bounds.end) target = bounds.end;
-    if (target === playerVideo.currentTime) return;
+    const pb = state.playback;
+    if (!pb.url) return;
+    seekToSource(currentSourceTime(pb) + delta);
+  }
+
+  /** Move the playhead within the current session (media time). */
+  function setMediaTime(mediaSeconds) {
+    const pb = state.playback;
     try {
-      playerVideo.currentTime = target;
+      playerVideo.currentTime = mediaSeconds;
     } catch (error) {
       /* Ignore: the source may not be seekable. */
     }
-    state.playback.currentTime = target;
+    pb.currentTime = mediaSeconds;
     syncTransport();
   }
 
-  function seekTo(value) {
-    if (!state.playback.url) return;
-    const seconds = Number(value);
-    if (!isFinite(seconds)) return;
-    const bounds = seekableBounds();
-    let target = seconds;
-    let clamped = false;
-    if (target < bounds.start) {
-      target = bounds.start;
-      clamped = true;
+  /**
+   * Live feedback while the range is being dragged. Only moves the playhead if
+   * this session can already reach the target; anything further is left to the
+   * `change` handler, so scrubbing cannot fire a re-negotiation per pixel.
+   */
+  function seekPreview(sourceSeconds) {
+    const pb = state.playback;
+    if (!pb.url || !isFinite(sourceSeconds)) return;
+    const produced = producedWindow(pb);
+    const reachable =
+      !pb.segmented || (produced && sourceSeconds >= produced.from && sourceSeconds <= produced.to);
+    if (reachable) setMediaTime(sourceSeconds - pb.sessionStart);
+  }
+
+  /**
+   * Seek to a point in the film, given in source seconds.
+   *
+   * Inside what this session has produced, it is an ordinary seek. Beyond that
+   * — a segmented stream has only produced up to some point — the session is
+   * re-negotiated from there, so seeking into the unproduced part of a film
+   * works instead of silently clamping.
+   */
+  function seekToSource(target) {
+    const pb = state.playback;
+    if (!pb.url) return;
+    let wanted = Number(target);
+    if (!isFinite(wanted)) return;
+    const total = sourceDurationOf(pb);
+    if (wanted < 0) wanted = 0;
+    /* The server rejects a start at or past the end of the media. */
+    if (total > 0 && wanted > total - 0.5) wanted = Math.max(0, total - 0.5);
+
+    const produced = producedWindow(pb);
+    const reachable =
+      !pb.segmented || (produced && wanted >= produced.from && wanted <= produced.to);
+
+    if (reachable) {
+      setMediaTime(wanted - pb.sessionStart);
+      return wanted;
     }
-    if (bounds.end > 0 && target > bounds.end) {
-      target = bounds.end;
-      clamped = true;
+    resumeSession({ startSeconds: wanted });
+    return wanted;
+  }
+
+  /* ── Quality and re-negotiation ──────────────────────────────────────── */
+
+  /* Heights below the source that are worth offering. 1080 is the ceiling
+     because a browser cannot be relied on to decode more in software. */
+  const QUALITY_LADDER = [1080, 720, 480, 360];
+
+  function sourceHeightOf(pb) {
+    const info = pb && pb.mediaInfo;
+    const value = info ? Number(info.height) : NaN;
+    return isFinite(value) && value > 0 ? value : 0;
+  }
+
+  function qualityOptions(pb) {
+    const sourceHeight = sourceHeightOf(pb);
+    if (!sourceHeight) return [];
+    return QUALITY_LADDER.filter(function (height) {
+      return height < sourceHeight;
+    });
+  }
+
+  /** What the viewer is actually watching: the server's choice, or the source. */
+  function effectiveHeight(pb) {
+    const decision = pb && pb.decision;
+    const target = decision ? Number(decision.target_height) : NaN;
+    if (isFinite(target) && target > 0) return target;
+    return sourceHeightOf(pb);
+  }
+
+  /**
+   * Adopt a negotiation response onto an existing session. Shared by the first
+   * negotiation and by every re-negotiation.
+   */
+  function applyPlaybackResult(pb, result, entity, requested) {
+    if (!result || typeof result.url !== "string" || !result.url) {
+      throw new ApiError("The playback endpoint returned no stream URL.", {
+        code: "unexpected_shape",
+      });
     }
+    const decision = result.decision && typeof result.decision === "object" ? result.decision : null;
+    const echoed = Number(result.start_seconds);
+    pb.entityId = entity.id;
+    pb.title = displayTitle(entity);
+    pb.mode = result.mode || (decision ? decision.mode : null) || "unknown";
+    pb.url = result.url;
+    pb.sessionId = result.session_id || null;
+    pb.objectId = result.object_id || null;
+    pb.decision = decision;
+    pb.mediaInfo = result.media_info && typeof result.media_info === "object" ? result.media_info : null;
+    pb.subtitles = Array.isArray(result.subtitles) ? result.subtitles : [];
+    pb.reasons = decision && Array.isArray(decision.reasons) ? decision.reasons : [];
+    pb.error = null;
+    /* Where this stream begins in the source. The server echoes the requested
+       offset (omitted at zero); the true start is keyframe-aligned and may sit
+       a second or two earlier, so this mapping is close, not exact. */
+    pb.sessionStart =
+      isFinite(echoed) && echoed >= 0
+        ? echoed
+        : requested && isFinite(requested.startSeconds)
+        ? requested.startSeconds
+        : 0;
+    pb.sourceDuration = mediaInfoDuration(pb);
+    pb.targetHeight = decision && Number(decision.target_height) > 0 ? Number(decision.target_height) : 0;
+    pb.maxHeight = requested && "maxHeight" in requested ? requested.maxHeight : null;
+    pb.currentTime = 0;
+    pb.duration = 0;
+    return pb;
+  }
+
+  /**
+   * Point the element (or hls.js) at a freshly negotiated session.
+   * `resumePlaying` keeps a paused viewer paused across a quality change.
+   */
+  function startSessionMedia(pb, entity, resumePlaying) {
+    if (pb.mode === "direct_play") {
+      pb.segmented = false;
+      startVideo(pb.url, entity, resumePlaying !== false);
+      return;
+    }
+    if (nativeHlsSupport()) {
+      /* startVideo() marks the session as unsegmented, so set this after it:
+         a native HLS playlist still grows as ffmpeg produces it. */
+      startVideo(pb.url, entity, resumePlaying !== false);
+      pb.segmented = true;
+      pb.engine = "native-hls";
+      return;
+    }
+    startSegmented(pb.url, entity, resumePlaying !== false);
+  }
+
+  /**
+   * Re-negotiate the current entity — a seek past what has been produced, or a
+   * quality change — and carry on from where the viewer is.
+   *
+   * The old session is torn down before the request goes out. There is no
+   * server endpoint to stop a streaming session, so dropping it is what tells
+   * the server nobody is watching: it stops being asked for segments and the
+   * reaper collects its ffmpeg once the session TTL expires.
+   */
+  async function resumeSession(options) {
+    const opts = options || {};
+    const detail = state.detail;
+    if (!detail) return;
+    const pb = state.playback;
+    if (!pb.url || pb.qualityBusy) return;
+    const entity = detail.entity;
+
+    /* Capture the position before the teardown resets the element. */
+    const startSeconds =
+      typeof opts.startSeconds === "number" && isFinite(opts.startSeconds)
+        ? Math.max(0, opts.startSeconds)
+        : currentSourceTime(pb);
+    const maxHeight = "maxHeight" in opts ? opts.maxHeight : pb.maxHeight;
+    const wasPlaying = !playerVideo.paused && !playerVideo.ended;
+    const previousMaxHeight = pb.maxHeight;
+    const previousSessionId = pb.sessionId;
+
+    pb.qualityBusy = true;
+    pb.status = "loading";
+    /* Adopt the target offset now so the clock holds its place across the
+       re-buffer instead of snapping back to where this session began. The
+       response echo confirms it a moment later. */
+    pb.sessionStart = startSeconds;
+    resetActiveMedia();
+    /* Nothing is reading the old stream any more, so stop its transcoder now
+       rather than leaving a second ffmpeg running until the idle reaper
+       notices. The new session gets a fresh id from the response. */
+    releaseStreamSession(previousSessionId, false);
+    renderPlayerChrome();
+    render();
+
     try {
-      playerVideo.currentTime = target;
-    } catch (error) {
-      /* Ignore: the source may not be seekable. */
-    }
-    state.playback.currentTime = target;
-    syncTransport();
-    /* Be explicit when the request was limited by the produced window rather
-       than silently doing nothing. */
-    if (clamped && isEventPlaylistPlayback()) {
-      setActionStatus(
-        "Seeking is limited to the part the server has produced so far (" +
-          formatClock(bounds.end) +
-          "). It grows as transcoding continues.",
-        null
+      const result = await api.playback(entity.id, playbackRequestBody(startSeconds, maxHeight));
+      /* Navigation or Stop may have replaced the session meanwhile. */
+      if (state.playback !== pb) return;
+      applyPlaybackResult(pb, result, entity, { startSeconds: startSeconds, maxHeight: maxHeight });
+      pb.qualityBusy = false;
+      startSessionMedia(pb, entity, wasPlaying);
+      toast(
+        "Resuming “" + pb.title + "” at " + formatClock(pb.sessionStart) +
+          (maxHeight ? " · " + maxHeight + "p" : "") + "…",
+        "info"
       );
+    } catch (error) {
+      if (state.playback !== pb) return;
+      /* A failed switch is not fatal: say so and keep the session selectable. */
+      pb.qualityBusy = false;
+      pb.maxHeight = previousMaxHeight;
+      pb.status = "error";
+      pb.error = playbackErrorMessage(entity, error);
+      setActionStatus(pb.error, "error");
+      showError(pb.error, function () {
+        doPlay();
+      });
+      toast(pb.error, "error");
+      renderPlayerChrome();
+      render();
     }
-    return target;
+  }
+
+  function startQualitySwitch(value) {
+    const pb = state.playback;
+    if (!pb.url || pb.qualityBusy) return;
+    const maxHeight = value === "auto" ? null : Number(value);
+    if (maxHeight !== null && !(maxHeight > 0)) return;
+    if (maxHeight === pb.maxHeight) return;
+    resumeSession({ startSeconds: currentSourceTime(pb), maxHeight: maxHeight });
   }
 
   /* ── 10. Data loading ────────────────────────────────────────────────── */
@@ -3206,6 +3685,8 @@
       stopPlayback();
     } else if (action === "fullscreen") {
       toggleFullscreen();
+    } else if (action === "toggle-mute") {
+      toggleMute();
     } else if (action === "toggle-filter") {
       state.filterIncomplete = !state.filterIncomplete;
       render();
@@ -3217,13 +3698,18 @@
     }
   });
 
-  /* The seek bar is rebuilt on every render, so its events are delegated. */
+  /* The seek bar, volume slider and quality menu are rebuilt on every render,
+     so their events are delegated. */
   document.addEventListener("input", function (event) {
     const target = event.target;
-    if (target instanceof Element && target.id === "player-seek") {
+    if (!(target instanceof Element)) return;
+    if (target.id === "player-seek") {
       state.playback.seeking = true;
-      seekTo(target.value);
+      /* Live scrub feedback only; the re-negotiation waits for `change`. */
+      seekPreview(Number(target.value));
+      return;
     }
+    if (target.id === "player-volume") setVolume(target.value);
   });
 
   document.addEventListener("change", function (event) {
@@ -3231,7 +3717,15 @@
     if (!(target instanceof Element)) return;
     if (target.id === "player-seek") {
       state.playback.seeking = false;
-      seekTo(target.value);
+      seekToSource(Number(target.value));
+      return;
+    }
+    if (target.id === "player-volume") {
+      saveAudioPreference();
+      return;
+    }
+    if (target.id === "player-quality") {
+      startQualitySwitch(target.value);
       return;
     }
     /* Covers mouse selection and arrow-key traversal of the radio group. */
@@ -3261,25 +3755,80 @@
 
   window.addEventListener("hashchange", onHashChange);
 
+  /* Last chance to stop a transcoder: the tab is going away, so the request
+     has to outlive the document. A beacon cannot issue DELETE, so this is a
+     keepalive fetch instead. */
+  function releaseSessionOnUnload() {
+    const pb = state.playback;
+    if (!pb || !pb.url) return;
+    releaseStreamSession(pb.sessionId, true);
+  }
+
+  window.addEventListener("pagehide", releaseSessionOnUnload);
+  window.addEventListener("beforeunload", releaseSessionOnUnload);
+
   /* ── Player overlay: interaction, auto-hide, fullscreen, shortcuts ───── */
 
-  dom.playerLayer.addEventListener("mousemove", function () {
-    showPlayerControls();
-  });
+  /* The hover latch is driven by real pointer *movement*, never by
+     `mouseover`/`mouseout`. Those fire on a DOM mutation under a stationary
+     cursor, and the player appears exactly under the pointer that just clicked
+     the hero Play button — whose button sits in the same band as the control
+     bar — so they latched "the user is on the bar" with nobody touching
+     anything. `mousemove` only fires when the pointer actually moves.
 
-  dom.playerLayer.addEventListener("pointerdown", function () {
-    showPlayerControls();
-  });
-
-  playerOverlay.addEventListener("mouseenter", function () {
-    pointerInsideOverlay = true;
-    showPlayerControls();
-  });
-
-  playerOverlay.addEventListener("mouseleave", function () {
-    pointerInsideOverlay = false;
+     It is owned by `document`, not by the player, because the pointer leaving
+     the player entirely — to the sidebar, another column, off the window — must
+     clear the latch too. A layer-only listener never hears about that move, so
+     the latch kept its last value and the bar stayed up for good. */
+  document.addEventListener("mousemove", function (event) {
+    if (dom.playerLayer.contains(event.target)) {
+      pointerInsideControls = !!controlStripOf(event.target);
+      showPlayerControls();
+      return;
+    }
+    /* Only react to leaving the controls when the latch is actually set, so
+       ordinary movement around the rest of the app does not keep re-arming a
+       hide timer that has nothing to do. */
+    if (!pointerInsideControls) return;
+    pointerInsideControls = false;
     scheduleControlsHide();
   });
+
+  /* Leaving the window stops `mousemove` reaching us at all, so the root
+     element's `mouseleave` closes that case too. `<html>` persists for the life
+     of the page, so unlike the old `mouseenter` this cannot fire spuriously
+     when a DOM mutation appears under a stationary pointer. */
+  document.documentElement.addEventListener("mouseleave", function () {
+    if (!pointerInsideControls) return;
+    pointerInsideControls = false;
+    scheduleControlsHide();
+  });
+
+  dom.playerLayer.addEventListener("pointerdown", function (event) {
+    /* A real press, so it is safe to latch — but only a mouse hovers. A touch
+       tap must not leave the bar latched open with no matching departure. */
+    if (event.pointerType !== "touch") {
+      pointerInsideControls = !!controlStripOf(event.target);
+    }
+    showPlayerControls();
+  });
+
+  /* Capture phase, so the modality is recorded before any handler acts on it,
+     whatever the event's target turns out to be. */
+  document.addEventListener(
+    "keydown",
+    function () {
+      keyboardFocusActive = true;
+    },
+    true
+  );
+  document.addEventListener(
+    "pointerdown",
+    function () {
+      keyboardFocusActive = false;
+    },
+    true
+  );
 
   /* Keyboard focus anywhere in the player keeps the chrome on screen. */
   dom.playerLayer.addEventListener("focusin", function () {
@@ -3304,6 +3853,8 @@
      remaining global listeners; nothing else needs bootstrapping. */
   function init() {
     render();
+    /* Prime the element with the remembered volume before anything plays. */
+    applyAudioPreference();
     checkHealth();
     boot();
   }

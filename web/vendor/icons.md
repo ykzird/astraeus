@@ -17,9 +17,9 @@ node scripts/fetch-icons.mjs
 | Author | Boxicons |
 | Licence | **MIT** — <https://github.com/box-icons/boxicons/blob/main/LICENSE> |
 | Licence text | [`bx.LICENSE`](bx.LICENSE) |
-| Registry size | 4,070 bytes |
-| SHA-256 | `66709131f0c66174e82690a67264ed229d6a894595bfc65a6db564e6709394b8` |
-| Source URL | `https://api.iconify.design/bx.json?icons=play,pause,refresh,fast-forward,stop,fullscreen,exit-fullscreen,chevron-right` |
+| Registry size | 5,234 bytes |
+| SHA-256 | `f9380e2b0ecc1ae9f03b17c74e8e2c2deacb6a74af4672c3a093a2ed71a444f7` |
+| Source URL | `https://api.iconify.design/bx.json?icons=play,pause,refresh,fast-forward,stop,volume-full,volume-mute,fullscreen,exit-fullscreen,chevron-right` |
 
 The project-wide summary lives in [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md).
 
@@ -31,7 +31,7 @@ development time and bakes the path data into `web/icons.js`, so the served page
 makes no external request, works offline, and cannot break when someone else's
 CDN has a bad day.
 
-Only the eight icons actually used are stored, which keeps the file at a few
+Only the ten icons actually used are stored, which keeps the file at a few
 kilobytes rather than shipping an entire set.
 
 ## The icons
@@ -43,6 +43,8 @@ kilobytes rather than shipping an entire set.
 | `restart` | `bx:refresh` | replay from the beginning |
 | `skip-forward` | `bx:fast-forward` | seek forward ten seconds |
 | `stop` | `bx:stop` | stop playback and close the player |
+| `volume` | `bx:volume-full` | the mute toggle while audio is audible |
+| `volume-mute` | `bx:volume-mute` | the mute toggle while muted or at zero volume |
 | `fullscreen-enter` | `bx:fullscreen` | enter fullscreen |
 | `fullscreen-exit` | `bx:exit-fullscreen` | leave fullscreen |
 | `arrow-right` | `bx:chevron-right` | the decision-reason list marker |

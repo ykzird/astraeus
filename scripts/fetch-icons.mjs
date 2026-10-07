@@ -28,6 +28,8 @@ const WANTED = [
   ["restart", "refresh", "replay from the beginning"],
   ["skip-forward", "fast-forward", "seek forward ten seconds"],
   ["stop", "stop", "stop playback and close the player"],
+  ["volume", "volume-full", "the mute toggle while audio is audible"],
+  ["volume-mute", "volume-mute", "the mute toggle while muted or at zero volume"],
   ["fullscreen-enter", "fullscreen", "enter fullscreen"],
   ["fullscreen-exit", "exit-fullscreen", "leave fullscreen"],
   ["arrow-right", "chevron-right", "the decision-reason list marker"],
