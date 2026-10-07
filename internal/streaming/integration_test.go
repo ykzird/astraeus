@@ -308,3 +308,113 @@ func waitForSegment(t *testing.T, dir string, timeout time.Duration) string {
 	}
 	return ""
 }
+
+// TestManager_TranscodeProducesPlayableBitDepth is the end-to-end regression
+// test for a 10-bit HDR source. Such a source is what exposed the bug: the
+// codec name said "h264", so nothing objected, segmentation went to 10-bit
+// H.264 "High 10", and the browser fetched every segment and never played one.
+func TestManager_TranscodeProducesPlayableBitDepth(t *testing.T) {
+	requireFFmpeg(t)
+
+	dir := t.TempDir()
+	source := filepath.Join(dir, "ten-bit.mkv")
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc=size=320x240:rate=15:duration=2",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+		"-c:a", "aac", "-shortest",
+		source,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("this ffmpeg cannot encode 10-bit H.264, so the fixture cannot be built: %v\n%s", err, output)
+	}
+
+	info, err := NewFFProbe("ffprobe").Probe(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if info.BitDepth != 10 {
+		t.Fatalf("probe reports bit depth %d (pixel format %q), want 10",
+			info.BitDepth, info.PixelFormat)
+	}
+
+	// The probe must be enough on its own to refuse the source.
+	decision := Negotiate(info, BrowserCapability())
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode for a 10-bit source", decision.Mode)
+	}
+
+	manager, session, _ := startSession(t, dir, source, decision)
+	defer manager.Stop(session.ID)
+
+	segment := waitForSegment(t, session.Dir, 60*time.Second)
+	if segment == "" {
+		t.Fatal("no segment was produced")
+	}
+
+	produced, err := NewFFProbe("ffprobe").Probe(context.Background(), filepath.Join(session.Dir, segment))
+	if err != nil {
+		t.Fatalf("probing the produced segment: %v", err)
+	}
+	if produced.BitDepth != 8 {
+		t.Errorf("transcoded segment is %d-bit (%s), want 8-bit: browsers cannot decode 10-bit H.264",
+			produced.BitDepth, produced.PixelFormat)
+	}
+}
+
+// TestManager_TranscodeDownmixesMultiChannelAudio is the regression test for a
+// real 5.1 film. Chromium refuses a 5.1 AAC SourceBuffer, and because the audio
+// append fails first it tears the whole MediaSource down: the player attaches,
+// fetches every segment, and never shows a frame.
+func TestManager_TranscodeDownmixesMultiChannelAudio(t *testing.T) {
+	requireFFmpeg(t)
+
+	dir := t.TempDir()
+	source := filepath.Join(dir, "surround.mkv")
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc=size=320x240:rate=15:duration=2",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+		"-af", "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0",
+		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+		"-c:a", "ac3", "-shortest",
+		source,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("this ffmpeg cannot build a 5.1 fixture: %v\n%s", err, output)
+	}
+
+	info, err := NewFFProbe("ffprobe").Probe(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if info.AudioChannels != 6 {
+		t.Fatalf("fixture has %d audio channels, want 6", info.AudioChannels)
+	}
+
+	decision := Negotiate(info, BrowserCapability())
+	if decision.AudioAction != ActionTranscode {
+		t.Fatalf("audio action = %q, want transcode", decision.AudioAction)
+	}
+	if decision.TargetAudioChannels != 2 {
+		t.Fatalf("target audio channels = %d, want 2", decision.TargetAudioChannels)
+	}
+
+	manager, session, _ := startSession(t, dir, source, decision)
+	defer manager.Stop(session.ID)
+
+	segment := waitForSegment(t, session.Dir, 60*time.Second)
+	if segment == "" {
+		t.Fatal("no segment was produced")
+	}
+
+	produced, err := NewFFProbe("ffprobe").Probe(context.Background(), filepath.Join(session.Dir, segment))
+	if err != nil {
+		t.Fatalf("probing the produced segment: %v", err)
+	}
+	if produced.AudioChannels != 2 {
+		t.Errorf("produced audio has %d channels (%s), want 2: browsers refuse a 5.1 AAC SourceBuffer",
+			produced.AudioChannels, produced.AudioCodec)
+	}
+}

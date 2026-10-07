@@ -24,6 +24,16 @@ type ClientCapability struct {
 	MaxHeight int `json:"max_height"`
 	// MaxBitrateKbps caps the acceptable bitrate; zero means unrestricted.
 	MaxBitrateKbps int `json:"max_bitrate_kbps"`
+	// MaxBitDepth is the deepest video the client can decode. Browsers cannot
+	// decode 10-bit H.264 even though they accept the codec name, so this is
+	// what stops a 10-bit source being direct-played into a stalled player.
+	// Zero means unrestricted.
+	MaxBitDepth int `json:"max_bit_depth"`
+	// MaxAudioChannels is the most channels the client can decode. Chromium's
+	// media pipeline refuses a 5.1 AAC SourceBuffer, and browsers output stereo
+	// in practice, so this defaults to 2 for browser clients. Zero means
+	// unrestricted.
+	MaxAudioChannels int `json:"max_audio_channels"`
 	// SupportsHLS enables the segmented delivery modes.
 	SupportsHLS bool `json:"supports_hls"`
 	// Subtitles indicates the client can render subtitle tracks.
@@ -32,16 +42,25 @@ type ClientCapability struct {
 
 // BrowserCapability returns the profile of a typical modern HTML5 browser.
 // It is the default the API falls back to when a client sends none.
+//
+// The 1080p ceiling is deliberate. Browsers can only be relied on to decode
+// H.264 up to 1080p in software; 4K playback needs hardware decoding that is
+// not universally available, and a stream the decoder cannot handle stalls
+// with no useful error. Capping here also avoids re-encoding a 4K source at
+// 4K, which costs roughly four times the CPU of 1080p for content usually
+// shown in a window. A client that wants more can ask for it in its manifest.
 func BrowserCapability() ClientCapability {
 	return ClientCapability{
-		Containers:     []string{"mp4", "webm", "hls"},
-		VideoCodecs:    []string{"h264", "vp9", "av1"},
-		AudioCodecs:    []string{"aac", "opus", "mp3", "vorbis"},
-		MaxWidth:       3840,
-		MaxHeight:      2160,
-		MaxBitrateKbps: 120_000,
-		SupportsHLS:    true,
-		Subtitles:      true,
+		Containers:       []string{"mp4", "webm", "hls"},
+		VideoCodecs:      []string{"h264", "vp9", "av1"},
+		AudioCodecs:      []string{"aac", "opus", "mp3", "vorbis"},
+		MaxWidth:         1920,
+		MaxHeight:        1080,
+		MaxBitrateKbps:   120_000,
+		MaxBitDepth:      8,
+		MaxAudioChannels: 2,
+		SupportsHLS:      true,
+		Subtitles:        true,
 	}
 }
 
@@ -67,14 +86,16 @@ func (c ClientCapability) Validate() error {
 // "H265", "h.265" and "hevc" are all understood.
 func (c ClientCapability) Normalise() ClientCapability {
 	return ClientCapability{
-		Containers:     normaliseAll(c.Containers, normaliseContainer),
-		VideoCodecs:    normaliseAll(c.VideoCodecs, NormaliseVideoCodec),
-		AudioCodecs:    normaliseAll(c.AudioCodecs, NormaliseAudioCodec),
-		MaxWidth:       c.MaxWidth,
-		MaxHeight:      c.MaxHeight,
-		MaxBitrateKbps: c.MaxBitrateKbps,
-		SupportsHLS:    c.SupportsHLS,
-		Subtitles:      c.Subtitles,
+		Containers:       normaliseAll(c.Containers, normaliseContainer),
+		VideoCodecs:      normaliseAll(c.VideoCodecs, NormaliseVideoCodec),
+		AudioCodecs:      normaliseAll(c.AudioCodecs, NormaliseAudioCodec),
+		MaxWidth:         c.MaxWidth,
+		MaxHeight:        c.MaxHeight,
+		MaxBitrateKbps:   c.MaxBitrateKbps,
+		MaxBitDepth:      c.MaxBitDepth,
+		MaxAudioChannels: c.MaxAudioChannels,
+		SupportsHLS:      c.SupportsHLS,
+		Subtitles:        c.Subtitles,
 	}
 }
 

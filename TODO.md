@@ -79,6 +79,9 @@ Status as of the current build. Evidence for each claim is the test suite
 - Image-based subtitles (PGS, VobSub) are detected and reported but not
   delivered — that needs OCR or bitmap overlay support.
 - Multi-audio-track selection is not implemented; the first audio stream wins.
+- Browser clients are capped at 1080p, 8-bit and stereo by default. There is no
+  surround passthrough and no per-client override beyond sending a capability
+  manifest, and the cap is a constant rather than a flag.
 - `--auth-mode` defaults to `none`. That is right for a trusted LAN and wrong
   for anything reachable from the internet; use `proxy` or `token` before
   exposing it.

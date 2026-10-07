@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -54,11 +55,19 @@ func IsTextSubtitle(codec string) bool {
 // MediaInfo is the subset of technical properties the negotiation needs. It is
 // produced by probing a MediaObject on disk.
 type MediaInfo struct {
-	Container       string          `json:"container"`
-	VideoCodec      string          `json:"video_codec"`
-	AudioCodec      string          `json:"audio_codec,omitempty"`
-	Width           int             `json:"width,omitempty"`
-	Height          int             `json:"height,omitempty"`
+	Container  string `json:"container"`
+	VideoCodec string `json:"video_codec"`
+	AudioCodec string `json:"audio_codec,omitempty"`
+	// AudioChannels is the channel count of the first audio stream. Chromium
+	// refuses a 5.1 AAC SourceBuffer, so this has to be negotiable.
+	AudioChannels int `json:"audio_channels,omitempty"`
+	Width         int `json:"width,omitempty"`
+	Height        int `json:"height,omitempty"`
+	// PixelFormat and BitDepth describe the decoded video. They matter because
+	// a 10-bit stream is not playable in a browser even when its codec name is
+	// one the browser claims to support.
+	PixelFormat     string          `json:"pixel_format,omitempty"`
+	BitDepth        int             `json:"bit_depth,omitempty"`
 	BitrateKbps     int             `json:"bitrate_kbps,omitempty"`
 	DurationSeconds float64         `json:"duration_seconds,omitempty"`
 	Subtitles       []SubtitleTrack `json:"subtitles,omitempty"`
@@ -96,6 +105,8 @@ type ffprobeStream struct {
 	CodecType   string `json:"codec_type"`
 	Width       int    `json:"width"`
 	Height      int    `json:"height"`
+	PixFmt      string `json:"pix_fmt"`
+	Channels    int    `json:"channels"`
 	BitRate     string `json:"bit_rate"`
 	Duration    string `json:"duration"`
 	Disposition struct {
@@ -169,11 +180,14 @@ func (p *FFProbe) Probe(ctx context.Context, path string) (*MediaInfo, error) {
 				info.VideoCodec = stream.CodecName
 				info.Width = stream.Width
 				info.Height = stream.Height
+				info.PixelFormat = stream.PixFmt
+				info.BitDepth = bitDepthFromPixelFormat(stream.PixFmt)
 				videoSeen = true
 			}
 		case "audio":
 			if info.AudioCodec == "" {
 				info.AudioCodec = stream.CodecName
+				info.AudioChannels = stream.Channels
 			}
 		case "subtitle":
 			if stream.CodecName == "" {
@@ -262,4 +276,43 @@ func preferredContainer(path, formatName string) string {
 		return ""
 	}
 	return strings.ToLower(path[idx+1:])
+}
+
+// pixelDepthRe matches the bit depth ffmpeg appends to deep pixel formats:
+// yuv420p10le, gray12be and friends. A plain yuv420p is 8-bit and does not
+// match, because the depth digits are absent.
+var pixelDepthRe = regexp.MustCompile(`(?:^|[a-z])(9|10|12|14|16)(?:le|be)?$`)
+
+// bitDepthFromPixelFormat reports the bit depth of a decoded pixel format.
+// It is a name-based heuristic, which is all ffprobe offers; formats whose
+// digits describe the chroma layout rather than the depth are handled first.
+func bitDepthFromPixelFormat(name string) int {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return 0
+	}
+
+	// nv12, nv16 and nv24 are 8-bit; their trailing digits are a layout, not a
+	// depth, and would otherwise look like a 12- or 16-bit format.
+	switch name {
+	case "nv12", "nv21", "nv16", "nv24":
+		return 8
+	}
+
+	// Semi-planar deep formats spell the depth first: p010le, p012le, p016le.
+	for _, candidate := range []struct {
+		prefix string
+		depth  int
+	}{{"p010", 10}, {"p012", 12}, {"p014", 14}, {"p016", 16}} {
+		if strings.HasPrefix(name, candidate.prefix) {
+			return candidate.depth
+		}
+	}
+
+	if match := pixelDepthRe.FindStringSubmatch(name); match != nil {
+		if depth, err := strconv.Atoi(match[1]); err == nil {
+			return depth
+		}
+	}
+	return 8
 }

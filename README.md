@@ -175,15 +175,25 @@ Errors are `{"code": "...", "message": "..."}` with a matching status code.
   "containers": ["mp4", "webm", "hls"],
   "video_codecs": ["h264", "vp9"],
   "audio_codecs": ["aac", "opus"],
-  "max_width": 3840,
-  "max_height": 2160,
+  "max_width": 1920,
+  "max_height": 1080,
   "max_bitrate_kbps": 120000,
+  "max_bit_depth": 8,
+  "max_audio_channels": 2,
   "supports_hls": true,
   "subtitles": true
 }
 ```
 
-Omit the body to use a modern-browser profile. The response carries the
+Omit the body to use the built-in browser profile, which caps at **1920x1080,
+8-bit, stereo**. Those three limits are not arbitrary: they are the ones a
+browser cannot be relied on to exceed. A 4K source would otherwise be
+re-encoded at 4K (about four times the CPU) for a client that usually cannot
+decode it; 10-bit H.264 ("High 10") and 5.1 AAC are refused outright by
+Chromium's media pipeline, and a refused audio append tears the whole
+MediaSource down, so the player attaches, fetches every segment, and never
+shows a frame. A client that genuinely wants more can ask for it in its
+manifest. The response carries the
 decision and the reason for every choice:
 
 ```json
@@ -216,6 +226,10 @@ Modes:
 
 A `409` means the client's declaration makes delivery impossible (for example it
 needs re-encoding but cannot play HLS); the reasons explain why.
+
+The decision also carries the concrete targets it chose — `target_height` for a
+downscale and `target_audio_channels` for a downmix — so a client can see not
+just that it will be re-encoded but what it will get.
 
 ## Access gate
 

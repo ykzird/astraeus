@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -491,6 +492,12 @@ func BuildFFmpegArgs(dir, inputPath string, decision Decision, cfg ManagerConfig
 			return nil, fmt.Errorf("no ffmpeg encoder available for video codec %q", decision.TargetVideoCodec)
 		}
 		args = append(args, encoderArgs(encoder, decision.TargetHeight)...)
+		// Cut on the requested segment boundary. Without this ffmpeg only cuts
+		// at encoder keyframes - a ~10s default GOP - so -hls_time is advisory
+		// and the first segment, and therefore first playback, arrives far
+		// later than asked for.
+		args = append(args, "-force_key_frames",
+			fmt.Sprintf("expr:gte(t,n_forced*%d)", cfg.SegmentSeconds))
 	default:
 		return nil, fmt.Errorf("unsupported video action %q", decision.VideoAction)
 	}
@@ -506,6 +513,12 @@ func BuildFFmpegArgs(dir, inputPath string, decision Decision, cfg ManagerConfig
 			codec = "aac"
 		}
 		args = append(args, "-c:a", codec, "-b:a", "192k")
+		if decision.TargetAudioChannels > 0 {
+			// Chromium refuses a 5.1 AAC SourceBuffer outright, and a browser
+			// outputs stereo anyway, so a negotiated downmix is what makes a
+			// film with a 5.1 track playable at all.
+			args = append(args, "-ac", strconv.Itoa(decision.TargetAudioChannels))
+		}
 	default:
 		return nil, fmt.Errorf("unsupported audio action %q", decision.AudioAction)
 	}
@@ -521,6 +534,24 @@ func BuildFFmpegArgs(dir, inputPath string, decision Decision, cfg ManagerConfig
 	return args, nil
 }
 
+// outputPixelFormat pins the encoder's output to a format browsers can decode.
+//
+// This matters more than it looks. Left alone, ffmpeg preserves the source's
+// bit depth, so a 10-bit HDR source transcodes to 10-bit H.264 "High 10" -
+// which no browser decodes through Media Source Extensions. The stream then
+// attaches, fetches its segments, and silently never plays: no media error, no
+// console message, just a stalled player. Pinning 8-bit yuv420p (and nv12,
+// which the hardware encoders want) keeps the output in the range every browser
+// supports.
+func outputPixelFormat(encoder string) string {
+	switch encoder {
+	case "h264_qsv", "hevc_qsv", "h264_vaapi", "hevc_vaapi":
+		return "nv12"
+	default:
+		return "yuv420p"
+	}
+}
+
 // encoderArgs renders the codec-specific options, including the scaling filter
 // when a target height was negotiated.
 func encoderArgs(encoder string, targetHeight int) []string {
@@ -531,38 +562,37 @@ func encoderArgs(encoder string, targetHeight int) []string {
 		softwareScale = fmt.Sprintf("scale=-2:%d", targetHeight)
 	}
 
+	var args []string
 	switch encoder {
 	case "h264_qsv", "hevc_qsv":
-		args := []string{"-c:v", encoder, "-preset", "veryfast", "-global_quality", "22"}
+		args = []string{"-c:v", encoder, "-preset", "veryfast", "-global_quality", "22"}
 		if softwareScale != "" {
 			args = append(args, "-vf", softwareScale)
 		}
-		return args
 	case "h264_vaapi", "hevc_vaapi":
 		filter := "format=nv12,hwupload"
 		if targetHeight > 0 {
 			filter = "format=nv12,hwupload," + fmt.Sprintf("scale_vaapi=w=-2:h=%d", targetHeight)
 		}
-		return []string{"-c:v", encoder, "-vf", filter}
+		args = []string{"-c:v", encoder, "-vf", filter}
 	case "libx264", "libx265":
-		args := []string{"-c:v", encoder, "-preset", "veryfast", "-crf", "21"}
+		args = []string{"-c:v", encoder, "-preset", "veryfast", "-crf", "21"}
 		if softwareScale != "" {
 			args = append(args, "-vf", softwareScale)
 		}
-		return args
 	case "libvpx-vp9":
-		args := []string{"-c:v", encoder, "-crf", "31", "-b:v", "0"}
+		args = []string{"-c:v", encoder, "-crf", "31", "-b:v", "0"}
 		if softwareScale != "" {
 			args = append(args, "-vf", softwareScale)
 		}
-		return args
 	case "libsvtav1", "libaom-av1":
-		args := []string{"-c:v", encoder, "-crf", "30"}
+		args = []string{"-c:v", encoder, "-crf", "30"}
 		if softwareScale != "" {
 			args = append(args, "-vf", softwareScale)
 		}
-		return args
 	default:
-		return []string{"-c:v", encoder}
+		args = []string{"-c:v", encoder}
 	}
+
+	return append(args, "-pix_fmt", outputPixelFormat(encoder))
 }

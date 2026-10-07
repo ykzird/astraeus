@@ -195,6 +195,13 @@ QuickSync, then VAAPI, then software, but hardware is only used when the device
 is actually present — an encoder being compiled into ffmpeg is not treated as
 proof that it works.
 
+Negotiation considers four independent axes, each with a reason attached:
+container, codec, resolution (as a bounding box, so a 2.35:1 source fits a
+16:9 limit), video bit depth, and audio channel count. Bit depth and channel
+count matter because a codec name the client accepts is not proof it can decode
+the stream: Chromium refuses 10-bit H.264 and 5.1 AAC SourceBuffers, and a
+refused audio append tears down the video with it.
+
 Not yet implemented: multiple audio track selection, and an adaptive bitrate
 ladder. Subtitle tracks are probed, and text-based tracks are extracted to
 WebVTT on demand (§9.5).

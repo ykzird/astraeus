@@ -47,6 +47,9 @@ type Decision struct {
 	TargetVideoCodec string `json:"target_video_codec,omitempty"`
 	TargetAudioCodec string `json:"target_audio_codec,omitempty"`
 	TargetHeight     int    `json:"target_height,omitempty"`
+	// TargetAudioChannels is set when the source carries more channels than the
+	// client accepts and the audio is being re-encoded anyway.
+	TargetAudioChannels int `json:"target_audio_channels,omitempty"`
 
 	// Reasons explains every choice, in order. This is what makes a surprising
 	// decision debuggable instead of mysterious.
@@ -90,14 +93,33 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 			fmt.Sprintf("client cannot open container %q", info.Container))
 	}
 
-	needsDownscale := capability.MaxHeight > 0 && info.Height > capability.MaxHeight
+	targetHeight, needsDownscale := targetHeightFor(info, capability)
 	if needsDownscale {
 		decision.Reasons = append(decision.Reasons,
-			fmt.Sprintf("source is %dp but the client accepts at most %dp", info.Height, capability.MaxHeight))
+			fmt.Sprintf("source is %dx%d but the client accepts at most %s",
+				info.Width, info.Height, describeBox(capability)))
+	}
+
+	channelsTooMany := capability.MaxAudioChannels > 0 &&
+		info.AudioChannels > capability.MaxAudioChannels
+	if channelsTooMany {
+		decision.Reasons = append(decision.Reasons,
+			fmt.Sprintf("source audio has %d channels but the client accepts at most %d",
+				info.AudioChannels, capability.MaxAudioChannels))
+	}
+
+	// A codec name the client accepts does not mean it can decode this stream:
+	// 10-bit H.264 ("High 10") is refused by every browser's media pipeline.
+	tooDeep := info.BitDepth > 8 &&
+		(capability.MaxBitDepth == 0 || info.BitDepth > capability.MaxBitDepth)
+	if tooDeep {
+		decision.Reasons = append(decision.Reasons,
+			fmt.Sprintf("source is %d-bit but the client decodes at most %d-bit",
+				info.BitDepth, capability.MaxBitDepth))
 	}
 
 	switch {
-	case !videoCompatible || !audioCompatible || needsDownscale:
+	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany:
 		decision.Mode = ModeTranscode
 	case containerCompatible:
 		decision.Mode = ModeDirectPlay
@@ -106,7 +128,7 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	}
 
 	// Video action.
-	if !videoCompatible || needsDownscale {
+	if !videoCompatible || needsDownscale || tooDeep {
 		decision.VideoAction = ActionTranscode
 		decision.TargetVideoCodec = capability.PreferredVideoCodec()
 		if decision.TargetVideoCodec == "" {
@@ -114,19 +136,22 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 			decision.Reasons = append(decision.Reasons, "client declared no video codecs to transcode into")
 		}
 		if needsDownscale {
-			decision.TargetHeight = capability.MaxHeight
+			decision.TargetHeight = targetHeight
 		}
 	}
 
 	// Audio action.
 	if info.AudioCodec == "" {
 		decision.AudioAction = ActionNone
-	} else if !audioCompatible {
+	} else if !audioCompatible || channelsTooMany {
 		decision.AudioAction = ActionTranscode
 		decision.TargetAudioCodec = capability.PreferredAudioCodec()
 		if decision.TargetAudioCodec == "" {
 			decision.Deliverable = false
 			decision.Reasons = append(decision.Reasons, "client declared no audio codecs to transcode into")
+		}
+		if channelsTooMany {
+			decision.TargetAudioChannels = capability.MaxAudioChannels
 		}
 	}
 
@@ -154,6 +179,53 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	}
 
 	return decision
+}
+
+// targetHeightFor reports the height to scale to so the output fits inside the
+// client's declared box, or 0 when no scaling is needed.
+//
+// Both limits matter. A 2.35:1 film scaled to fit a 1080-high limit comes out
+// roughly 2530 wide, which breaks a client that also declared a 1920 width.
+// The tighter of the two, expressed in the source's aspect ratio, wins.
+func targetHeightFor(info *MediaInfo, capability ClientCapability) (int, bool) {
+	if info.Height <= 0 || info.Width <= 0 {
+		return 0, false
+	}
+	if capability.MaxHeight <= 0 && capability.MaxWidth <= 0 {
+		return 0, false
+	}
+
+	limit := info.Height
+	if capability.MaxHeight > 0 && capability.MaxHeight < limit {
+		limit = capability.MaxHeight
+	}
+	if capability.MaxWidth > 0 && info.Width > capability.MaxWidth {
+		if byWidth := capability.MaxWidth * info.Height / info.Width; byWidth < limit {
+			limit = byWidth
+		}
+	}
+
+	if limit >= info.Height {
+		return 0, false
+	}
+	if limit < 2 {
+		limit = 2
+	}
+	return limit, true
+}
+
+// describeBox renders a client's resolution limit for a human.
+func describeBox(capability ClientCapability) string {
+	switch {
+	case capability.MaxWidth > 0 && capability.MaxHeight > 0:
+		return fmt.Sprintf("%dx%d", capability.MaxWidth, capability.MaxHeight)
+	case capability.MaxHeight > 0:
+		return fmt.Sprintf("%dp", capability.MaxHeight)
+	case capability.MaxWidth > 0:
+		return fmt.Sprintf("%dpx wide", capability.MaxWidth)
+	default:
+		return "no resolution limit"
+	}
 }
 
 // clientSupportsVideo treats an unknown source codec as incompatible rather
