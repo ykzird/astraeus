@@ -211,6 +211,13 @@ func targetHeightFor(info *MediaInfo, capability ClientCapability) (int, bool) {
 	if limit >= info.Height {
 		return 0, false
 	}
+
+	// H.264 and HEVC with 4:2:0 require even dimensions, and the scale filter's
+	// "-2" only makes the *width* even, so the height has to be made even here.
+	// Rounding down, never up: rounding up would exceed the client's box.
+	if limit%2 != 0 {
+		limit--
+	}
 	if limit < 2 {
 		limit = 2
 	}

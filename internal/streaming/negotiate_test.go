@@ -583,6 +583,14 @@ func TestNegotiate_RespectsBothResolutionLimits(t *testing.T) {
 			wantScale: false,
 		},
 		{
+			// 1920 * 1600 / 3832 truncates to 801, an odd height, which x264
+			// refuses outright: "height not divisible by 2 (1918x801)".
+			name:       "a scope source whose width-derived height is odd",
+			info:       &MediaInfo{Container: "mp4", VideoCodec: "hevc", AudioCodec: "eac3", Width: 3832, Height: 1600},
+			wantScale:  true,
+			wantHeight: 800,
+		},
+		{
 			name:       "anamorphic-style source with no limits is untouched",
 			info:       &MediaInfo{Container: "mp4", VideoCodec: "h264", AudioCodec: "aac", Width: 2560, Height: 1080},
 			wantScale:  true,
@@ -655,5 +663,35 @@ func TestBuildFFmpegArgs_DownmixesWhenNegotiated(t *testing.T) {
 	}
 	if joined := strings.Join(args, " "); !strings.Contains(joined, "-ac 2") {
 		t.Errorf("args do not downmix to stereo:\n%s", joined)
+	}
+}
+
+// TestTargetHeightIsAlwaysEven is the invariant behind the reported failure:
+// the scale filter's -2 makes the width even but leaves the height alone, so an
+// odd computed height reaches the encoder and x264 refuses to open.
+func TestTargetHeightIsAlwaysEven(t *testing.T) {
+	t.Parallel()
+
+	capability := ClientCapability{MaxWidth: 1920, MaxHeight: 1080}
+
+	for width := 1000; width <= 4000; width += 7 {
+		for height := 400; height <= 2200; height += 6 {
+			info := &MediaInfo{Width: width, Height: height}
+			got, needed := targetHeightFor(info, capability)
+			if !needed {
+				continue
+			}
+			if got%2 != 0 {
+				t.Fatalf("targetHeightFor(%dx%d) = %d, which is odd", width, height, got)
+			}
+			if got > capability.MaxHeight {
+				t.Fatalf("targetHeightFor(%dx%d) = %d, above the declared %d",
+					width, height, got, capability.MaxHeight)
+			}
+			if scaled := capability.MaxWidth * got / height; scaled > capability.MaxWidth {
+				t.Fatalf("targetHeightFor(%dx%d) = %d yields %d wide, above the declared %d",
+					width, height, got, scaled, capability.MaxWidth)
+			}
+		}
 	}
 }
