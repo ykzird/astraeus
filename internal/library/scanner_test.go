@@ -385,3 +385,61 @@ func TestScanner_ScanLibrary_SkipsIgnoredDirectories(t *testing.T) {
 		t.Errorf("files seen = %d, want 1 (sample and hidden dirs are ignored)", result.FilesSeen)
 	}
 }
+
+// TestScanner_ScanLibrary_CountsDistinctEntities pins the accounting: a series
+// and season shared by many episodes are single entities, not one per lookup.
+func TestScanner_ScanLibrary_CountsDistinctEntities(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "Show", "Season 01", "Show.S01E01.mkv"), "1")
+	writeFile(t, filepath.Join(root, "Show", "Season 01", "Show.S01E02.mkv"), "2")
+	writeFile(t, filepath.Join(root, "Show", "Season 01", "Show.S01E03.mkv"), "3")
+
+	lib := mustLibraryAt(t, repo, root, ShowsLibrary)
+	scanner := NewScanner(repo, newTestLogger())
+
+	// One series plus one season plus three episodes. The containers are looked
+	// up three times each, but they are two entities.
+	first, err := scanner.ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if first.FilesSeen != 3 {
+		t.Errorf("files seen = %d, want 3", first.FilesSeen)
+	}
+	if first.EntitiesCreated != 5 {
+		t.Errorf("entities created = %d, want 5 (1 series + 1 season + 3 episodes)", first.EntitiesCreated)
+	}
+	if first.EntitiesReused != 0 {
+		t.Errorf("entities reused = %d, want 0 (nothing existed before this scan)", first.EntitiesReused)
+	}
+
+	second, err := scanner.ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	if second.EntitiesCreated != 0 {
+		t.Errorf("entities created = %d on a repeat scan, want 0", second.EntitiesCreated)
+	}
+	if second.EntitiesReused != 5 {
+		t.Errorf("entities reused = %d on a repeat scan, want 5 (nine lookups, five entities)",
+			second.EntitiesReused)
+	}
+
+	// A new episode is the only new entity; the containers it shares are still
+	// one reuse each.
+	writeFile(t, filepath.Join(root, "Show", "Season 01", "Show.S01E04.mkv"), "4")
+	third, err := scanner.ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("third scan: %v", err)
+	}
+	if third.EntitiesCreated != 1 {
+		t.Errorf("entities created = %d, want 1 (the new episode)", third.EntitiesCreated)
+	}
+	if third.EntitiesReused != 5 {
+		t.Errorf("entities reused = %d, want 5", third.EntitiesReused)
+	}
+}

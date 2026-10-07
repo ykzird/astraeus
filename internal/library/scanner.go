@@ -62,6 +62,9 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 		return result, fmt.Errorf("library path %q is not a directory", lib.Path)
 	}
 
+	// tally accumulates the distinct entities this pass touches.
+	tally := newEntityTally()
+
 	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -86,7 +89,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 		}
 
 		result.FilesSeen++
-		if err := s.ingestFile(ctx, lib, path, root, &result); err != nil {
+		if err := s.ingestFile(ctx, lib, path, root, &result, tally); err != nil {
 			return err
 		}
 		return nil
@@ -95,18 +98,54 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 		return result, fmt.Errorf("scanning %s: %w", root, walkErr)
 	}
 
+	// Report distinct entities rather than lookups: a season shared by twenty
+	// episodes is one reused entity, not twenty.
+	tally.apply(&result)
+
 	s.logger.InfoContext(ctx, "scan complete",
 		"library", lib.Name,
 		"files", result.FilesSeen,
 		"entities_created", result.EntitiesCreated,
+		"entities_reused", result.EntitiesReused,
 		"objects_created", result.ObjectsCreated,
 		"warnings", len(result.Warnings))
 	return result, nil
 }
 
+// entityTally counts the distinct entities a scan touched. Containers are
+// looked up once per file, so counting lookups would report the same series
+// once for every episode it holds.
+type entityTally struct {
+	created map[string]bool
+	reused  map[string]bool
+}
+
+func newEntityTally() *entityTally {
+	return &entityTally{created: make(map[string]bool), reused: make(map[string]bool)}
+}
+
+func (t *entityTally) markCreated(id string) {
+	t.created[id] = true
+	// An entity this scan created is not also a reuse, even though a later
+	// file in the same scan will legitimately find it.
+	delete(t.reused, id)
+}
+
+func (t *entityTally) markReused(id string) {
+	if t.created[id] {
+		return
+	}
+	t.reused[id] = true
+}
+
+func (t *entityTally) apply(result *ScanResult) {
+	result.EntitiesCreated = len(t.created)
+	result.EntitiesReused = len(t.reused)
+}
+
 // ingestFile reconciles one media file with the database inside a transaction,
 // so a failure part-way cannot leave an episode without its series or season.
-func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root string, result *ScanResult) error {
+func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root string, result *ScanResult, tally *entityTally) error {
 	info, err := os.Stat(absPath)
 	if err != nil {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %v", absPath, err))
@@ -139,9 +178,9 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 				if err := tx.CreateEntity(ctx, entity); err != nil {
 					return err
 				}
-				result.EntitiesCreated++
+				tally.markCreated(entity.ID)
 			} else {
-				result.EntitiesReused++
+				tally.markReused(entity.ID)
 			}
 			parentID = &entity.ID
 		}
@@ -155,9 +194,9 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 			if err := tx.CreateEntity(ctx, leafEntity); err != nil {
 				return err
 			}
-			result.EntitiesCreated++
+			tally.markCreated(leafEntity.ID)
 		} else {
-			result.EntitiesReused++
+			tally.markReused(leafEntity.ID)
 		}
 
 		existing, err := tx.GetObjectByPath(ctx, absPath)
