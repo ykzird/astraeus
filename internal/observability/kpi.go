@@ -30,6 +30,7 @@ const (
 	MetricScanRuns             = "astraeus_scan_runs_total"
 	MetricHTTPRequests         = "astraeus_http_requests_total"
 	MetricHTTPRequestSeconds   = "astraeus_http_request_seconds"
+	MetricTranscodeFallbacks   = "astraeus_transcode_fallbacks_total"
 	MetricAuthGranted          = "astraeus_auth_granted_total"
 	MetricAuthDenied           = "astraeus_auth_denied_total"
 )
@@ -107,6 +108,11 @@ var KPIRegistry = []KPIDefinition{
 		Name: MetricHTTPRequestSeconds,
 		Help: "HTTP request duration.",
 		Kind: "histogram",
+	},
+	{
+		Name: MetricTranscodeFallbacks,
+		Help: "Transcodes that failed on a hardware encoder and were retried in software.",
+		Kind: "counter",
 	},
 	{
 		Name: MetricAuthGranted,

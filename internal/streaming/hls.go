@@ -210,7 +210,53 @@ func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration) {
 func (m *Manager) Config() ManagerConfig { return m.cfg }
 
 // Start begins a segmented delivery and returns once the playlist exists.
+//
+// If the stream fails to come up and a hardware encoder was in play, the same
+// decision is retried in software. A hardware encoder can be listed by ffmpeg
+// and still fail to open a session - a missing driver, or simply the wrong GPU
+// vendor - and failing the request when a working software path exists would be
+// the wrong answer.
 func (m *Manager) Start(ctx context.Context, entityID, objectPath string, decision Decision) (*Session, error) {
+	cfg := m.cfg
+	session, err := m.startOnce(ctx, entityID, objectPath, decision, cfg)
+	if err == nil || !wouldUseHardware(decision, cfg) {
+		return session, err
+	}
+
+	m.cfg.Logger.WarnContext(ctx, "hardware transcode failed; retrying with software encoding",
+		"entity_id", entityID, "error", err)
+	m.cfg.Metrics.IncCounter(observability.MetricTranscodeFallbacks,
+		"Transcodes that failed on a hardware encoder and were retried in software.", nil)
+
+	cfg = withoutHardware(cfg)
+	return m.startOnce(ctx, entityID, objectPath, decision, cfg)
+}
+
+// wouldUseHardware reports whether this decision would be served by a hardware
+// encoder under the given configuration.
+func wouldUseHardware(decision Decision, cfg ManagerConfig) bool {
+	if decision.Mode == ModeDirectPlay || decision.VideoAction != ActionTranscode {
+		return false
+	}
+	return isHardwareEncoder(EncoderFor(decision.TargetVideoCodec, cfg.Server))
+}
+
+// withoutHardware returns a configuration that can only choose software
+// encoders.
+func withoutHardware(cfg ManagerConfig) ManagerConfig {
+	software := make([]string, 0, len(cfg.Server.VideoEncoders))
+	for _, encoder := range cfg.Server.VideoEncoders {
+		if !isHardwareEncoder(encoder) {
+			software = append(software, encoder)
+		}
+	}
+	cfg.Server.VideoEncoders = software
+	cfg.Server.HardwareAcceleration = ""
+	return cfg
+}
+
+// startOnce prepares and launches one session with the given configuration.
+func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, decision Decision, cfg ManagerConfig) (*Session, error) {
 	if decision.Mode == ModeDirectPlay {
 		return nil, ErrDirectPlayHasNoSession
 	}
@@ -219,12 +265,12 @@ func (m *Manager) Start(ctx context.Context, entityID, objectPath string, decisi
 	}
 
 	sessionID := uuid.NewString()
-	dir := filepath.Join(m.cfg.RootDir, sessionID)
+	dir := filepath.Join(cfg.RootDir, sessionID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating session directory: %w", err)
 	}
 
-	args, err := BuildFFmpegArgs(dir, objectPath, decision, m.cfg)
+	args, err := BuildFFmpegArgs(dir, objectPath, decision, cfg)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
@@ -243,7 +289,7 @@ func (m *Manager) Start(ctx context.Context, entityID, objectPath string, decisi
 		lastAccess: time.Now(),
 	}
 
-	cmd := exec.CommandContext(runCtx, m.cfg.FFmpegBin, args...)
+	cmd := exec.CommandContext(runCtx, cfg.FFmpegBin, args...)
 	// Assigning an io.Writer rather than reading a pipe ourselves makes
 	// cmd.Wait wait until every byte of ffmpeg's diagnostics has been
 	// collected, so the output is complete by the time the session reports
@@ -258,7 +304,7 @@ func (m *Manager) Start(ctx context.Context, entityID, objectPath string, decisi
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("starting ffmpeg: %w", err)
 	}
-	m.cfg.Logger.InfoContext(ctx, "streaming session started",
+	cfg.Logger.InfoContext(ctx, "streaming session started",
 		"session_id", sessionID, "entity_id", entityID, "mode", decision.Mode)
 
 	go func() {
@@ -270,10 +316,10 @@ func (m *Manager) Start(ctx context.Context, entityID, objectPath string, decisi
 		}
 		session.mu.Unlock()
 		if waitErr != nil && runCtx.Err() == nil {
-			m.cfg.Metrics.IncCounter("astraeus_stream_errors_total",
+			cfg.Metrics.IncCounter("astraeus_stream_errors_total",
 				"Segmented streaming failures: sessions that never produced a playlist, plus ffmpeg exiting unexpectedly.",
 				map[string]string{"mode": string(decision.Mode)})
-			m.cfg.Logger.Error("ffmpeg exited unexpectedly",
+			cfg.Logger.Error("ffmpeg exited unexpectedly",
 				"session_id", sessionID, "error", waitErr, "stderr", session.Diagnostics())
 		}
 	}()
@@ -287,21 +333,21 @@ func (m *Manager) Start(ctx context.Context, entityID, objectPath string, decisi
 	if err := m.waitForPlaylist(ctx, session); err != nil {
 		// transcode_startup_time is only recorded for a stream that actually
 		// came up; a failure is an error, not a slow success.
-		m.cfg.Metrics.IncCounter("astraeus_stream_sessions_total",
+		cfg.Metrics.IncCounter("astraeus_stream_sessions_total",
 			"Segmented streaming sessions, by mode and outcome.",
 			map[string]string{"mode": string(decision.Mode), "outcome": "failed"})
-		m.cfg.Metrics.IncCounter("astraeus_stream_errors_total",
+		cfg.Metrics.IncCounter("astraeus_stream_errors_total",
 			"Segmented streaming failures: sessions that never produced a playlist, plus ffmpeg exiting unexpectedly.",
 			map[string]string{"mode": string(decision.Mode)})
 		m.Stop(sessionID)
 		return nil, err
 	}
 
-	m.cfg.Metrics.ObserveHistogram("astraeus_transcode_startup_seconds",
+	cfg.Metrics.ObserveHistogram("astraeus_transcode_startup_seconds",
 		"Time from starting ffmpeg to the playlist being available, for the segmented modes.",
 		time.Since(startupStart).Seconds(),
 		map[string]string{"mode": string(decision.Mode)})
-	m.cfg.Metrics.IncCounter("astraeus_stream_sessions_total",
+	cfg.Metrics.IncCounter("astraeus_stream_sessions_total",
 		"Segmented streaming sessions, by mode and outcome.",
 		map[string]string{"mode": string(decision.Mode), "outcome": "started"})
 

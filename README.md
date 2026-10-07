@@ -95,7 +95,23 @@ administrator, rather than being quietly filled in with a placeholder.
 
 `--stream-root` controls where HLS session output is written (default:
 `$TMPDIR/astraeus-streams`). `--device-dir` (default `/dev/dri`) is where
-hardware transcoding devices are looked for. `--scan-interval` (default `6h`,
+hardware transcoding devices are looked for.
+
+### Hardware acceleration
+
+A hardware encoder is used only after it has **proved it can encode**: at
+startup each candidate is run against a fraction of a second of test video, and
+one that cannot open a session is dropped from the reported capabilities. This
+matters because neither signal alone is trustworthy. `ffmpeg -encoders` lists
+what was *compiled in*, and a populated `/dev/dri` says nothing about the GPU
+vendor — an AMD machine exposes a device directory exactly as an Intel one does,
+so QuickSync can look available on a host where it can never work.
+
+If a hardware encoder is chosen and still fails at runtime, the session is
+retried once in software and `astraeus_transcode_fallbacks_total` counts it,
+rather than failing the request when a working software path exists.
+
+`GET /api/system/capabilities` reports what survived that check. `--scan-interval` (default `6h`,
 `0` disables) re-scans every library for new files; `--enrich-interval` does the
 same for metadata. `--image-cache` and `--subtitle-cache` place the artwork and
 WebVTT caches.

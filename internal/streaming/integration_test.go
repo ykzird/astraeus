@@ -418,3 +418,53 @@ func TestManager_TranscodeDownmixesMultiChannelAudio(t *testing.T) {
 			produced.AudioChannels, produced.AudioCodec)
 	}
 }
+
+// TestDetectServerCapability_RejectsEncodersThatCannotRun is the regression test
+// for the reported failure. h264_qsv is compiled into this ffmpeg and the host
+// exposed a device directory, so the old detection offered QuickSync - on a
+// machine with no Intel GPU, where every transcode then died with
+// "Error creating a MFX session: -9".
+func TestDetectServerCapability_RejectsEncodersThatCannotRun(t *testing.T) {
+	requireFFmpeg(t)
+
+	// A device directory that exists and looks populated, which is the only
+	// thing the old check looked at.
+	deviceDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(deviceDir, "renderD128"), nil, 0o644); err != nil {
+		t.Fatalf("creating a fake render node: %v", err)
+	}
+
+	capability := DetectServerCapability(context.Background(), "ffmpeg", "ffprobe", deviceDir)
+
+	// The invariant: never advertise an encoder that cannot encode.
+	for _, encoder := range capability.VideoEncoders {
+		if !encoderWorks(context.Background(), "ffmpeg", encoder, deviceDir) {
+			t.Errorf("capability advertises %q, which cannot actually encode", encoder)
+		}
+	}
+
+	// This host cannot drive QuickSync, so it must not be offered even though
+	// it is listed by ffmpeg.
+	if containsFold(capability.VideoEncoders, "h264_qsv") {
+		if !encoderWorks(context.Background(), "ffmpeg", "h264_qsv", deviceDir) {
+			t.Error("h264_qsv is advertised although it cannot create a session")
+		}
+	}
+
+	// Whatever else is true, a working software encoder must remain.
+	if !containsFold(capability.VideoEncoders, "libx264") {
+		t.Errorf("libx264 is missing from the capability report: %v", capability.VideoEncoders)
+	}
+
+	// Any claimed hardware path must be backed by an encoder that is offered.
+	switch capability.HardwareAcceleration {
+	case "qsv":
+		if !containsFold(capability.VideoEncoders, "h264_qsv") && !containsFold(capability.VideoEncoders, "hevc_qsv") {
+			t.Error("hardware acceleration claims qsv with no working qsv encoder")
+		}
+	case "vaapi":
+		if !containsFold(capability.VideoEncoders, "h264_vaapi") && !containsFold(capability.VideoEncoders, "hevc_vaapi") {
+			t.Error("hardware acceleration claims vaapi with no working vaapi encoder")
+		}
+	}
+}

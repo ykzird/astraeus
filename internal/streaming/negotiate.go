@@ -3,11 +3,14 @@ package streaming
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // PlaybackMode is how the server intends to deliver a MediaObject.
@@ -263,9 +266,15 @@ func ParseEncoders(output string) []string {
 	return encoders
 }
 
-// DetectServerCapability inspects the host. dockerDeviceDir is checked for the
-// presence of a hardware transcoding device, which is what makes QuickSync or
-// VAAPI usable.
+// DetectServerCapability inspects the host.
+//
+// Hardware encoders are verified by running one, never inferred. Being listed
+// in `ffmpeg -encoders` only means the encoder was compiled in, and the presence
+// of a device node does not mean it can be driven: an AMD machine exposes
+// /dev/dri exactly as an Intel one does, so a QuickSync encoder can be selected
+// on a host where QuickSync cannot work at all. Both signals together are still
+// not proof, and trusting them produces a server that fails every transcode
+// with "Error creating a MFX session".
 func DetectServerCapability(ctx context.Context, ffmpegBin, ffprobeBin, deviceDir string) ServerCapability {
 	if deviceDir == "" {
 		deviceDir = "/dev/dri"
@@ -287,21 +296,73 @@ func DetectServerCapability(ctx context.Context, ffmpegBin, ffprobeBin, deviceDi
 	if err := cmd.Run(); err != nil {
 		return capability
 	}
-	capability.VideoEncoders = videoEncodersOnly(ParseEncoders(stdout.String()))
 
-	hasDevice := false
-	if entries, err := os.ReadDir(deviceDir); err == nil && len(entries) > 0 {
-		hasDevice = true
+	// Software encoders are trusted once listed; hardware encoders have to
+	// prove themselves, because the failure mode of a wrong guess is that no
+	// transcode works at all.
+	for _, encoder := range videoEncodersOnly(ParseEncoders(stdout.String())) {
+		if isHardwareEncoder(encoder) && !encoderWorks(ctx, ffmpegBin, encoder, deviceDir) {
+			continue
+		}
+		capability.VideoEncoders = append(capability.VideoEncoders, encoder)
 	}
 
 	switch {
-	case hasDevice && containsFold(capability.VideoEncoders, "h264_qsv"):
+	case containsFold(capability.VideoEncoders, "h264_qsv"),
+		containsFold(capability.VideoEncoders, "hevc_qsv"):
 		capability.HardwareAcceleration = "qsv"
-	case hasDevice && containsFold(capability.VideoEncoders, "h264_vaapi"):
+	case containsFold(capability.VideoEncoders, "h264_vaapi"),
+		containsFold(capability.VideoEncoders, "hevc_vaapi"):
 		capability.HardwareAcceleration = "vaapi"
 	}
 
 	return capability
+}
+
+// encoderTime out bounds a single capability probe.
+const encoderProbeTimeout = 20 * time.Second
+
+// encoderWorks encodes a fraction of a second to nowhere. A missing driver, an
+// unusable device or the wrong GPU vendor all fail here, which is exactly the
+// condition that matters.
+func encoderWorks(ctx context.Context, ffmpegBin, encoder, deviceDir string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, encoderProbeTimeout)
+	defer cancel()
+
+	args := []string{
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc=size=320x240:rate=5:duration=0.2",
+	}
+
+	if strings.HasSuffix(encoder, "_vaapi") {
+		// VAAPI needs a render node pointed at explicitly.
+		device, ok := firstRenderNode(deviceDir)
+		if !ok {
+			return false
+		}
+		args = append(args, "-vaapi_device", device, "-vf", "format=nv12,hwupload")
+	}
+
+	args = append(args, "-c:v", encoder, "-f", "null", "-")
+
+	probe := exec.CommandContext(probeCtx, ffmpegBin, args...)
+	probe.Stdout = io.Discard
+	probe.Stderr = io.Discard
+	return probe.Run() == nil
+}
+
+// firstRenderNode finds a DRM render node, which is what VAAPI requires.
+func firstRenderNode(deviceDir string) (string, bool) {
+	entries, err := os.ReadDir(deviceDir)
+	if err != nil {
+		return "", false
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "renderD") {
+			return filepath.Join(deviceDir, entry.Name()), true
+		}
+	}
+	return "", false
 }
 
 // videoEncodersOnly keeps the encoders this project can actually target.

@@ -6,8 +6,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jok/astraeus-media/internal/observability"
 )
 
 // newTestLogger keeps manager logging out of the test output.
@@ -162,5 +166,126 @@ func TestManager_ReapStopsIdleSessions(t *testing.T) {
 	}
 	if _, ok := manager.Session("idle"); ok {
 		t.Error("the idle session is still registered")
+	}
+}
+
+// TestManager_StartFallsBackToSoftwareWhenHardwareFails reproduces the reported
+// failure: an encoder that is *listed* but cannot open a session. The stub
+// ffmpeg below fails exactly the way h264_qsv does on a machine with no Intel
+// GPU ("Error creating a MFX session"), and the manager must notice and retry
+// in software rather than failing the request.
+func TestManager_StartFallsBackToSoftwareWhenHardwareFails(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub encoder is a shell script")
+	}
+
+	dir := t.TempDir()
+	encoder := filepath.Join(dir, "ffmpeg-stub")
+	stub := `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "h264_qsv" ]; then
+    echo "[h264_qsv @ 0x0] Error creating a MFX session: -9." >&2
+    exit 1
+  fi
+done
+out=""
+for arg in "$@"; do out="$arg"; done
+mkdir -p "$(dirname "$out")"
+printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000000,\nseg00000.ts\n' > "$out"
+printf 'segment' > "$(dirname "$out")/seg00000.ts"
+exit 0
+`
+	if err := os.WriteFile(encoder, []byte(stub), 0o755); err != nil {
+		t.Fatalf("writing the stub encoder: %v", err)
+	}
+
+	metrics := observability.New()
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		FFmpegBin:      encoder,
+		RootDir:        filepath.Join(dir, "sessions"),
+		SegmentSeconds: 4,
+		Server: ServerCapability{
+			VideoEncoders:        []string{"h264_qsv", "libx264"},
+			HardwareAcceleration: "qsv",
+		},
+		Metrics: metrics,
+		Logger:  newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	// A hardware encoder would be chosen, so the first attempt fails.
+	decision := Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+	}
+	if !wouldUseHardware(decision, manager.Config()) {
+		t.Fatal("this test needs a decision that would use the hardware encoder")
+	}
+
+	session, err := manager.Start(context.Background(), "entity-1", "/media/movie.mkv", decision)
+	if err != nil {
+		t.Fatalf("Start should have retried in software, got: %v", err)
+	}
+	t.Cleanup(func() { manager.Stop(session.ID) })
+
+	if rendered := metrics.Render(); !strings.Contains(rendered, "astraeus_transcode_fallbacks_total 1") {
+		t.Errorf("the fallback was not counted:\n%s", rendered)
+	}
+}
+
+func TestWouldUseHardware(t *testing.T) {
+	t.Parallel()
+
+	quickSync := ManagerConfig{
+		Server: ServerCapability{VideoEncoders: []string{"h264_qsv", "libx264"}, HardwareAcceleration: "qsv"},
+	}
+	software := ManagerConfig{
+		Server: ServerCapability{VideoEncoders: []string{"libx264"}},
+	}
+
+	transcode := Decision{Mode: ModeTranscode, VideoAction: ActionTranscode, TargetVideoCodec: "h264"}
+	remux := Decision{Mode: ModeRemux, VideoAction: ActionCopy}
+	direct := Decision{Mode: ModeDirectPlay, VideoAction: ActionCopy}
+
+	if !wouldUseHardware(transcode, quickSync) {
+		t.Error("a transcode on a QuickSync host should use hardware")
+	}
+	if wouldUseHardware(transcode, software) {
+		t.Error("a software-only host must not report hardware use")
+	}
+	if wouldUseHardware(remux, quickSync) {
+		t.Error("a stream copy uses no encoder at all")
+	}
+	if wouldUseHardware(direct, quickSync) {
+		t.Error("direct play uses no encoder at all")
+	}
+}
+
+func TestWithoutHardware(t *testing.T) {
+	t.Parallel()
+
+	cfg := withoutHardware(ManagerConfig{
+		Server: ServerCapability{
+			VideoEncoders:        []string{"h264_qsv", "hevc_vaapi", "libx264"},
+			HardwareAcceleration: "qsv",
+		},
+	})
+
+	if cfg.Server.HardwareAcceleration != "" {
+		t.Errorf("hardware acceleration = %q, want it cleared", cfg.Server.HardwareAcceleration)
+	}
+	for _, encoder := range cfg.Server.VideoEncoders {
+		if isHardwareEncoder(encoder) {
+			t.Errorf("hardware encoder %q survived the downgrade", encoder)
+		}
+	}
+	if len(cfg.Server.VideoEncoders) != 1 || cfg.Server.VideoEncoders[0] != "libx264" {
+		t.Errorf("software encoders = %v, want just libx264", cfg.Server.VideoEncoders)
 	}
 }

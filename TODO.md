@@ -90,6 +90,10 @@ Status as of the current build. Evidence for each claim is the test suite
   a previous run are swept at startup.
 - Probe results are cached per path for the process lifetime; a file replaced
   underneath the server keeps its old technical metadata until restart.
+- Hardware encoders are verified only at startup, and only with a bare test
+  encode: a driver that works for 320x240 could still fail at 4K, which is what
+  the runtime software fallback is for. VAAPI needs a render node and could not
+  be exercised on this development host, since its `/dev/dri` is not visible.
 - The hls.js fatal-error recovery path and the native-HLS (Safari) branch are
   implemented but have not been observed firing — no Safari was available, and a
   stream failure could not be forced on a live server.
