@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jok/astraeus-media/internal/library"
@@ -28,22 +29,29 @@ type fakeStreams struct {
 	started   int
 	lastPath  string
 	lastMode  streaming.PlaybackMode
+	lastStart float64
 	startErr  error
 	servedOut string
 }
 
-func (f *fakeStreams) Start(_ context.Context, entityID, objectPath string, decision streaming.Decision) (*streaming.Session, error) {
+func (f *fakeStreams) Start(ctx context.Context, entityID, objectPath string, decision streaming.Decision) (*streaming.Session, error) {
+	return f.StartAt(ctx, entityID, objectPath, decision, 0)
+}
+
+func (f *fakeStreams) StartAt(_ context.Context, entityID, objectPath string, decision streaming.Decision, startSeconds float64) (*streaming.Session, error) {
 	if f.startErr != nil {
 		return nil, f.startErr
 	}
 	f.started++
 	f.lastPath = objectPath
 	f.lastMode = decision.Mode
+	f.lastStart = startSeconds
 	return &streaming.Session{
-		ID:         "fake-session",
-		EntityID:   entityID,
-		ObjectPath: objectPath,
-		Decision:   decision,
+		ID:           "fake-session",
+		EntityID:     entityID,
+		ObjectPath:   objectPath,
+		Decision:     decision,
+		StartSeconds: startSeconds,
 	}, nil
 }
 
@@ -406,4 +414,75 @@ func TestSystemCapabilities(t *testing.T) {
 	if !response.NegotiationEnabled || !response.SegmentingEnabled {
 		t.Errorf("expected both negotiation and segmenting to be reported as enabled: %+v", response)
 	}
+}
+
+// TestPlayback_StartSeconds covers resuming at an offset, which is what a
+// quality change and a seek past produced content both rely on.
+func TestPlayback_StartSeconds(t *testing.T) {
+	t.Parallel()
+
+	transcodeInfo := &streaming.MediaInfo{
+		Container: "mp4", VideoCodec: "hevc", AudioCodec: "ac3",
+		Width: 3840, Height: 1600, DurationSeconds: 6000, AudioChannels: 6,
+	}
+
+	t.Run("an offset reaches the stream and is echoed back", func(t *testing.T) {
+		t.Parallel()
+
+		streams := &fakeStreams{}
+		env := newTestEnv(t, withProber(stubProber{info: transcodeInfo}), withStreams(streams))
+		entity, _ := seedPlayableEntity(t, env, "Dune (2021).mp4", "not really a video")
+
+		recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback",
+			`{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],"max_height":720,"supports_hls":true,"start_seconds":600.5}`)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+		}
+
+		if streams.lastStart != 600.5 {
+			t.Errorf("stream started at %v, want 600.5", streams.lastStart)
+		}
+		response := decodeBody[playbackResponse](t, recorder)
+		if response.StartSeconds != 600.5 {
+			t.Errorf("response start_seconds = %v, want 600.5", response.StartSeconds)
+		}
+	})
+
+	t.Run("a negative offset is refused", func(t *testing.T) {
+		t.Parallel()
+
+		env := newTestEnv(t, withProber(stubProber{info: transcodeInfo}), withStreams(&fakeStreams{}))
+		entity, _ := seedPlayableEntity(t, env, "Dune (2021).mp4", "not really a video")
+
+		recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback",
+			`{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],"max_height":720,"supports_hls":true,"start_seconds":-5}`)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), "non-negative") {
+			t.Errorf("the error should explain itself: %s", recorder.Body.String())
+		}
+	})
+
+	t.Run("an offset past the end is refused before ffmpeg is asked", func(t *testing.T) {
+		t.Parallel()
+
+		streams := &fakeStreams{}
+		env := newTestEnv(t, withProber(stubProber{info: &streaming.MediaInfo{
+			Container: "mp4", VideoCodec: "hevc", Width: 3840, Height: 1600, DurationSeconds: 100,
+		}}), withStreams(streams))
+		entity, _ := seedPlayableEntity(t, env, "Dune (2021).mp4", "not really a video")
+
+		recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback",
+			`{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],"max_height":720,"supports_hls":true,"start_seconds":5000}`)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), "past the end") {
+			t.Errorf("the error should say why: %s", recorder.Body.String())
+		}
+		if streams.started != 0 {
+			t.Error("a session was started for a start offset past the end of the media")
+		}
+	})
 }

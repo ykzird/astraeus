@@ -695,3 +695,51 @@ func TestTargetHeightIsAlwaysEven(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildFFmpegArgsAt_SeeksOnTheInput covers the offset that makes a quality
+// change or a seek into unproduced content resume where the viewer is. -ss must
+// come before -i, otherwise ffmpeg decodes everything up to the offset first,
+// which on a 4K film means minutes of nothing.
+func TestBuildFFmpegArgsAt_SeeksOnTheInput(t *testing.T) {
+	t.Parallel()
+
+	cfg := ManagerConfig{SegmentSeconds: 4, Server: ServerCapability{VideoEncoders: []string{"libx264"}}}
+	decision := Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+	}
+
+	args, err := BuildFFmpegArgsAt("/tmp/s", "/media/movie.mkv", decision, cfg, 901.5)
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgsAt: %v", err)
+	}
+
+	seek, input := -1, -1
+	for i, arg := range args {
+		switch arg {
+		case "-ss":
+			seek = i
+		case "-i":
+			input = i
+		}
+	}
+	if seek == -1 {
+		t.Fatalf("no -ss in:\n%s", strings.Join(args, " "))
+	}
+	if seek > input {
+		t.Errorf("-ss must precede -i so ffmpeg seeks the input; got -ss at %d, -i at %d", seek, input)
+	}
+	if args[seek+1] != "901.500" {
+		t.Errorf("seek offset = %q, want %q", args[seek+1], "901.500")
+	}
+
+	// From the beginning, no -ss at all.
+	plain, err := BuildFFmpegArgsAt("/tmp/s", "/media/movie.mkv", decision, cfg, 0)
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgsAt: %v", err)
+	}
+	if strings.Contains(strings.Join(plain, " "), "-ss") {
+		t.Errorf("a zero offset should not emit -ss:\n%s", strings.Join(plain, " "))
+	}
+}

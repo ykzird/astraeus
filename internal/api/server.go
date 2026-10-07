@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -32,6 +34,9 @@ const maxRequestBody = 1 << 20 // 1 MiB
 // interface so handler tests do not need ffmpeg installed.
 type StreamManager interface {
 	Start(ctx context.Context, entityID, objectPath string, decision streaming.Decision) (*streaming.Session, error)
+	// StartAt begins delivery at an offset into the source, which is what a
+	// seek beyond produced content, or a quality change, needs.
+	StartAt(ctx context.Context, entityID, objectPath string, decision streaming.Decision, startSeconds float64) (*streaming.Session, error)
 	Session(id string) (*streaming.Session, bool)
 	ServeFile(w http.ResponseWriter, r *http.Request, sessionID, name string)
 }
@@ -443,6 +448,16 @@ type playbackResponse struct {
 	MediaInfo *streaming.MediaInfo   `json:"media_info,omitempty"`
 	// Subtitles lists every subtitle track, and whether it can be delivered.
 	Subtitles []subtitleResource `json:"subtitles,omitempty"`
+	// StartSeconds echoes where this stream begins in the source, so a client
+	// can present a continuous timeline across a seek or a quality change.
+	StartSeconds float64 `json:"start_seconds,omitempty"`
+}
+
+// playbackRequest is the optional body of a playback request: the client's
+// capability manifest, plus where in the source it wants to begin.
+type playbackRequest struct {
+	streaming.ClientCapability
+	StartSeconds float64 `json:"start_seconds"`
 }
 
 // handlePlayback negotiates how to deliver an entity to the calling client and
@@ -476,18 +491,26 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	object := objects[0]
 
 	capability := streaming.BrowserCapability()
+	startSeconds := 0.0
 	// A non-zero ContentLength includes the -1 sent by chunked requests, so a
 	// streamed capability body is still honoured.
 	if r.ContentLength != 0 {
-		var declared streaming.ClientCapability
-		if !decodeJSON(w, r, &declared) {
+		var request playbackRequest
+		if !decodeJSON(w, r, &request) {
 			return
 		}
+		declared := request.ClientCapability
 		if err := declared.Validate(); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_capability", err.Error())
 			return
 		}
+		if math.IsNaN(request.StartSeconds) || math.IsInf(request.StartSeconds, 0) || request.StartSeconds < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_start",
+				"start_seconds must be a finite, non-negative number of seconds")
+			return
+		}
 		capability = declared
+		startSeconds = request.StartSeconds
 	}
 
 	info, err := s.prober.Probe(ctx, object.FilePath)
@@ -499,17 +522,27 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Starting past the end produces no output at all, and ffmpeg's complaint
+	// about it is not something a client could act on.
+	if startSeconds > 0 && info.DurationSeconds > 0 && startSeconds >= info.DurationSeconds {
+		writeError(w, http.StatusBadRequest, "start_beyond_end",
+			fmt.Sprintf("start_seconds %.3f is at or past the end of the media (%.3f seconds)",
+				startSeconds, info.DurationSeconds))
+		return
+	}
+
 	decision := streaming.Negotiate(info, capability)
 	s.metrics.IncCounter("astraeus_playback_decisions_total",
 		"Playback negotiations, by the mode they chose.",
 		map[string]string{"mode": string(decision.Mode)})
 	response := playbackResponse{
-		EntityID:  entity.ID,
-		ObjectID:  object.ID,
-		Mode:      decision.Mode,
-		Decision:  decision,
-		MediaInfo: info,
-		Subtitles: s.subtitleResources(object.ID, info.Subtitles),
+		EntityID:     entity.ID,
+		ObjectID:     object.ID,
+		Mode:         decision.Mode,
+		Decision:     decision,
+		MediaInfo:    info,
+		Subtitles:    s.subtitleResources(object.ID, info.Subtitles),
+		StartSeconds: startSeconds,
 	}
 
 	if decision.Mode == streaming.ModeDirectPlay {
@@ -528,7 +561,7 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, err := s.streams.Start(ctx, entity.ID, object.FilePath, decision)
+	session, err := s.streams.StartAt(ctx, entity.ID, object.FilePath, decision, startSeconds)
 	if err != nil {
 		s.logger.ErrorContext(ctx, "starting streaming session", "entity_id", entity.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "stream_start_failed", err.Error())

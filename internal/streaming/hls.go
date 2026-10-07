@@ -50,6 +50,11 @@ type Session struct {
 	Decision   Decision
 	Dir        string
 
+	// StartSeconds is where this session begins in the source. A client maps
+	// media time back to source time by adding it, which is what lets a seek or
+	// a quality change present a continuous timeline.
+	StartSeconds float64
+
 	mu         sync.Mutex
 	cancel     context.CancelFunc
 	done       chan struct{}
@@ -209,16 +214,32 @@ func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration) {
 // or report capabilities.
 func (m *Manager) Config() ManagerConfig { return m.cfg }
 
-// Start begins a segmented delivery and returns once the playlist exists.
+// Start begins a segmented delivery from the beginning of the source.
+func (m *Manager) Start(ctx context.Context, entityID, objectPath string, decision Decision) (*Session, error) {
+	return m.StartAt(ctx, entityID, objectPath, decision, 0)
+}
+
+// StartAt begins a segmented delivery whose timeline starts at startSeconds
+// into the source.
+//
+// This is what makes a quality change, or a seek into a part of the film that
+// has not been produced yet, resume where the viewer is rather than sending
+// them back to the opening titles. Seeking is applied to the input, so ffmpeg
+// starts near the requested point instead of decoding everything before it; the
+// first segment may therefore begin slightly earlier, at the preceding
+// keyframe.
 //
 // If the stream fails to come up and a hardware encoder was in play, the same
 // decision is retried in software. A hardware encoder can be listed by ffmpeg
 // and still fail to open a session - a missing driver, or simply the wrong GPU
 // vendor - and failing the request when a working software path exists would be
 // the wrong answer.
-func (m *Manager) Start(ctx context.Context, entityID, objectPath string, decision Decision) (*Session, error) {
+func (m *Manager) StartAt(ctx context.Context, entityID, objectPath string, decision Decision, startSeconds float64) (*Session, error) {
+	if startSeconds < 0 {
+		startSeconds = 0
+	}
 	cfg := m.cfg
-	session, err := m.startOnce(ctx, entityID, objectPath, decision, cfg)
+	session, err := m.startOnce(ctx, entityID, objectPath, decision, cfg, startSeconds)
 	if err == nil || !wouldUseHardware(decision, cfg) {
 		return session, err
 	}
@@ -229,7 +250,7 @@ func (m *Manager) Start(ctx context.Context, entityID, objectPath string, decisi
 		"Transcodes that failed on a hardware encoder and were retried in software.", nil)
 
 	cfg = withoutHardware(cfg)
-	return m.startOnce(ctx, entityID, objectPath, decision, cfg)
+	return m.startOnce(ctx, entityID, objectPath, decision, cfg, startSeconds)
 }
 
 // wouldUseHardware reports whether this decision would be served by a hardware
@@ -256,7 +277,7 @@ func withoutHardware(cfg ManagerConfig) ManagerConfig {
 }
 
 // startOnce prepares and launches one session with the given configuration.
-func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, decision Decision, cfg ManagerConfig) (*Session, error) {
+func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, decision Decision, cfg ManagerConfig, startSeconds float64) (*Session, error) {
 	if decision.Mode == ModeDirectPlay {
 		return nil, ErrDirectPlayHasNoSession
 	}
@@ -270,7 +291,7 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 		return nil, fmt.Errorf("creating session directory: %w", err)
 	}
 
-	args, err := BuildFFmpegArgs(dir, objectPath, decision, cfg)
+	args, err := BuildFFmpegArgsAt(dir, objectPath, decision, cfg, startSeconds)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
@@ -278,15 +299,16 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 
 	runCtx, cancel := context.WithCancel(m.baseCtx)
 	session := &Session{
-		ID:         sessionID,
-		EntityID:   entityID,
-		ObjectPath: objectPath,
-		Decision:   decision,
-		Dir:        dir,
-		cancel:     cancel,
-		done:       make(chan struct{}),
-		startedAt:  time.Now(),
-		lastAccess: time.Now(),
+		ID:           sessionID,
+		EntityID:     entityID,
+		ObjectPath:   objectPath,
+		Decision:     decision,
+		Dir:          dir,
+		cancel:       cancel,
+		done:         make(chan struct{}),
+		startedAt:    time.Now(),
+		lastAccess:   time.Now(),
+		StartSeconds: startSeconds,
 	}
 
 	cmd := exec.CommandContext(runCtx, cfg.FFmpegBin, args...)
@@ -513,9 +535,17 @@ func (m *Manager) ServeFile(w http.ResponseWriter, r *http.Request, sessionID, n
 	http.ServeFile(w, r, filepath.Join(session.Dir, name))
 }
 
-// BuildFFmpegArgs renders the ffmpeg invocation for a decision. It is exported
-// so the command line can be asserted in tests without running ffmpeg.
+// BuildFFmpegArgs renders the ffmpeg invocation for a decision from the start
+// of the source. It is exported so the command line can be asserted in tests
+// without running ffmpeg.
 func BuildFFmpegArgs(dir, inputPath string, decision Decision, cfg ManagerConfig) ([]string, error) {
+	return BuildFFmpegArgsAt(dir, inputPath, decision, cfg, 0)
+}
+
+// BuildFFmpegArgsAt renders the ffmpeg invocation for a decision, beginning at
+// startSeconds into the source. Placing -ss before -i makes ffmpeg seek on the
+// input, which is fast, at the cost of landing on the preceding keyframe.
+func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConfig, startSeconds float64) ([]string, error) {
 	if decision.Mode == ModeDirectPlay {
 		return nil, ErrDirectPlayHasNoSession
 	}
@@ -524,10 +554,15 @@ func BuildFFmpegArgs(dir, inputPath string, decision Decision, cfg ManagerConfig
 		"-hide_banner",
 		"-loglevel", "error",
 		"-y",
+	}
+	if startSeconds > 0 {
+		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
+	}
+	args = append(args,
 		"-i", inputPath,
 		"-map", "0:v:0",
 		"-map", "0:a:0?",
-	}
+	)
 
 	switch decision.VideoAction {
 	case ActionCopy:
