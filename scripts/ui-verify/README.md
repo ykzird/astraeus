@@ -23,8 +23,10 @@ chromium --headless=new --no-sandbox --disable-gpu --mute-audio \
   --remote-allow-origins='*' --user-data-dir="$(mktemp -d)" about:blank &
 
 cd scripts/ui-verify
-node player-verify.mjs   http://127.0.0.1:8810 <episodeId> <movieId>
-node subtitle-verify.mjs http://127.0.0.1:8810 <captionedEpisodeId> <movieId>
+node player-verify.mjs        http://127.0.0.1:8810 <episodeId> <movieId>
+node subtitle-verify.mjs      http://127.0.0.1:8810 <captionedEpisodeId> <movieId>
+node player-chrome-verify.mjs http://127.0.0.1:8810 <entityId>
+node real-media-verify.mjs    http://127.0.0.1:8810 <entityId> [timeoutSeconds]
 ```
 
 `CDP_PORT` overrides the debugging port (default 9333).
@@ -41,6 +43,30 @@ node subtitle-verify.mjs http://127.0.0.1:8810 <captionedEpisodeId> <movieId>
   direct_play/remux with the browser profile) and its re-encoded playlist is
   played through the same `hls.js`, so the re-encode path is exercised too;
 - no console errors.
+
+`player-chrome-verify.mjs`
+
+- the transport is overlaid on the video and there is exactly one play control,
+  so the sidebar and the player cannot disagree;
+- the seek bar and a fullscreen control live inside the player container;
+- play/pause from the overlay and Space from the keyboard both drive the video;
+- fullscreen entries target the player container (not the bare `<video>`), the
+  bar is still on screen in fullscreen, and leaving fullscreen updates the
+  control rather than leaving it lying;
+- the bar auto-hides while playing, a hidden bar is not tabbable, and pointer
+  movement brings it back.
+
+Controls are located semantically — a fullscreen control is whatever is
+labelled like one — so these checks survive renaming.
+
+`real-media-verify.mjs`
+
+- plays one entity through the UI and polls until the first frame, which fixed
+  sleeps cannot do for a 4K transcode;
+- reports the observed time to first frame, the mode badge, the server's
+  reasons and whether delivery went through MSE;
+- seeks within produced content, and reports the media element's state if it
+  never starts.
 
 `subtitle-verify.mjs`
 

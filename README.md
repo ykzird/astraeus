@@ -39,7 +39,9 @@ play when the codecs are ones it supports (typically mp4/H.264/AAC).
 `remux` and `transcode` produce **HLS**. Safari demuxes HLS natively; Chromium
 and Firefox do not, so the UI loads the vendored **hls.js** (MSE) for those
 browsers. See [`web/vendor/README.md`](web/vendor/README.md) for the pinned
-version, licence and provenance. No shipped page depends on a third-party origin
+version, licence and provenance, and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the licence notices that
+must travel with any redistribution. No shipped page depends on a third-party origin
 at runtime.
 
 Seek behaviour on a segmented stream is limited by how far the transcoder has
@@ -247,6 +249,15 @@ The decision also carries the concrete targets it chose — `target_height` for 
 downscale and `target_audio_channels` for a downmix — so a client can see not
 just that it will be re-encoded but what it will get.
 
+An omitted limit means **unrestricted**, so a client that says nothing about
+channels gets the source's own channel count. That is the right default for a
+native player, which may well want the 5.1 mix, but it is a trap for a browser:
+Chromium refuses a 5.1 AAC `SourceBuffer`, and because the audio append fails
+first it tears down the whole `MediaSource`, so the player attaches, fetches
+every segment and never shows a frame. A browser client should declare
+`max_audio_channels: 2` and `max_bit_depth: 8` — the built-in profile already
+does.
+
 ## Access gate
 
 Per the specification, authentication is delegated to an identity-aware proxy
@@ -314,6 +325,7 @@ internal/observability/ KPI registry and Prometheus exposition
 internal/access/        the access gate
 internal/api/           HTTP layer
 web/                    the Spatial Web UI, including vendored hls.js
+                        and the generated BoxIcons registry (web/icons.js)
 scripts/ui-verify/      browser harnesses for playback and subtitles
 scripts/make-demo-media.sh  generates a throwaway demo library
 ```

@@ -89,6 +89,33 @@
     while (node.firstChild) node.removeChild(node.firstChild);
   }
 
+  /**
+   * Build an icon from the registry in icons.js, which index.html loads before
+   * this file. If that script is missing the UI stays usable: every control
+   * also carries its own accessible name, so only the glyph is lost.
+   */
+  function icon(name, options) {
+    if (window.AstraeusIcons && typeof window.AstraeusIcons.icon === "function") {
+      return window.AstraeusIcons.icon(name, options);
+    }
+    return el("span", { class: "icon icon-missing", "aria-hidden": "true" });
+  }
+
+  /**
+   * Swap a button's glyph and optional visible label. syncTransport runs on
+   * every timeupdate, so an identical update is skipped rather than rebuilt.
+   */
+  function setIconButton(button, name, label) {
+    if (!button) return;
+    const nextLabel = label || "";
+    if (button.dataset.icon === name && button.dataset.iconLabel === nextLabel) return;
+    button.dataset.icon = name;
+    button.dataset.iconLabel = nextLabel;
+    clear(button);
+    button.append(icon(name));
+    if (nextLabel) button.append(el("span", { class: "btn-label", text: nextLabel }));
+  }
+
   const countFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
   const byteFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
   const dateFmt = new Intl.DateTimeFormat(undefined, {
@@ -343,6 +370,9 @@
       subtitles: [],
       /* "off", or the key of the selected deliverable track. */
       subtitleSelection: "off",
+      /* Overlay chrome, kept per session so a new one starts visible. */
+      controlsVisible: true,
+      fullscreen: false,
     };
   }
 
@@ -963,6 +993,22 @@
     dom.canvasContent.append(browse);
   }
 
+  /* The canvas's own Play affordance, distinct from the player's toggle: while
+     the player is up this one is inside the inert underlay. */
+  function heroPlayButton(entity, detail) {
+    const objects = Array.isArray(detail.objects) ? detail.objects : [];
+    const button = el("button", {
+      type: "button",
+      class: "btn btn-primary",
+      "data-action": "play",
+      "data-focus-key": "play-hero",
+      disabled: objects.length === 0,
+      "aria-label": "Play " + displayTitle(entity),
+    });
+    setIconButton(button, "play", "Play");
+    return button;
+  }
+
   function renderLeafCanvas(detail) {
     const entity = detail.entity;
     const metadata = metadataOf(entity);
@@ -987,15 +1033,7 @@
           "No description has been attached to this entity yet. Enrich metadata to fill this in.",
       }),
       el("div", { class: "hero-actions" }, [
-        el("button", {
-          type: "button",
-          class: "btn btn-primary",
-          "data-action": "play",
-          "data-focus-key": "play-hero",
-          disabled: !Array.isArray(detail.objects) || detail.objects.length === 0,
-          "aria-label": "Play " + displayTitle(entity),
-          text: "▶ Play",
-        }),
+        heroPlayButton(entity, detail),
       ]),
     ]);
 
@@ -1320,91 +1358,21 @@
   function renderPlaybackSection(entity, objects, isLeaf) {
     const pb = state.playback;
     const hasObjects = Array.isArray(objects) && objects.length > 0;
-    const playable = isLeafType(entity.type) && hasObjects;
 
-    /* A negotiation belongs to one entity only. */
+    /* A negotiation belongs to one entity only. The controls themselves live
+       on the player overlay (see buildPlayerOverlay); this panel is purely
+       informational: what was decided, and what is happening. */
     const isCurrent = pb.entityId === entity.id;
     const status = isCurrent ? pb.status : "idle";
-    const live = isCurrent && (status === "ready" || status === "playing" || status === "paused");
-    const busy = isCurrent && status === "loading";
-
-    const playing = live && pb.started && playerVideo && !playerVideo.paused && !playerVideo.ended;
-
-    const transport = el("div", { class: "transport" }, [
-      el("button", {
-        type: "button",
-        class: "btn btn-primary",
-        "data-action": "play",
-        "data-focus-key": "play",
-        id: "player-toggle",
-        disabled: !playable || busy,
-        "aria-label": playing ? "Pause" : "Play",
-        text: playing ? "❚❚ Pause" : "▶ Play",
-      }),
-      el("button", {
-        type: "button",
-        class: "btn",
-        "data-action": "restart",
-        "data-focus-key": "restart",
-        disabled: !live,
-        "aria-label": "Restart from the beginning",
-        text: "⏮",
-      }),
-      el("button", {
-        type: "button",
-        class: "btn",
-        "data-action": "skip",
-        "data-focus-key": "skip",
-        disabled: !live,
-        "aria-label": "Skip forward 10 seconds",
-        text: "⏭",
-      }),
-      live
-        ? el("button", {
-            type: "button",
-            class: "btn btn-quiet",
-            "data-action": "stop-playback",
-            "data-focus-key": "stop",
-            text: "Stop",
-          })
-        : null,
-    ]);
-
-    /* The seek bar is bound to the real seekable window, never to an assumed
-       duration: a segmented stream grows while ffmpeg produces segments. */
-    const bounds = live ? seekableBounds() : { start: 0, end: 0 };
-    const seekable = live && bounds.end > 0;
+    const playable = isLeafType(entity.type) && hasObjects;
+    const live = isCurrent && playbackIsLive(pb);
     const growing = live && isEventPlaylistPlayback();
+    const bounds = live ? seekableBounds() : { start: 0, end: 0 };
+    const duration = bounds.end > 0 ? bounds.end : mediaInfoDuration(pb);
 
-    const seek = el("input", {
-      type: "range",
-      class: "seek",
-      id: "player-seek",
-      min: String(bounds.start),
-      max: String(seekable ? bounds.end : 100),
-      step: "0.1",
-      value: String(seekable ? Math.min(Math.max(pb.currentTime, bounds.start), bounds.end) : 0),
-      disabled: !seekable,
-      "aria-label": growing ? "Seek within the produced part of the stream" : "Seek position",
-      "aria-describedby": "playback-note",
-      "aria-valuetext": seekable
-        ? formatClock(pb.currentTime) + " of " + formatClock(bounds.end)
-        : "unavailable",
-    });
+    const children = [];
 
-    const time = el("span", {
-      class: "player-time",
-      id: "player-time",
-      text: seekable
-        ? formatClock(pb.currentTime) + " / " + formatClock(bounds.end)
-        : "0:00 / 0:00",
-    });
-
-    const seekRow = el("div", { class: "seek-row" }, [seek, time]);
-
-    const children = [transport, seekRow];
-
-    if (live && pb.mode) {
+    if (isCurrent && pb.mode) {
       children.push(
         el("div", { class: "delivery-facts" }, [
           el("span", { class: "mode-badge " + modeClass(pb.mode), text: modeLabel(pb.mode) }),
@@ -1423,10 +1391,10 @@
                 text: pb.mediaInfo.width + "×" + pb.mediaInfo.height,
               })
             : null,
-          bounds.end > 0
+          duration > 0
             ? el("span", {
                 class: "chip",
-                text: (growing ? "produced " : "") + formatClock(bounds.end),
+                text: (growing ? "produced " : "") + formatClock(duration),
               })
             : null,
         ])
@@ -1446,23 +1414,19 @@
       );
     }
 
-    if (live && pb.decision && Array.isArray(pb.decision.reasons) && pb.decision.reasons.length) {
+    if (isCurrent && pb.decision && Array.isArray(pb.decision.reasons) && pb.decision.reasons.length) {
       children.push(
         el(
           "ul",
           { class: "reasons" },
           pb.decision.reasons.map(function (reason) {
-            return el("li", { text: String(reason) });
+            return el("li", null, [
+              icon("arrow-right"),
+              el("span", { text: String(reason) }),
+            ]);
           })
         )
       );
-    }
-
-    /* Subtitle selection belongs to one negotiated session only, so it is
-       shown only while that session is the current one. */
-    if (isCurrent) {
-      const subtitleNode = subtitleSelectorNode(pb, live);
-      if (subtitleNode) children.push(subtitleNode);
     }
 
     children.push(el("p", { class: "playback-note", id: "playback-note", "data-state": noteState(status, playable), text: noteText(entity, status, playable, pb) }));
@@ -1785,12 +1749,33 @@
     state.playback.started = true;
     state.playback.status = "ready";
     syncTransport();
+    showPlayerControls();
+    scheduleControlsHide();
   });
-  playerVideo.addEventListener("pause", syncTransport);
-  playerVideo.addEventListener("ended", syncTransport);
+  playerVideo.addEventListener("pause", function () {
+    syncTransport();
+    /* Never fade away on a paused frame. */
+    showPlayerControls();
+  });
+  playerVideo.addEventListener("ended", function () {
+    syncTransport();
+    showPlayerControls();
+  });
   playerVideo.addEventListener("progress", syncTransport);
   playerVideo.addEventListener("seeked", syncTransport);
   playerVideo.addEventListener("error", onVideoError);
+
+  /* The overlay is a sibling of the <video> and, like it, is created once and
+     never re-created by a canvas repaint. Only its contents are rebuilt. */
+  const playerOverlay = document.createElement("div");
+  playerOverlay.className = "player-overlay";
+  playerOverlay.id = "player-overlay";
+  playerOverlay.setAttribute("role", "group");
+  playerOverlay.setAttribute("aria-label", "Player controls");
+
+  const CONTROLS_HIDE_DELAY_MS = 3200;
+  let controlsHideTimer = null;
+  let pointerInsideOverlay = false;
 
   /* ── hls.js: lazily loaded, single instance, always torn down ────────── */
 
@@ -1866,6 +1851,20 @@
     return state.playback.mode !== "direct_play" && state.playback.segmented === true;
   }
 
+  /** True once a source is attached and the transport can actually drive it. */
+  function playbackIsLive(pb) {
+    if (!pb || !pb.url) return false;
+    const status = pb.status;
+    return status === "ready" || status === "playing" || status === "paused";
+  }
+
+  /** Duration the server reported, used only when the element has none yet. */
+  function mediaInfoDuration(pb) {
+    const info = pb && pb.mediaInfo;
+    const value = info ? Number(info.duration_seconds) : NaN;
+    return isFinite(value) && value > 0 ? value : 0;
+  }
+
   function handleHlsError(HlsCtor, instance, recovery, data) {
     if (!data) return;
     const pb = state.playback;
@@ -1913,6 +1912,7 @@
     pb.status = "error";
     pb.error = text;
     resetActiveMedia();
+    closePlayerLayer();
     setActionStatus(text, "error");
     showError(text, function () {
       doPlay();
@@ -2043,6 +2043,9 @@
     pb.status = "error";
     pb.error = message;
     resetActiveMedia();
+    /* The media is gone, so the overlay would be a dead control bar: close it
+       exactly as Stop and the segmented-failure path do. */
+    closePlayerLayer();
     setActionStatus(message, "error");
     showError(message, function () {
       doPlay();
@@ -2123,8 +2126,19 @@
     }
     if (toggle) {
       const playing = mediaLive && !playerVideo.paused && !playerVideo.ended;
-      toggle.textContent = playing ? "❚❚ Pause" : "▶ Play";
+      setIconButton(toggle, playing ? "pause" : "play", playing ? "Pause" : "Play");
       toggle.setAttribute("aria-label", playing ? "Pause" : "Play");
+    }
+    /* Fullscreen can be left with Esc or a swipe, so the button is driven from
+       the document state rather than from what we last asked for. */
+    const fullscreen = document.getElementById("player-fullscreen");
+    if (fullscreen) {
+      const on = fullscreenActive();
+      const label = on ? "Exit fullscreen" : "Enter fullscreen";
+      fullscreen.setAttribute("aria-pressed", on ? "true" : "false");
+      fullscreen.setAttribute("aria-label", label);
+      fullscreen.title = label;
+      setIconButton(fullscreen, on ? "fullscreen-exit" : "fullscreen-enter", on ? "Exit" : "Fullscreen");
     }
   }
 
@@ -2245,10 +2259,8 @@
        teardown's own `error`/`emptied` events cannot be mistaken for a real
        playback failure. */
     state.playback = emptyPlayback();
-    setUnderlayInert(false);
+    closePlayerLayer();
     resetActiveMedia();
-    dom.playerLayer.hidden = true;
-    clear(dom.playerLayer);
     if (!opts.silent) render();
   }
 
@@ -2264,31 +2276,347 @@
     }
   }
 
+  /* ── Player overlay: controls over the video ─────────────────────────── */
+
   function renderPlayerChrome() {
-    clear(dom.playerLayer);
     const pb = state.playback;
-    dom.playerLayer.append(playerVideo);
-    dom.playerLayer.append(
-      el("div", { class: "player-chrome" }, [
-        el("div", { class: "player-chrome-text" }, [
-          el("p", { class: "player-chrome-title", text: pb.title || "Now playing" }),
-          el("p", {
-            class: "player-chrome-sub",
-            text:
-              modeLabel(pb.mode) +
-              (pb.mediaInfo && pb.mediaInfo.container ? " · " + pb.mediaInfo.container : "") +
-              (pb.sessionId ? " · session " + String(pb.sessionId).slice(0, 8) : ""),
-          }),
-        ]),
-        el("button", {
-          type: "button",
-          class: "btn btn-small",
-          "data-action": "stop-playback",
-          "data-focus-key": "stop-player",
-          text: "Close player",
-        }),
-      ])
+    /* Keep the persistent <video> and overlay nodes in place; only their guts
+       are rebuilt, so a repaint can never detach a playing element. */
+    if (playerVideo.parentNode !== dom.playerLayer) dom.playerLayer.append(playerVideo);
+    if (playerOverlay.parentNode !== dom.playerLayer) dom.playerLayer.append(playerOverlay);
+
+    const restoreKey = focusKeyOf(document.activeElement);
+    clear(playerOverlay);
+    playerOverlay.append(buildPlayerTitleBar(pb));
+    playerOverlay.append(buildPlayerBar(pb));
+    applyControlsVisibility();
+    if (restoreKey) restoreFocus(restoreKey);
+  }
+
+  function buildPlayerTitleBar(pb) {
+    return el("div", { class: "player-titlebar" }, [
+      el("p", { class: "player-chrome-title", text: pb.title || "Now playing" }),
+      el("p", {
+        class: "player-chrome-sub",
+        text:
+          modeLabel(pb.mode) +
+          (pb.mediaInfo && pb.mediaInfo.container ? " · " + pb.mediaInfo.container : "") +
+          (pb.sessionId ? " · session " + String(pb.sessionId).slice(0, 8) : ""),
+      }),
+    ]);
+  }
+
+  function buildPlayerBar(pb) {
+    const live = playbackIsLive(pb);
+    const playing = live && !playerVideo.paused && !playerVideo.ended;
+    const bounds = live ? seekableBounds() : { start: 0, end: 0 };
+    const seekable = live && bounds.end > 0;
+    const growing = live && isEventPlaylistPlayback();
+
+    const toggle = el("button", {
+      type: "button",
+      class: "btn btn-primary",
+      id: "player-toggle",
+      "data-action": "play",
+      "data-focus-key": "play",
+      disabled: !live,
+      "aria-label": playing ? "Pause" : "Play",
+    });
+    setIconButton(toggle, playing ? "pause" : "play", playing ? "Pause" : "Play");
+
+    const restart = el("button", {
+      type: "button",
+      class: "btn",
+      "data-action": "restart",
+      "data-focus-key": "restart",
+      disabled: !live,
+      "aria-label": "Restart from the beginning",
+    });
+    setIconButton(restart, "restart", null);
+
+    const skip = el("button", {
+      type: "button",
+      class: "btn",
+      "data-action": "skip",
+      "data-focus-key": "skip",
+      disabled: !live,
+      "aria-label": "Skip forward 10 seconds",
+    });
+    setIconButton(skip, "skip-forward", null);
+
+    const stop = el("button", {
+      type: "button",
+      class: "btn btn-quiet",
+      "data-action": "stop-playback",
+      "data-focus-key": "stop",
+      "aria-label": "Stop playback and close the player",
+    });
+    setIconButton(stop, "stop", "Stop");
+
+    const fullscreenOn = document.fullscreenElement === dom.playerLayer;
+    const fullscreen = el("button", {
+      type: "button",
+      class: "btn",
+      id: "player-fullscreen",
+      "data-action": "fullscreen",
+      "data-focus-key": "fullscreen",
+      "aria-pressed": fullscreenOn ? "true" : "false",
+      "aria-label": fullscreenOn ? "Exit fullscreen" : "Enter fullscreen",
+      title: fullscreenOn ? "Exit fullscreen" : "Enter fullscreen",
+    });
+    setIconButton(
+      fullscreen,
+      fullscreenOn ? "fullscreen-exit" : "fullscreen-enter",
+      fullscreenOn ? "Exit" : "Fullscreen"
     );
+
+    const seek = el("input", {
+      type: "range",
+      class: "seek",
+      id: "player-seek",
+      "data-focus-key": "seek",
+      min: String(bounds.start),
+      max: String(seekable ? bounds.end : 100),
+      step: "0.1",
+      value: String(seekable ? Math.min(Math.max(pb.currentTime, bounds.start), bounds.end) : 0),
+      disabled: !seekable,
+      "aria-label": growing ? "Seek within the produced part of the stream" : "Seek position",
+      "aria-describedby": "playback-note",
+      "aria-valuetext": seekable
+        ? formatClock(pb.currentTime) + " of " + formatClock(bounds.end)
+        : "unavailable",
+    });
+
+    const time = el("span", {
+      class: "player-time",
+      id: "player-time",
+      text: seekable
+        ? formatClock(pb.currentTime) + " / " + formatClock(bounds.end)
+        : "0:00 / 0:00",
+    });
+
+    const rows = [
+      el("div", { class: "player-scrub" }, [seek, time]),
+      el("div", { class: "player-buttons" }, [
+        toggle,
+        restart,
+        skip,
+        stop,
+        el("span", { class: "player-spacer" }),
+        fullscreen,
+      ]),
+      buildPlayerSubtitleRow(pb, live),
+    ];
+
+    return el("div", { class: "player-bar" }, rows);
+  }
+
+  function buildPlayerSubtitleRow(pb, live) {
+    const node = subtitleSelectorNode(pb, live);
+    if (!node) return null;
+    return el("div", { class: "player-bar-subs" }, node);
+  }
+
+  /* ── Overlay visibility ──────────────────────────────────────────────── */
+
+  function controlsHaveFocus() {
+    const active = document.activeElement;
+    return !!active && playerOverlay.contains(active);
+  }
+
+  function applyControlsVisibility() {
+    const pb = state.playback;
+    const visible = pb.controlsVisible !== false;
+    playerOverlay.classList.toggle("is-hidden", !visible);
+    if (visible) {
+      playerOverlay.removeAttribute("inert");
+    } else {
+      /* A hidden bar must not be tabbable, or keyboard users get stranded. */
+      playerOverlay.setAttribute("inert", "");
+    }
+  }
+
+  function showPlayerControls() {
+    const pb = state.playback;
+    if (!pb) return;
+    if (pb.controlsVisible === false) {
+      pb.controlsVisible = true;
+      applyControlsVisibility();
+    }
+    scheduleControlsHide();
+  }
+
+  function scheduleControlsHide() {
+    if (controlsHideTimer !== null) {
+      clearTimeout(controlsHideTimer);
+      controlsHideTimer = null;
+    }
+    const pb = state.playback;
+    if (!pb || !pb.url) return;
+    controlsHideTimer = setTimeout(function () {
+      controlsHideTimer = null;
+      maybeHideControls();
+    }, CONTROLS_HIDE_DELAY_MS);
+  }
+
+  function maybeHideControls() {
+    const pb = state.playback;
+    if (!pb || !pb.url) return;
+    /* Three things keep the bar on screen: a paused frame, the user's focus
+       resting inside it, and the pointer hovering over it. */
+    if (playerVideo.paused || playerVideo.ended) return;
+    if (controlsHaveFocus()) return;
+    if (pointerInsideOverlay) return;
+    if (pb.controlsVisible === false) return;
+    pb.controlsVisible = false;
+    applyControlsVisibility();
+  }
+
+  function clearControlsHideTimer() {
+    if (controlsHideTimer !== null) {
+      clearTimeout(controlsHideTimer);
+      controlsHideTimer = null;
+    }
+  }
+
+  /**
+   * Put the player surface away: no timer left running, no fullscreen left
+   * owned, no chrome left behind for the next session to inherit.
+   */
+  function closePlayerLayer() {
+    clearControlsHideTimer();
+    pointerInsideOverlay = false;
+    exitFullscreenIfOwned();
+    clear(playerOverlay);
+    dom.playerLayer.hidden = true;
+    setUnderlayInert(false);
+  }
+
+  /* ── Fullscreen ──────────────────────────────────────────────────────── */
+
+  function fullscreenTarget() {
+    return dom.playerLayer;
+  }
+
+  function fullscreenActive() {
+    return document.fullscreenElement === fullscreenTarget();
+  }
+
+  function toggleFullscreen() {
+    if (dom.playerLayer.hidden) return;
+    if (!document.fullscreenEnabled || typeof fullscreenTarget().requestFullscreen !== "function") {
+      toast("Fullscreen is not available in this browser.", "warn");
+      return;
+    }
+    let result;
+    try {
+      result = fullscreenActive()
+        ? typeof document.exitFullscreen === "function"
+          ? document.exitFullscreen()
+          : null
+        : fullscreenTarget().requestFullscreen();
+    } catch (error) {
+      toast("Could not change fullscreen: " + (error && error.message ? error.message : "the browser refused") + ".", "warn");
+      return;
+    }
+    if (result && typeof result.catch === "function") {
+      result.catch(function (error) {
+        toast(
+          "Could not " +
+            (fullscreenActive() ? "leave" : "enter") +
+            " fullscreen: " +
+            (error && error.message ? error.message : "the browser refused") +
+            ".",
+          "warn"
+        );
+      });
+    }
+  }
+
+  function onFullscreenChange() {
+    state.playback.fullscreen = fullscreenActive();
+    showPlayerControls();
+    syncTransport();
+  }
+
+  function exitFullscreenIfOwned() {
+    if (!fullscreenActive()) return;
+    if (typeof document.exitFullscreen !== "function") return;
+    try {
+      const result = document.exitFullscreen();
+      if (result && typeof result.catch === "function") {
+        result.catch(function () {
+          /* Leaving fullscreen is best-effort during teardown. */
+        });
+      }
+    } catch (error) {
+      /* Nothing useful to do; the layer is about to be hidden anyway. */
+    }
+  }
+
+  /* ── Player keyboard shortcuts ───────────────────────────────────────── */
+
+  /* Only genuine text entry counts: a range slider or a radio is an <input>
+     too, and must not swallow the player shortcuts. */
+  const TEXT_INPUT_TYPES = [
+    "text", "search", "email", "url", "tel", "password", "number",
+    "date", "datetime-local", "month", "week", "time",
+  ];
+
+  function isTextField(node) {
+    if (!(node instanceof Element)) return false;
+    if (node.isContentEditable) return true;
+    const tag = node.tagName;
+    if (tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (tag !== "INPUT") return false;
+    const type = (node.getAttribute("type") || "text").toLowerCase();
+    return TEXT_INPUT_TYPES.indexOf(type) !== -1;
+  }
+
+  /* Elements that already act on Space themselves. */
+  function isActivatable(node) {
+    return (
+      node instanceof Element &&
+      !!node.closest("button, a[href], summary, input, select, textarea")
+    );
+  }
+
+  function focusIsElsewhere() {
+    const active = document.activeElement;
+    if (!active || active === document.body || active === document.documentElement) return false;
+    return !dom.playerLayer.contains(active);
+  }
+
+  function onPlayerKeydown(event) {
+    if (event.defaultPrevented) return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (!playbackIsLive(state.playback) || dom.playerLayer.hidden) return;
+    /* Only act while the player owns focus, or while nothing at all does. */
+    if (focusIsElsewhere()) return;
+
+    const target = event.target;
+    if (isTextField(target)) return;
+    showPlayerControls();
+
+    const key = event.key;
+    if (key === " " || key === "Spacebar" || key === "k") {
+      /* Let a focused control use Space itself. */
+      if (isActivatable(target)) return;
+      event.preventDefault();
+      doPlay();
+      return;
+    }
+    if (key === "ArrowLeft" || key === "ArrowRight") {
+      /* Range and radio inputs already handle arrows natively. */
+      if (target instanceof Element && target.closest('input[type="range"], input[type="radio"]')) return;
+      event.preventDefault();
+      seekBy(key === "ArrowRight" ? 10 : -10);
+      return;
+    }
+    if (key === "f" || key === "F") {
+      event.preventDefault();
+      toggleFullscreen();
+    }
   }
 
   function startVideo(url, entity) {
@@ -2297,9 +2625,9 @@
     pb.url = url;
     pb.engine = "native";
     pb.segmented = false;
+    pb.controlsVisible = true;
     dom.playerLayer.hidden = false;
     setUnderlayInert(true);
-    renderPlayerChrome();
     if (playerVideo.getAttribute("src") !== url) {
       playerVideo.setAttribute("src", url);
       try {
@@ -2308,10 +2636,14 @@
         /* load() is best-effort; the error handler reports real failures. */
       }
     }
-    /* Attach tracks after load(): the load algorithm resets text tracks. */
+    /* Attach tracks after load(): the load algorithm resets text tracks. The
+       overlay is built afterwards so its subtitle selector already reflects
+       the default selection. */
     applySubtitleTracks();
+    renderPlayerChrome();
     const attempt = playerVideo.play();
     if (attempt && typeof attempt.catch === "function") attempt.catch(onPlayRejection);
+    showPlayerControls();
     render();
     focusTransportIfFocusWasLost();
   }
@@ -2327,9 +2659,11 @@
     pb.status = "loading";
     pb.url = url;
     pb.engine = null;
+    pb.controlsVisible = true;
     dom.playerLayer.hidden = false;
     setUnderlayInert(true);
     renderPlayerChrome();
+    showPlayerControls();
     render();
 
     let HlsCtor;
@@ -2383,8 +2717,10 @@
     /* MSE carries text tracks alongside the media source, so the same
        <track> elements work here as on the direct-play path. */
     applySubtitleTracks();
-    /* Single repaint: transport comes alive (Stop button, enabled controls)
-       and the subtitle selector reflects the tracks just attached. */
+    /* Rebuild once the session is genuinely ready: the transport enables and
+       the subtitle selector reflects the tracks just attached. */
+    renderPlayerChrome();
+    showPlayerControls();
     render();
   }
 
@@ -2395,9 +2731,7 @@
     pb.engine = null;
     pb.segmentedCause = cause || null;
     resetActiveMedia();
-    dom.playerLayer.hidden = true;
-    clear(dom.playerLayer);
-    setUnderlayInert(false);
+    closePlayerLayer();
     const message = segmentedMessage(pb, cause);
     setActionStatus(message, null);
     toast(message, "warn");
@@ -2536,15 +2870,25 @@
   }
 
   function skipForward() {
+    seekBy(10);
+  }
+
+  /** Relative seek, clamped to what the source can actually deliver. */
+  function seekBy(delta) {
     if (!state.playback.url) return;
     const bounds = seekableBounds();
-    const target = playerVideo.currentTime + 10;
+    let target = playerVideo.currentTime + delta;
+    if (target < bounds.start) target = bounds.start;
     /* Forward seeking cannot outrun the transcoder. */
+    if (bounds.end > 0 && target > bounds.end) target = bounds.end;
+    if (target === playerVideo.currentTime) return;
     try {
-      playerVideo.currentTime = bounds.end > 0 ? Math.min(target, bounds.end) : target;
+      playerVideo.currentTime = target;
     } catch (error) {
       /* Ignore: the source may not be seekable. */
     }
+    state.playback.currentTime = target;
+    syncTransport();
   }
 
   function seekTo(value) {
@@ -2824,10 +3168,10 @@
     try {
       const health = await api.health();
       const service = health && health.service ? health.service : "astraeus";
-      dom.healthPill.textContent = "● " + service + " online";
+      dom.healthPill.textContent = service + " online";
       dom.healthPill.dataset.state = "ok";
     } catch (error) {
-      dom.healthPill.textContent = "● API unreachable";
+      dom.healthPill.textContent = "API unreachable";
       dom.healthPill.dataset.state = "down";
     }
   }
@@ -2860,6 +3204,8 @@
       skipForward();
     } else if (action === "stop-playback") {
       stopPlayback();
+    } else if (action === "fullscreen") {
+      toggleFullscreen();
     } else if (action === "toggle-filter") {
       state.filterIncomplete = !state.filterIncomplete;
       render();
@@ -2914,6 +3260,45 @@
   });
 
   window.addEventListener("hashchange", onHashChange);
+
+  /* ── Player overlay: interaction, auto-hide, fullscreen, shortcuts ───── */
+
+  dom.playerLayer.addEventListener("mousemove", function () {
+    showPlayerControls();
+  });
+
+  dom.playerLayer.addEventListener("pointerdown", function () {
+    showPlayerControls();
+  });
+
+  playerOverlay.addEventListener("mouseenter", function () {
+    pointerInsideOverlay = true;
+    showPlayerControls();
+  });
+
+  playerOverlay.addEventListener("mouseleave", function () {
+    pointerInsideOverlay = false;
+    scheduleControlsHide();
+  });
+
+  /* Keyboard focus anywhere in the player keeps the chrome on screen. */
+  dom.playerLayer.addEventListener("focusin", function () {
+    showPlayerControls();
+  });
+
+  dom.playerLayer.addEventListener("focusout", function () {
+    /* Focus may be moving within the overlay; re-check on the next turn. */
+    setTimeout(function () {
+      if (!controlsHaveFocus()) scheduleControlsHide();
+    }, 0);
+  });
+
+  document.addEventListener("keydown", onPlayerKeydown);
+
+  if ("onfullscreenchange" in document) {
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+  }
+  document.addEventListener("webkitfullscreenchange", onFullscreenChange);
 
   /* A second click on the app's own CSP-free world is enough to wire up the
      remaining global listeners; nothing else needs bootstrapping. */

@@ -82,6 +82,10 @@ Status as of the current build. Evidence for each claim is the test suite
 - Browser clients are capped at 1080p, 8-bit and stereo by default. There is no
   surround passthrough and no per-client override beyond sending a capability
   manifest, and the cap is a constant rather than a flag.
+- A capability manifest that omits `max_audio_channels` or `max_bit_depth` is
+  treated as unrestricted, which can hand a browser a stream it cannot decode
+  (see the README). The failure surfaces as a stalled player rather than a
+  clear error, so a client that guesses wrong has nothing to go on.
 - `--auth-mode` defaults to `none`. That is right for a trusted LAN and wrong
   for anything reachable from the internet; use `proxy` or `token` before
   exposing it.

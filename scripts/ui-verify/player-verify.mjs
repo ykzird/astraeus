@@ -132,11 +132,17 @@ async function main() {
   const res = await fetch(baseUrl + "/api/entities/" + movieId + "/playback", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // Declare what Chromium can actually decode, exactly as a real client must.
+    // Omitting max_audio_channels means "unrestricted", and a 5.1 AAC
+    // SourceBuffer is refused outright - which stalls this probe, not the app.
     body: JSON.stringify({
       containers: ["hls"],
       video_codecs: ["h264"],
       audio_codecs: ["aac"],
+      max_width: 1920,
       max_height: 180,
+      max_bit_depth: 8,
+      max_audio_channels: 2,
       supports_hls: true,
     }),
   });
@@ -168,13 +174,21 @@ async function main() {
     })()`);
     record("the transcoded playlist loads through hls.js", started === "ok", "start=" + started);
 
-    await sleep(2500);
-    const t = await cdp.eval(`(() => {
-      const v = document.getElementById("transcode-probe");
-      if (!v) return null;
-      return { currentTime: v.currentTime, paused: v.paused, readyState: v.readyState,
-               duration: v.duration, error: v.error ? v.error.code : null };
-    })()`);
+    // Poll rather than sleeping a fixed amount: a cold transcode has to produce
+    // its first segment before there is anything to play.
+    let t = null;
+    const probeDeadline = Date.now() + 30000;
+    while (Date.now() < probeDeadline) {
+      t = await cdp.eval(`(() => {
+        const v = document.getElementById("transcode-probe");
+        if (!v) return null;
+        return { currentTime: v.currentTime, paused: v.paused, readyState: v.readyState,
+                 duration: v.duration, error: v.error ? v.error.code : null };
+      })()`);
+      if (!t || t.error !== null) break;
+      if (t.currentTime > 0.2 && t.readyState >= 2) break;
+      await sleep(1000);
+    }
     record("transcoded playback actually advances",
       t !== null && t.currentTime > 0.2 && t.error === null,
       t ? "currentTime=" + t.currentTime.toFixed(3) + ", paused=" + t.paused +

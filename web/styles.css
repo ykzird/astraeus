@@ -349,6 +349,19 @@ img {
   border-radius: 999px;
 }
 
+/* The status light is drawn, not typed: a filled circle in whatever colour the
+   pill's data-state gives it, so there is no glyph standing in for a graphic. */
+.health-pill::before {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 0.55em;
+  margin-right: 0.5em;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: baseline;
+}
+
 .health-pill[data-state="ok"] {
   color: var(--ok);
   border-color: var(--ok);
@@ -619,6 +632,32 @@ img {
   color: var(--danger);
 }
 
+/* ── 6b. Icons ─────────────────────────────────────────────────────────── */
+
+/* BoxIcons glyphs from icons.js. Sized in `em` so they track the button's
+   own type scale, and coloured by `currentColor` so the brutalist button states
+   keep working untouched. */
+.icon {
+  display: block;
+  flex: 0 0 auto;
+  width: 1.1em;
+  height: 1.1em;
+  color: currentColor;
+  pointer-events: none;
+}
+
+/* If icons.js ever fails to load, the control keeps its size and its name. */
+.icon-missing {
+  display: block;
+  width: 1.1em;
+  height: 1.1em;
+}
+
+.btn-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 /* ── 7. Brutalist controls ─────────────────────────────────────────────── */
 
 .btn {
@@ -814,23 +853,26 @@ img {
 }
 
 /* 8e. Player layer — the one part of the canvas that is never re-rendered, so
-   the <video> element (and therefore playback) survives unrelated repaints. */
+   the <video> element (and therefore playback) survives unrelated repaints.
+   Everything the user can press now lives here, over the picture. */
 .player-layer {
   position: absolute;
   inset: 0;
   z-index: 8;
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  display: block;
   min-height: 0;
+  overflow: hidden;
   background: #000;
 }
 
-/* `hidden` must win over `display: grid`. */
+/* `hidden` must win over `display: block`. */
 .player-layer[hidden] {
   display: none;
 }
 
 .player-video {
+  position: absolute;
+  inset: 0;
   display: block;
   width: 100%;
   height: 100%;
@@ -839,27 +881,117 @@ img {
   object-fit: contain;
 }
 
-.player-chrome {
+/* Fullscreen the container, never the bare <video>, so the overlay travels
+   with the picture instead of being left behind in the page. */
+.player-layer:fullscreen {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+}
+
+/* The overlay itself is inert to the pointer; only its two strips take input,
+   so clicks on the middle of the picture are never swallowed. */
+.player-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 220ms ease;
+}
+
+.player-overlay > * {
+  pointer-events: auto;
+}
+
+/* Hidden chrome is also unclickable and unreachable by Tab. */
+.player-overlay.is-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.player-overlay.is-hidden > * {
+  pointer-events: none;
+}
+
+.player-titlebar {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px 18px 22px;
+  background: linear-gradient(180deg, rgba(5, 6, 11, 0.86) 0%, rgba(5, 6, 11, 0) 100%);
+}
+
+.player-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 26px 18px 16px;
+  background: linear-gradient(
+    0deg,
+    rgba(5, 6, 11, 0.94) 0%,
+    rgba(5, 6, 11, 0.8) 45%,
+    rgba(5, 6, 11, 0) 100%
+  );
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+
+.player-scrub {
   display: flex;
   align-items: center;
   gap: 12px;
-  flex-wrap: wrap;
-  padding: 10px 14px;
-  background: var(--glass-bg-strong);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  border-top: var(--brutal-line) solid var(--brutal-border);
+  min-width: 0;
 }
 
-.player-chrome-text {
-  flex: 1 1 220px;
+.player-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
   min-width: 0;
+}
+
+.player-spacer {
+  flex: 1 1 auto;
+}
+
+.player-bar-subs {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.player-bar-subs .subtitle-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.player-bar-subs .subtitle-group > legend {
+  margin: 0;
+}
+
+.player-bar-subs .subtitle-reason {
+  flex: 1 1 100%;
+  margin-top: 0;
 }
 
 .player-chrome-title {
   font-weight: 800;
   font-size: var(--step-md);
   overflow-wrap: anywhere;
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.8);
 }
 
 .player-chrome-sub {
@@ -867,7 +999,7 @@ img {
   font-size: var(--step-xs);
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--ink-mute);
+  color: var(--ink-soft);
   overflow-wrap: anywhere;
 }
 
@@ -917,19 +1049,21 @@ img {
 }
 
 .reasons li {
-  position: relative;
-  padding-left: 18px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: var(--step-xs);
   color: var(--ink-soft);
+}
+
+.reasons li > span {
+  min-width: 0;
   overflow-wrap: anywhere;
 }
 
-.reasons li::before {
-  content: "→";
-  position: absolute;
-  left: 0;
+/* BoxIcons "chevron-right", tinted as the list marker. */
+.reasons li > .icon {
   color: var(--brutal-accent-2);
-  font-family: var(--font-mono);
 }
 
 .player-time {
@@ -1440,13 +1574,8 @@ img {
   display: none;
 }
 
-/* Playback */
-.transport {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
+/* Playback — the transport now lives in the player overlay (see §8e); only the
+   shared seek control is styled here. */
 .seek {
   flex: 1 1 140px;
   min-width: 0;
@@ -1461,12 +1590,6 @@ img {
   cursor: not-allowed;
 }
 
-.seek-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
 
 /* Delivery metadata (container / codecs / dimensions). */
 .delivery-facts {

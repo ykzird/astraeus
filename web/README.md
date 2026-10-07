@@ -1,13 +1,15 @@
 # Astraeus Media — web front-end
 
-Static, dependency-free front-end for the Astraeus media server. Three files, no
-build step, no npm, no bundler, no CDN: vanilla HTML, CSS and ES2020 JavaScript.
+Static, dependency-free front-end for the Astraeus media server. No build step,
+no npm, no bundler, no CDN: vanilla HTML, CSS and ES2020 JavaScript, plus two
+locally vendored assets (`vendor/hls.min.js` and the icon paths in `icons.js`).
 
 | File | Purpose |
 | --- | --- |
 | `index.html` | The static shell: topbar + breadcrumbs, the three-column grid (nav / canvas / context), the error banner and the toast region. Every dynamic region is filled by `app.js`. |
 | `styles.css` | The whole visual language. CSS custom properties in `:root` separate the two systems: the **GLASS** tokens (`--glass-*`) for translucent blurred surfaces, and the **BRUTAL** tokens (`--brutal-*`, `--shadow-hard*`) for high-contrast tactile controls. |
-| `app.js` | Hash router, API client with per-request timeouts, render functions for the navigation list, breadcrumbs, canvas and context panel, and the player (negotiation, transport, seek binding, delivery-decision reporting). |
+| `icons.js` | The icon registry (**generated**, not hand-edited): the 8 [BoxIcons](https://icon-sets.iconify.design/bx/) this UI uses, as frozen path data, plus `AstraeusIcons.icon(name)` returning an `<svg>`. Fetched from the Iconify API at authoring time and vendored — nothing is requested from a third-party origin at runtime. BoxIcons is MIT; regenerate with `node scripts/fetch-icons.mjs`. See `vendor/icons.md` for provenance and `../THIRD_PARTY_NOTICES.md` for the licence notices. |
+| `app.js` | Hash router, API client with per-request timeouts, render functions for the navigation list, breadcrumbs, canvas and context panel, and the player (negotiation, overlay controls, fullscreen, seek binding, subtitles, delivery-decision reporting). |
 
 `app.js` is deliberately organised in numbered sections so the two halves — the
 browsing shell (§1–§8) and the player (§9b) — stay separable.
@@ -76,10 +78,33 @@ server decides:
 
 Subtitle tracks returned by the playback endpoint are served as WebVTT
 (`text/vtt; charset=utf-8`) and attached to the player as `<track>` elements,
-which works on both the native and the MSE path. The playback panel offers an
-**Off** option plus one per deliverable track; image-based tracks (PGS/VobSub)
-have no URL and are shown disabled with the reason. Nothing is selected unless
-the server marks a track as default.
+which works on both the native and the MSE path. The player's subtitle menu
+offers an **Off** option plus one per deliverable track; image-based tracks
+(PGS/VobSub) have no URL and are shown disabled with the reason. Nothing is
+selected unless the server marks a track as default.
+
+### Player chrome
+
+Every control — play/pause, restart, skip, stop, the seek bar with its time
+readout, the subtitle menu and the fullscreen toggle — is overlaid on the
+picture inside `#player-layer`, not parked in the context sidebar. The bar is a
+glass scrim so it stays legible over bright and dark frames, and it fades out
+after a few idle seconds while playing. It never hides on a paused frame, while
+the user's focus is inside it, or while the pointer is resting on it — and while
+hidden it is `inert`, so it can never become an invisible focus trap.
+
+The context sidebar keeps only what is *informational*: the mode badge, the
+server's `decision.reasons`, media facts (container, codecs, resolution,
+duration) and the status note.
+
+Fullscreen is requested on the player **container**, not the bare `<video>`, so
+the overlay travels with the picture. The button is driven from
+`fullscreenchange`, so leaving with Esc or a swipe keeps it honest.
+
+Keyboard shortcuts, active while the player has focus (or nothing else does):
+**Space** play/pause, **←/→** seek 10s, **F** fullscreen. Keys are left alone
+when a modifier is held or focus is in a text field, and a focused button still
+gets its own Space. Esc is the browser's.
 
 **Seeking a segmented stream is bounded by the transcoder.** The server
 produces segments in order while playback runs, so the seek bar is bound to the
