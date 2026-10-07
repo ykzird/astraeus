@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#080910" />
+    <meta
+      name="description"
+      content="Astraeus Media — a media-first spatial environment for browsing a local media library."
+    />
+    <title>Astraeus Media</title>
+    <!-- Inline so the browser never falls back to requesting /favicon.ico,
+         which would show up as a 404 in the console. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20fill='%23080910'/%3E%3Crect%20x='7'%20y='7'%20width='18'%20height='18'%20fill='%23ffd23f'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-canvas">Skip to media canvas</a>
+
+    <header class="topbar glass">
+      <p class="brand" translate="no">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">Astraeus</span>
+        <span class="brand-tail">Media</span>
+      </p>
+
+      <nav class="crumbs" aria-label="Breadcrumb">
+        <ol id="breadcrumbs" class="crumbs-list"></ol>
+      </nav>
+
+      <p id="health-pill" class="health-pill" role="status">Connecting…</p>
+    </header>
+
+    <div class="banner-slot">
+      <div id="error-banner" class="banner" role="alert" hidden>
+        <span class="banner-icon" aria-hidden="true">!</span>
+        <span id="error-text" class="banner-text"></span>
+        <button type="button" id="error-retry" class="btn btn-small" hidden>Retry</button>
+        <button
+          type="button"
+          id="error-dismiss"
+          class="btn btn-small btn-quiet"
+          aria-label="Dismiss error message"
+        >
+          Dismiss
+        </button>
+      </div>
+    </div>
+
+    <main class="layout">
+      <!-- ── Left: navigation ─────────────────────────────────────────── -->
+      <aside class="panel nav-panel" aria-labelledby="nav-heading">
+        <div class="panel-head">
+          <h2 id="nav-heading" class="panel-title">Libraries</h2>
+          <p id="nav-summary" class="panel-sub">Loading…</p>
+        </div>
+
+        <ul id="library-list" class="library-list"></ul>
+        <p id="nav-empty" class="muted small" hidden>No libraries yet.</p>
+
+        <div class="nav-actions">
+          <button
+            type="button"
+            id="filter-toggle"
+            class="toggle"
+            aria-pressed="false"
+            data-focus-key="filter-toggle"
+            title="Show only entities that still need metadata"
+          >
+            <span class="toggle-box" aria-hidden="true"></span>
+            <span class="toggle-label">Incomplete only</span>
+            <span id="incomplete-count" class="badge" aria-hidden="true">0</span>
+            <span id="incomplete-desc" class="sr-only"></span>
+          </button>
+
+          <button
+            type="button"
+            id="enrich-button"
+            class="btn btn-accent btn-block"
+            data-focus-key="enrich"
+          >
+            Enrich metadata
+          </button>
+        </div>
+
+        <p id="action-status" class="action-status" role="status"></p>
+      </aside>
+
+      <!-- ── Centre: the canvas ───────────────────────────────────────── -->
+      <section
+        id="main-canvas"
+        class="canvas"
+        tabindex="-1"
+        aria-label="Media canvas"
+        aria-busy="false"
+      >
+        <!-- Repainted on every state change. The player layer below is not:
+             the <video> element has to survive re-renders so that an
+             unrelated repaint can never interrupt playback. -->
+        <div id="canvas-content" class="canvas-content"></div>
+        <div id="player-layer" class="player-layer" hidden></div>
+      </section>
+
+      <!-- ── Right: contextual intelligence ───────────────────────────── -->
+      <aside class="panel context-panel" aria-labelledby="context-heading">
+        <div class="panel-head">
+          <h2 id="context-heading" class="panel-title">Context</h2>
+          <p id="context-sub" class="panel-sub">Nothing selected</p>
+        </div>
+        <div id="context-body" class="context-body"></div>
+      </aside>
+    </main>
+
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

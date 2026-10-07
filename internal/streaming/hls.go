@@ -1,0 +1,568 @@
+package streaming
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/jok/astraeus-media/internal/observability"
+)
+
+const (
+	// defaultSegmentSeconds is the HLS target segment duration. Six seconds is
+	// the usual compromise between startup latency and request overhead.
+	defaultSegmentSeconds = 6
+	// defaultSessionTTL is how long an unwatched session is kept before its
+	// ffmpeg process is stopped.
+	defaultSessionTTL = 2 * time.Minute
+	// playlistWait bounds how long Start waits for ffmpeg to publish a
+	// playlist before giving up.
+	playlistWait = 30 * time.Second
+	// stderrLimit bounds the captured ffmpeg diagnostics.
+	stderrLimit = 8 << 10
+)
+
+// ErrDirectPlayHasNoSession is returned when a session is requested for a
+// decision that does not need one.
+var ErrDirectPlayHasNoSession = errors.New("direct play does not use a streaming session")
+
+// NamedSegmentRe is the allowlist of files a session directory exposes. Building
+// the path from a matched name is what makes path traversal impossible.
+var NamedSegmentRe = regexp.MustCompile(`^(playlist\.m3u8|seg[0-9]{5}\.ts)$`)
+
+// Session is one in-flight segmented delivery of a MediaObject.
+type Session struct {
+	ID         string
+	EntityID   string
+	ObjectPath string
+	Decision   Decision
+	Dir        string
+
+	mu         sync.Mutex
+	cancel     context.CancelFunc
+	done       chan struct{}
+	runErr     error
+	stderr     strings.Builder
+	startedAt  time.Time
+	lastAccess time.Time
+
+	// firstSegmentOnce makes the first-time-to-first-segment measurement record
+	// exactly one observation per session.
+	firstSegmentOnce sync.Once
+}
+
+// StartedAt reports when the session began.
+func (s *Session) StartedAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.startedAt
+}
+
+// LastAccess reports when the session was last served.
+func (s *Session) LastAccess() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastAccess
+}
+
+// PlaylistPath is the absolute path of the session playlist.
+func (s *Session) PlaylistPath() string { return filepath.Join(s.Dir, "playlist.m3u8") }
+
+// Done is closed once the underlying ffmpeg process has exited.
+func (s *Session) Done() <-chan struct{} { return s.done }
+
+// Err reports why the session ended, if it failed.
+func (s *Session) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runErr
+}
+
+// Diagnostics returns the tail of the ffmpeg error output.
+func (s *Session) Diagnostics() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.TrimSpace(s.stderr.String())
+}
+
+func (s *Session) touch() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastAccess = time.Now()
+}
+
+func (s *Session) recordStderr(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stderr.Len() < stderrLimit {
+		s.stderr.WriteString(text)
+	}
+}
+
+// stderrCollector funnels ffmpeg diagnostics into a session's bounded buffer.
+type stderrCollector struct{ session *Session }
+
+func (c stderrCollector) Write(p []byte) (int, error) {
+	c.session.recordStderr(string(p))
+	return len(p), nil
+}
+
+// ManagerConfig configures a Manager.
+type ManagerConfig struct {
+	// FFmpegBin is the ffmpeg executable to run.
+	FFmpegBin string
+	// RootDir is where session directories are created.
+	RootDir string
+	// SegmentSeconds is the HLS target segment duration.
+	SegmentSeconds int
+	// SessionTTL is how long an idle session survives.
+	SessionTTL time.Duration
+	// Server describes the encoders available on this host.
+	Server ServerCapability
+	// Metrics collects the streaming KPIs. A nil value disables instrumentation.
+	Metrics *observability.Metrics
+	Logger  *slog.Logger
+}
+
+// Manager owns the active streaming sessions.
+type Manager struct {
+	cfg     ManagerConfig
+	baseCtx context.Context
+
+	mu       sync.Mutex
+	sessions map[string]*Session
+}
+
+// NewManager creates a Manager and prepares its working directory.
+func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
+	if cfg.FFmpegBin == "" {
+		cfg.FFmpegBin = "ffmpeg"
+	}
+	if cfg.SegmentSeconds <= 0 {
+		cfg.SegmentSeconds = defaultSegmentSeconds
+	}
+	if cfg.SessionTTL <= 0 {
+		cfg.SessionTTL = defaultSessionTTL
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.RootDir == "" {
+		return nil, errors.New("streaming: RootDir is required")
+	}
+	if err := os.MkdirAll(cfg.RootDir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating streaming root %s: %w", cfg.RootDir, err)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	manager := &Manager{cfg: cfg, baseCtx: ctx, sessions: make(map[string]*Session)}
+	manager.sweepStaleDirectories(cfg.RootDir, cfg.SessionTTL)
+	return manager, nil
+}
+
+// sweepStaleDirectories removes session output left behind by a previous run.
+// A process that is killed outright never gets to clean up after itself, so
+// without this the stream root would grow without bound.
+//
+// Only directories older than the TTL are removed, so a second instance sharing
+// the same root does not lose its live sessions. Running more than one instance
+// against one root is therefore discouraged.
+func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+
+	cutoff := time.Now().Add(-olderThan)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			m.cfg.Logger.Warn("removing stale session directory", "path", path, "error", err)
+			continue
+		}
+		m.cfg.Logger.Info("removed stale session directory", "path", path)
+	}
+}
+
+// Config exposes the manager configuration for callers that need to build URLs
+// or report capabilities.
+func (m *Manager) Config() ManagerConfig { return m.cfg }
+
+// Start begins a segmented delivery and returns once the playlist exists.
+func (m *Manager) Start(ctx context.Context, entityID, objectPath string, decision Decision) (*Session, error) {
+	if decision.Mode == ModeDirectPlay {
+		return nil, ErrDirectPlayHasNoSession
+	}
+	if !decision.Deliverable {
+		return nil, errors.New("streaming: the negotiation result is not deliverable")
+	}
+
+	sessionID := uuid.NewString()
+	dir := filepath.Join(m.cfg.RootDir, sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating session directory: %w", err)
+	}
+
+	args, err := BuildFFmpegArgs(dir, objectPath, decision, m.cfg)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+
+	runCtx, cancel := context.WithCancel(m.baseCtx)
+	session := &Session{
+		ID:         sessionID,
+		EntityID:   entityID,
+		ObjectPath: objectPath,
+		Decision:   decision,
+		Dir:        dir,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+		startedAt:  time.Now(),
+		lastAccess: time.Now(),
+	}
+
+	cmd := exec.CommandContext(runCtx, m.cfg.FFmpegBin, args...)
+	// Assigning an io.Writer rather than reading a pipe ourselves makes
+	// cmd.Wait wait until every byte of ffmpeg's diagnostics has been
+	// collected, so the output is complete by the time the session reports
+	// that it is done.
+	cmd.Stderr = stderrCollector{session: session}
+	// WaitDelay stops Wait from blocking forever if the process ignores the
+	// cancellation and keeps its output open.
+	cmd.WaitDelay = 5 * time.Second
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("starting ffmpeg: %w", err)
+	}
+	m.cfg.Logger.InfoContext(ctx, "streaming session started",
+		"session_id", sessionID, "entity_id", entityID, "mode", decision.Mode)
+
+	go func() {
+		defer close(session.done)
+		waitErr := cmd.Wait()
+		session.mu.Lock()
+		if waitErr != nil && runCtx.Err() == nil {
+			session.runErr = waitErr
+		}
+		session.mu.Unlock()
+		if waitErr != nil && runCtx.Err() == nil {
+			m.cfg.Metrics.IncCounter("astraeus_stream_errors_total",
+				"Segmented streaming failures: sessions that never produced a playlist, plus ffmpeg exiting unexpectedly.",
+				map[string]string{"mode": string(decision.Mode)})
+			m.cfg.Logger.Error("ffmpeg exited unexpectedly",
+				"session_id", sessionID, "error", waitErr, "stderr", session.Diagnostics())
+		}
+	}()
+
+	m.mu.Lock()
+	m.sessions[sessionID] = session
+	m.mu.Unlock()
+	m.updateActiveGauge()
+
+	startupStart := time.Now()
+	if err := m.waitForPlaylist(ctx, session); err != nil {
+		// transcode_startup_time is only recorded for a stream that actually
+		// came up; a failure is an error, not a slow success.
+		m.cfg.Metrics.IncCounter("astraeus_stream_sessions_total",
+			"Segmented streaming sessions, by mode and outcome.",
+			map[string]string{"mode": string(decision.Mode), "outcome": "failed"})
+		m.cfg.Metrics.IncCounter("astraeus_stream_errors_total",
+			"Segmented streaming failures: sessions that never produced a playlist, plus ffmpeg exiting unexpectedly.",
+			map[string]string{"mode": string(decision.Mode)})
+		m.Stop(sessionID)
+		return nil, err
+	}
+
+	m.cfg.Metrics.ObserveHistogram("astraeus_transcode_startup_seconds",
+		"Time from starting ffmpeg to the playlist being available, for the segmented modes.",
+		time.Since(startupStart).Seconds(),
+		map[string]string{"mode": string(decision.Mode)})
+	m.cfg.Metrics.IncCounter("astraeus_stream_sessions_total",
+		"Segmented streaming sessions, by mode and outcome.",
+		map[string]string{"mode": string(decision.Mode), "outcome": "started"})
+
+	return session, nil
+}
+
+// updateActiveGauge publishes the number of live sessions.
+func (m *Manager) updateActiveGauge() {
+	m.mu.Lock()
+	active := len(m.sessions)
+	m.mu.Unlock()
+	m.cfg.Metrics.SetGauge("astraeus_stream_sessions_active",
+		"Segmented streaming sessions currently running.", float64(active), nil)
+}
+
+// waitForPlaylist blocks until ffmpeg has published a playlist, the process
+// dies, or the deadline passes.
+func (m *Manager) waitForPlaylist(ctx context.Context, session *Session) error {
+	deadline := time.NewTimer(playlistWait)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if _, err := os.Stat(session.PlaylistPath()); err == nil {
+			return nil
+		}
+
+		select {
+		case <-session.Done():
+			// The process can write the playlist and exit between the stat
+			// above and this select, so check once more before declaring
+			// failure.
+			if _, err := os.Stat(session.PlaylistPath()); err == nil {
+				return nil
+			}
+			diagnostics := session.Diagnostics()
+			if diagnostics == "" {
+				diagnostics = "no diagnostics produced"
+			}
+			return fmt.Errorf("ffmpeg stopped before producing a playlist: %s", diagnostics)
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for playlist: %w", ctx.Err())
+		case <-deadline.C:
+			return fmt.Errorf("timed out after %s waiting for the playlist to appear", playlistWait)
+		case <-ticker.C:
+		}
+	}
+}
+
+// Session returns an active session by id.
+func (m *Manager) Session(id string) (*Session, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.sessions[id]
+	return session, ok
+}
+
+// Stop ends a session and removes its directory.
+func (m *Manager) Stop(id string) {
+	m.mu.Lock()
+	session, ok := m.sessions[id]
+	delete(m.sessions, id)
+	m.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	session.cancel()
+	<-session.done
+	if err := os.RemoveAll(session.Dir); err != nil {
+		m.cfg.Logger.Warn("removing session directory", "session_id", id, "error", err)
+	}
+	m.updateActiveGauge()
+	m.cfg.Logger.Info("streaming session stopped", "session_id", id)
+}
+
+// Close stops every session.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.sessions))
+	for id := range m.sessions {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+
+	for _, id := range ids {
+		m.Stop(id)
+	}
+}
+
+// Reap stops sessions that have not been accessed within the TTL.
+func (m *Manager) Reap(now time.Time) int {
+	m.mu.Lock()
+	var stale []string
+	for id, session := range m.sessions {
+		if now.Sub(session.LastAccess()) > m.cfg.SessionTTL {
+			stale = append(stale, id)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, id := range stale {
+		m.cfg.Logger.Info("reaping idle streaming session", "session_id", id)
+		m.Stop(id)
+	}
+	return len(stale)
+}
+
+// ReapLoop reaps idle sessions until the context is cancelled.
+func (m *Manager) ReapLoop(ctx context.Context) {
+	interval := m.cfg.SessionTTL / 2
+	if interval < 10*time.Second {
+		interval = 10 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			m.Close()
+			return
+		case <-ticker.C:
+			m.Reap(time.Now())
+		}
+	}
+}
+
+// ServeFile serves one file from a session directory. The name is matched
+// against an allowlist, so a client can never escape the directory.
+func (m *Manager) ServeFile(w http.ResponseWriter, r *http.Request, sessionID, name string) {
+	if !NamedSegmentRe.MatchString(name) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	session, ok := m.Session(sessionID)
+	if !ok {
+		http.Error(w, "streaming session not found", http.StatusNotFound)
+		return
+	}
+	session.touch()
+
+	switch filepath.Ext(name) {
+	case ".m3u8":
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	case ".ts":
+		w.Header().Set("Content-Type", "video/mp2t")
+		// fttt_latency: the first time a segment is actually handed to a client
+		// is the moment the stream became watchable.
+		session.firstSegmentOnce.Do(func() {
+			m.cfg.Metrics.ObserveHistogram("astraeus_first_segment_seconds",
+				"Time from stream preparation starting to the first segment being delivered to a client.",
+				time.Since(session.StartedAt()).Seconds(),
+				map[string]string{"mode": string(session.Decision.Mode)})
+		})
+	}
+	w.Header().Set("Cache-Control", "no-store")
+
+	http.ServeFile(w, r, filepath.Join(session.Dir, name))
+}
+
+// BuildFFmpegArgs renders the ffmpeg invocation for a decision. It is exported
+// so the command line can be asserted in tests without running ffmpeg.
+func BuildFFmpegArgs(dir, inputPath string, decision Decision, cfg ManagerConfig) ([]string, error) {
+	if decision.Mode == ModeDirectPlay {
+		return nil, ErrDirectPlayHasNoSession
+	}
+
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-y",
+		"-i", inputPath,
+		"-map", "0:v:0",
+		"-map", "0:a:0?",
+	}
+
+	switch decision.VideoAction {
+	case ActionCopy:
+		args = append(args, "-c:v", "copy")
+	case ActionTranscode:
+		encoder := EncoderFor(decision.TargetVideoCodec, cfg.Server)
+		if encoder == "" {
+			return nil, fmt.Errorf("no ffmpeg encoder available for video codec %q", decision.TargetVideoCodec)
+		}
+		args = append(args, encoderArgs(encoder, decision.TargetHeight)...)
+	default:
+		return nil, fmt.Errorf("unsupported video action %q", decision.VideoAction)
+	}
+
+	switch decision.AudioAction {
+	case ActionNone:
+		args = append(args, "-an")
+	case ActionCopy:
+		args = append(args, "-c:a", "copy")
+	case ActionTranscode:
+		codec := decision.TargetAudioCodec
+		if codec == "" {
+			codec = "aac"
+		}
+		args = append(args, "-c:a", codec, "-b:a", "192k")
+	default:
+		return nil, fmt.Errorf("unsupported audio action %q", decision.AudioAction)
+	}
+
+	args = append(args,
+		"-f", "hls",
+		"-hls_time", fmt.Sprint(cfg.SegmentSeconds),
+		"-hls_list_size", "0",
+		"-hls_playlist_type", "event",
+		"-hls_segment_filename", filepath.Join(dir, "seg%05d.ts"),
+		filepath.Join(dir, "playlist.m3u8"),
+	)
+	return args, nil
+}
+
+// encoderArgs renders the codec-specific options, including the scaling filter
+// when a target height was negotiated.
+func encoderArgs(encoder string, targetHeight int) []string {
+	// Software scaling is applied before the hardware upload; QuickSync happily
+	// consumes system-memory frames, whereas VAAPI requires its own frames.
+	softwareScale := ""
+	if targetHeight > 0 {
+		softwareScale = fmt.Sprintf("scale=-2:%d", targetHeight)
+	}
+
+	switch encoder {
+	case "h264_qsv", "hevc_qsv":
+		args := []string{"-c:v", encoder, "-preset", "veryfast", "-global_quality", "22"}
+		if softwareScale != "" {
+			args = append(args, "-vf", softwareScale)
+		}
+		return args
+	case "h264_vaapi", "hevc_vaapi":
+		filter := "format=nv12,hwupload"
+		if targetHeight > 0 {
+			filter = "format=nv12,hwupload," + fmt.Sprintf("scale_vaapi=w=-2:h=%d", targetHeight)
+		}
+		return []string{"-c:v", encoder, "-vf", filter}
+	case "libx264", "libx265":
+		args := []string{"-c:v", encoder, "-preset", "veryfast", "-crf", "21"}
+		if softwareScale != "" {
+			args = append(args, "-vf", softwareScale)
+		}
+		return args
+	case "libvpx-vp9":
+		args := []string{"-c:v", encoder, "-crf", "31", "-b:v", "0"}
+		if softwareScale != "" {
+			args = append(args, "-vf", softwareScale)
+		}
+		return args
+	case "libsvtav1", "libaom-av1":
+		args := []string{"-c:v", encoder, "-crf", "30"}
+		if softwareScale != "" {
+			args = append(args, "-vf", softwareScale)
+		}
+		return args
+	default:
+		return []string{"-c:v", encoder}
+	}
+}

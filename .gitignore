@@ -1,0 +1,12 @@
+# Build output
+/astraeus-server
+/dist/
+
+# Local databases and their SQLite sidecar files
+*.db
+*.db-shm
+*.db-wal
+*.db.bak-*
+
+# Transient HLS session output
+/streams/

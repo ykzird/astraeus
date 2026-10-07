@@ -1,0 +1,2931 @@
+/* ==========================================================================
+   Astraeus Media — front-end
+   --------------------------------------------------------------------------
+   Vanilla ES2020, no build step, no dependencies. Served as a static file.
+
+   Conventions enforced throughout:
+
+     * Nothing derived from the API is ever written with innerHTML. Every
+       entity name originates from a filename on disk, so all text goes
+       through textContent / document.createTextNode via the el() helper
+       below. The only HTML in this app is the static shell in index.html.
+     * Every fetch has an AbortController timeout, so the UI can never spin
+       forever. Failures always surface in the error banner.
+     * Navigation state lives in location.hash, so breadcrumbs are real
+       anchors and the back button behaves.
+   ========================================================================== */
+
+(function () {
+  "use strict";
+
+  /* ── 1. DOM references ───────────────────────────────────────────────── */
+
+  const dom = {
+    breadcrumbs: document.getElementById("breadcrumbs"),
+    healthPill: document.getElementById("health-pill"),
+    errorBanner: document.getElementById("error-banner"),
+    errorText: document.getElementById("error-text"),
+    errorRetry: document.getElementById("error-retry"),
+    errorDismiss: document.getElementById("error-dismiss"),
+    libraryList: document.getElementById("library-list"),
+    navSummary: document.getElementById("nav-summary"),
+    navEmpty: document.getElementById("nav-empty"),
+    filterToggle: document.getElementById("filter-toggle"),
+    incompleteCount: document.getElementById("incomplete-count"),
+    incompleteDesc: document.getElementById("incomplete-desc"),
+    enrichButton: document.getElementById("enrich-button"),
+    actionStatus: document.getElementById("action-status"),
+    canvas: document.getElementById("main-canvas"),
+    canvasContent: document.getElementById("canvas-content"),
+    playerLayer: document.getElementById("player-layer"),
+    contextSub: document.getElementById("context-sub"),
+    contextBody: document.getElementById("context-body"),
+    toasts: document.getElementById("toasts"),
+  };
+
+  /* ── 2. Tiny DOM + format helpers ────────────────────────────────────── */
+
+  /**
+   * Build an element. `props` supports class, text, dataset, style (an object
+   * of custom properties) and boolean DOM properties such as disabled/hidden;
+   * anything else becomes an attribute. Children may be nodes, strings,
+   * arrays, or null/false to skip.
+   */
+  function el(tag, props, children) {
+    const node = document.createElement(tag);
+    if (props) {
+      for (const key of Object.keys(props)) {
+        const value = props[key];
+        if (value === null || value === undefined || value === false) continue;
+        if (key === "class") {
+          node.className = value;
+        } else if (key === "text") {
+          node.textContent = String(value);
+        } else if (key === "dataset") {
+          for (const dk of Object.keys(value)) node.dataset[dk] = String(value[dk]);
+        } else if (key === "style" && typeof value === "object") {
+          for (const sk of Object.keys(value)) node.style.setProperty(sk, String(value[sk]));
+        } else if (typeof value === "boolean" && key in node) {
+          node[key] = value;
+        } else {
+          node.setAttribute(key, String(value));
+        }
+      }
+    }
+    appendChildren(node, children);
+    return node;
+  }
+
+  function appendChildren(parent, children) {
+    if (children === null || children === undefined || children === false) return;
+    if (Array.isArray(children)) {
+      for (const child of children) appendChildren(parent, child);
+      return;
+    }
+    parent.append(children instanceof Node ? children : document.createTextNode(String(children)));
+  }
+
+  function clear(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  const countFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+  const byteFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
+  const dateFmt = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+
+  function formatCount(value) {
+    return countFmt.format(typeof value === "number" && isFinite(value) ? value : 0);
+  }
+
+  function formatBytes(value) {
+    if (typeof value !== "number" || !isFinite(value) || value < 0) return "—";
+    if (value === 0) return "0\u00A0B";
+    const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let amount = value;
+    let unit = 0;
+    while (amount >= 1024 && unit < units.length - 1) {
+      amount /= 1024;
+      unit += 1;
+    }
+    return byteFmt.format(amount) + "\u00A0" + units[unit];
+  }
+
+  function formatDate(iso) {
+    if (!iso) return "—";
+    const date = new Date(iso);
+    if (isNaN(date.getTime())) return "—";
+    return dateFmt.format(date);
+  }
+
+  function plural(n, singular, pluralForm) {
+    return n === 1 ? singular : pluralForm || singular + "s";
+  }
+
+  function pad2(value) {
+    const text = String(value);
+    return /^\d+$/.test(text) ? text.padStart(2, "0") : text;
+  }
+
+  function basename(filePath) {
+    if (typeof filePath !== "string" || !filePath) return "—";
+    const parts = filePath.split(/[\\/]/);
+    return parts[parts.length - 1] || filePath;
+  }
+
+  function fnv1a(text) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < text.length; i += 1) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return hash >>> 0;
+  }
+
+  /* ── 3. API client ───────────────────────────────────────────────────── */
+
+  /* Relative to the document, so the app works from any mount point: the
+     server serves this directory at "/" and the API at "/api/…". */
+  const API_BASE = "api/";
+  const REQUEST_TIMEOUT_MS = 15000;
+
+  class ApiError extends Error {
+    constructor(message, details) {
+      super(message);
+      const info = details || {};
+      this.name = "ApiError";
+      this.status = info.status || 0;
+      this.code = info.code || "";
+      this.path = info.path || "";
+      /* The parsed error envelope, when the server sent one. Carries the
+         `decision` block on some failures, so the UI can explain itself. */
+      this.body = info.body || null;
+    }
+  }
+
+  async function apiFetch(path, options) {
+    const opts = options || {};
+    const method = opts.method || "GET";
+    const controller = new AbortController();
+    const timer = setTimeout(function () {
+      controller.abort();
+    }, REQUEST_TIMEOUT_MS);
+
+    let response;
+    try {
+      response = await fetch(API_BASE + path, {
+        method: method,
+        headers: opts.body === undefined ? undefined : { "Content-Type": "application/json" },
+        body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+        signal: controller.signal,
+        cache: "no-store",
+        credentials: "same-origin",
+      });
+    } catch (error) {
+      clearTimeout(timer);
+      if (error && error.name === "AbortError") {
+        throw new ApiError(
+          "The request to the Astraeus API timed out after " +
+            Math.round(REQUEST_TIMEOUT_MS / 1000) +
+            " seconds.",
+          { path: path, code: "timeout" }
+        );
+      }
+      throw new ApiError(
+        "Could not reach the Astraeus API (" + API_BASE + path + "). Is the server running?",
+        { path: path, code: "network" }
+      );
+    }
+    clearTimeout(timer);
+
+    let text = "";
+    try {
+      text = await response.text();
+    } catch (error) {
+      text = "";
+    }
+
+    if (!response.ok) {
+      let message = "";
+      let code = "";
+      let parsedBody = null;
+      if (text) {
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed && typeof parsed === "object") {
+            parsedBody = parsed;
+            if (typeof parsed.message === "string") message = parsed.message;
+            if (typeof parsed.code === "string") code = parsed.code;
+          }
+        } catch (error) {
+          /* Non-JSON error bodies still have to reach the user verbatim. */
+          message = text.slice(0, 200);
+        }
+      }
+      throw new ApiError(message || "The API responded with HTTP " + response.status + ".", {
+        status: response.status,
+        code: code,
+        path: path,
+        body: parsedBody,
+      });
+    }
+
+    if (response.status === 204 || !text) return null;
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      throw new ApiError("The API returned a response that was not valid JSON.", {
+        status: response.status,
+        code: "invalid_json",
+        path: path,
+      });
+    }
+  }
+
+  function expectArray(value, what) {
+    if (!Array.isArray(value)) {
+      throw new ApiError("The API did not return a list of " + what + ".", {
+        code: "unexpected_shape",
+      });
+    }
+    return value;
+  }
+
+  const api = {
+    health: function () {
+      return apiFetch("health");
+    },
+    libraries: function () {
+      return apiFetch("libraries");
+    },
+    libraryEntities: function (libraryId) {
+      return apiFetch("libraries/" + encodeURIComponent(libraryId) + "/entities");
+    },
+    entity: function (entityId) {
+      return apiFetch("entities/" + encodeURIComponent(entityId));
+    },
+    scan: function (libraryId) {
+      return apiFetch("libraries/" + encodeURIComponent(libraryId) + "/scan", { method: "POST" });
+    },
+    enrich: function () {
+      return apiFetch("metadata/enrich", { method: "POST" });
+    },
+    /* Negotiates delivery for one entity. The body is an optional client
+       capability description; omitted, the server assumes its browser profile.
+       We intentionally omit it and then check what we can actually play, so
+       the server's decision is always visible to the user. */
+    playback: function (entityId, capability) {
+      return apiFetch("entities/" + encodeURIComponent(entityId) + "/playback", {
+        method: "POST",
+        body: capability,
+      });
+    },
+  };
+
+  /* ── 4. State ────────────────────────────────────────────────────────── */
+
+  const state = {
+    libraries: [],
+    libraryId: null,
+    entities: [],
+    entitiesLibraryId: null,
+    entityIndex: new Map(),
+    detail: null,
+    route: null,
+    loading: false,
+    busyAction: null,
+    /* Everything the player knows. Replaced wholesale by resetPlayback(). */
+    playback: emptyPlayback(),
+    filterIncomplete: false,
+    loadToken: 0,
+    retry: null,
+    booted: false,
+    /* Set when a route change was driven by a deliberate user gesture, so
+       the canvas (not <body>) receives focus once the new view is painted. */
+    focusTarget: null,
+  };
+
+  /* status: idle      — nothing negotiated yet
+             loading   — /playback in flight, or hls.js is being fetched
+             ready     — a source is attached; paused/playing tracked live
+             segmented — server chose HLS and nothing here can demux it
+             error     — negotiation, network or decode failure */
+  function emptyPlayback() {
+    return {
+      entityId: null,
+      title: null,
+      status: "idle",
+      mode: null,
+      url: null,
+      sessionId: null,
+      objectId: null,
+      decision: null,
+      mediaInfo: null,
+      reasons: [],
+      error: null,
+      duration: 0,
+      currentTime: 0,
+      seeking: false,
+      started: false,
+      /* "native" for a direct file or native HLS, "hls.js" for MSE. */
+      engine: null,
+      /* True whenever delivery is segmented, i.e. generated while playing. */
+      segmented: false,
+      /* Why a segmented stream could not be handed to a demuxer; kept on the
+         session so the rendered note can explain it, not just the toast. */
+      segmentedCause: null,
+      seekableStart: 0,
+      seekableEnd: 0,
+      /* Subtitle tracks as the server described them. Only an entry carrying a
+         `url` can actually be delivered; the rest are image-based. */
+      subtitles: [],
+      /* "off", or the key of the selected deliverable track. */
+      subtitleSelection: "off",
+    };
+  }
+
+  function activeLibrary() {
+    for (const library of state.libraries) {
+      if (library.id === state.libraryId) return library;
+    }
+    return null;
+  }
+
+  function rememberEntity(entity) {
+    if (entity && typeof entity.id === "string" && entity.id) {
+      state.entityIndex.set(entity.id, entity);
+    }
+  }
+
+  function parentIdOf(entity) {
+    /* The Go model marshals parent_id as *string, so a real parent is a
+       non-empty string and top-level entities arrive either without the key
+       or — for older rows — with "". Treat both as "no parent". */
+    if (!entity) return null;
+    const id = entity.parent_id;
+    return typeof id === "string" && id.length > 0 ? id : null;
+  }
+
+  function childCountOf(entity) {
+    if (!entity || (entity.type !== "Series" && entity.type !== "Season")) return null;
+    let count = 0;
+    for (const candidate of state.entities) {
+      if (parentIdOf(candidate) === entity.id) count += 1;
+    }
+    return count;
+  }
+
+  function displayTitle(entity) {
+    if (!entity) return "Untitled";
+    const metadata = entity.metadata;
+    if (metadata && typeof metadata.title === "string" && metadata.title.trim()) {
+      return metadata.title;
+    }
+    if (typeof entity.name === "string" && entity.name.trim()) return entity.name;
+    return "Untitled";
+  }
+
+  function metadataOf(entity) {
+    return (entity && entity.metadata) || null;
+  }
+
+  function extraOf(entity) {
+    const metadata = metadataOf(entity);
+    return (metadata && metadata.extra) || null;
+  }
+
+  function episodeLabel(entity) {
+    const extra = extraOf(entity);
+    if (!extra) return null;
+    const season = extra.season;
+    const episode = extra.episode;
+    if (season && episode) return "S" + pad2(season) + "E" + pad2(episode);
+    if (season) return "Season " + season;
+    if (episode) return "Episode " + episode;
+    return null;
+  }
+
+  function yearOf(entity) {
+    const extra = extraOf(entity);
+    if (extra && extra.year) return String(extra.year);
+    return null;
+  }
+
+  /* ── 5. Artwork ──────────────────────────────────────────────────────── */
+
+  /* poster_path/backdrop_path are TMDB-style paths with no CDN configured,
+     so they are usually unusable. We only trust absolute http(s) URLs and
+     otherwise fall back to a deterministic gradient derived from the id. */
+  function remoteArt(entity) {
+    const metadata = metadataOf(entity);
+    if (!metadata) return null;
+    const candidate = metadata.backdrop_path || metadata.poster_path;
+    if (typeof candidate === "string" && /^https?:\/\//i.test(candidate)) return candidate;
+    return null;
+  }
+
+  function artVars(seed) {
+    const hash = fnv1a(String(seed || "astraeus"));
+    const hueA = hash % 360;
+    const hueB = (hueA + 38 + ((hash >>> 8) % 132)) % 360;
+    return { "--art-h1": String(hueA), "--art-h2": String(hueB) };
+  }
+
+  function monogram(entity) {
+    const title = displayTitle(entity);
+    for (let i = 0; i < title.length; i += 1) {
+      const ch = title.charAt(i);
+      if (/[\p{L}\p{N}]/u.test(ch)) return ch.toUpperCase();
+    }
+    return "★";
+  }
+
+  function artNode(entity, extraClass) {
+    const node = el(
+      "span",
+      {
+        class: "art" + (extraClass ? " " + extraClass : ""),
+        style: artVars(entity && entity.id ? entity.id : displayTitle(entity)),
+        "aria-hidden": "true",
+      },
+      el("span", { class: "art-mono", text: monogram(entity) })
+    );
+    const src = remoteArt(entity);
+    if (src) {
+      const img = el("img", {
+        class: "art-img",
+        src: src,
+        alt: "",
+        width: 1280,
+        height: 720,
+        loading: "lazy",
+        decoding: "async",
+      });
+      img.addEventListener("error", function () {
+        img.remove();
+      });
+      node.prepend(img);
+    }
+    return node;
+  }
+
+  function setAmbient(entity) {
+    const seed = entity && entity.id ? entity.id : "astraeus";
+    const hash = fnv1a(seed);
+    document.documentElement.style.setProperty("--ambient-h", String(hash % 360));
+  }
+
+  /* ── 6. Shared UI pieces ─────────────────────────────────────────────── */
+
+  function statusFlag(entity) {
+    const incomplete = entity && entity.status === "Incomplete";
+    return el("span", {
+      class: "flag " + (incomplete ? "flag-incomplete" : "flag-complete"),
+      text: incomplete ? "Needs metadata" : "Complete",
+    });
+  }
+
+  function entityCard(entity, options) {
+    const opts = options || {};
+    const current = opts.current === true;
+    const parent = parentIdOf(entity) ? state.entityIndex.get(parentIdOf(entity)) : null;
+    const details = [];
+    const episode = episodeLabel(entity);
+    if (episode) details.push(episode);
+    const year = yearOf(entity);
+    if (year) details.push(year);
+    const childCount = childCountOf(entity);
+    if (childCount !== null) details.push(formatCount(childCount) + " " + plural(childCount, "item"));
+    if (parent) details.push("in " + displayTitle(parent));
+
+    return el(
+      "button",
+      {
+        type: "button",
+        class: "card",
+        "data-action": "open-entity",
+        "data-entity-id": entity.id,
+        "data-focus-key": "card:" + entity.id,
+        "aria-current": current ? "true" : null,
+        "aria-label":
+          displayTitle(entity) +
+          ", " +
+          entity.type +
+          ", " +
+          (entity.status === "Incomplete" ? "needs metadata" : "complete"),
+      },
+      [
+        artNode(entity, "card-art"),
+        el("span", { class: "card-body" }, [
+          el("span", { class: "card-type", text: entity.type || "Entity" }),
+          el("span", { class: "card-title", text: displayTitle(entity) }),
+          details.length
+            ? el("span", { class: "card-sub", text: details.join(" · ") })
+            : null,
+          el("span", { class: "card-flags" }, statusFlag(entity)),
+        ]),
+      ]
+    );
+  }
+
+  function collectionNode(entities, options) {
+    const opts = options || {};
+    const list = el("ul", { class: "collection" });
+    const currentNode = state.route && state.route.segs[0] === "entity" ? state.route.segs[1] : null;
+    for (const entity of entities) {
+      list.append(
+        el(
+          "li",
+          null,
+          entityCard(entity, { current: opts.current === true && entity.id === currentNode })
+        )
+      );
+    }
+    enableArrowNav(list, ".card");
+    return list;
+  }
+
+  /* Left/right move through a collection without leaving the keyboard. */
+  function enableArrowNav(container, selector) {
+    container.addEventListener("keydown", function (event) {
+      const keys = ["ArrowRight", "ArrowLeft", "Home", "End"];
+      if (keys.indexOf(event.key) === -1) return;
+      const items = Array.prototype.slice.call(container.querySelectorAll(selector));
+      const active = document.activeElement;
+      const index = items.indexOf(active);
+      if (index === -1) return;
+      let next = index;
+      if (event.key === "ArrowRight") next = Math.min(items.length - 1, index + 1);
+      if (event.key === "ArrowLeft") next = Math.max(0, index - 1);
+      if (event.key === "Home") next = 0;
+      if (event.key === "End") next = items.length - 1;
+      if (next === index) return;
+      event.preventDefault();
+      items[next].focus();
+    });
+  }
+
+  function canvasState(options) {
+    const opts = options || {};
+    const children = [
+      opts.spinner
+        ? el("span", { class: "spinner", "aria-hidden": "true" })
+        : el("span", { class: "state-mark", "aria-hidden": "true" }),
+      el("h1", { class: "state-title", text: opts.title || "" }),
+    ];
+    if (opts.body) children.push(el("p", { class: "state-body", text: opts.body }));
+    if (opts.actions && opts.actions.length) {
+      children.push(el("div", { class: "hero-actions" }, opts.actions));
+    }
+    return el("div", { class: "canvas-state" }, children);
+  }
+
+  function metaRow(term, value, valueClass) {
+    if (value === null || value === undefined || value === "") return null;
+    return el("div", { class: "meta-row" }, [
+      el("dt", { text: term }),
+      el("dd", { class: valueClass || null, text: String(value) }),
+    ]);
+  }
+
+  function sectionNode(title, children) {
+    return el("section", { class: "ctx-section" }, [
+      el("h3", { class: "ctx-heading", text: title }),
+    ].concat(children.filter(Boolean)));
+  }
+
+  /* ── 7. Rendering ────────────────────────────────────────────────────── */
+
+  function render() {
+    const restoreKey = focusKeyOf(document.activeElement);
+    renderNav();
+    renderBreadcrumbs();
+    renderCanvas();
+    renderContext();
+    if (restoreKey) restoreFocus(restoreKey);
+  }
+
+  function focusKeyOf(node) {
+    if (!node || !node.dataset || typeof node.dataset.focusKey !== "string") return null;
+    return node.dataset.focusKey;
+  }
+
+  function restoreFocus(key) {
+    let next = null;
+    try {
+      next = document.querySelector('[data-focus-key="' + CSS.escape(key) + '"]');
+    } catch (error) {
+      next = null;
+    }
+    if (next && next !== document.activeElement) {
+      next.focus({ preventScroll: true });
+    }
+  }
+
+  /* After a user-driven navigation, hand focus to the canvas so keyboard and
+     screen-reader users land inside the new view instead of on <body>. */
+  function applyFocusTarget() {
+    if (state.focusTarget !== "canvas") return;
+    state.focusTarget = null;
+    dom.canvas.focus({ preventScroll: true });
+  }
+
+  /* 7a. Left sidebar ------------------------------------------------------ */
+
+  function renderNav() {
+    const library = activeLibrary();
+    clear(dom.libraryList);
+    dom.navEmpty.hidden = state.libraries.length > 0;
+
+    for (const item of state.libraries) {
+      const selected = item.id === state.libraryId;
+      const scanning = state.busyAction === "scan:" + item.id;
+      dom.libraryList.append(
+        el("li", { class: "library-item" + (selected ? " is-selected" : "") }, [
+          el(
+            "a",
+            {
+              class: "library-link",
+              href: hashFor("library", item.id),
+              "data-focus-key": "lib:" + item.id,
+              "aria-current": selected ? "true" : null,
+            },
+            [
+              el("span", { class: "library-name", text: item.name || "Untitled library" }),
+              el("span", { class: "library-kind", text: kindLabel(item.kind) }),
+              el("span", {
+                class: "library-path",
+                text: item.path || "",
+                title: item.path || "",
+              }),
+            ]
+          ),
+          el("button", {
+            type: "button",
+            class: "btn btn-small btn-quiet",
+            "data-action": "scan",
+            "data-library-id": item.id,
+            "data-focus-key": "scan:" + item.id,
+            disabled: scanning,
+            "aria-label": "Scan library " + (item.name || "Untitled library"),
+            text: scanning ? "Scanning…" : "Scan",
+          }),
+        ])
+      );
+    }
+
+    const total = state.entities.length;
+    let incomplete = 0;
+    for (const entity of state.entities) {
+      if (entity.status === "Incomplete") incomplete += 1;
+    }
+
+    if (library) {
+      dom.navSummary.textContent =
+        kindLabel(library.kind) +
+        " · " +
+        formatCount(total) +
+        " " +
+        plural(total, "entity", "entities") +
+        " · " +
+        formatCount(incomplete) +
+        " incomplete";
+    } else {
+      dom.navSummary.textContent = state.booted ? "No library selected" : "Loading…";
+    }
+
+    dom.incompleteCount.textContent = formatCount(incomplete);
+    dom.incompleteCount.dataset.empty = incomplete === 0 ? "true" : "false";
+    dom.incompleteDesc.textContent =
+      incomplete === 0
+        ? ", nothing needs attention"
+        : ", " + formatCount(incomplete) + " " + plural(incomplete, "entity", "entities") + " need metadata";
+    dom.filterToggle.setAttribute("aria-pressed", state.filterIncomplete ? "true" : "false");
+    dom.enrichButton.disabled = state.busyAction === "enrich";
+    dom.enrichButton.textContent = state.busyAction === "enrich" ? "Enriching…" : "Enrich metadata";
+  }
+
+  function kindLabel(kind) {
+    if (kind === "movies") return "Movies";
+    if (kind === "shows") return "Shows";
+    return kind ? String(kind) : "Unknown";
+  }
+
+  /* 7b. Breadcrumbs ------------------------------------------------------- */
+
+  function breadcrumbTrail() {
+    const trail = [];
+    const library = activeLibrary();
+    if (library) {
+      trail.push({
+        kind: "library",
+        id: library.id,
+        label: library.name || "Untitled library",
+        type: "Library",
+      });
+    }
+    if (!state.route || state.route.segs[0] !== "entity") return trail;
+
+    const chain = [];
+    let current =
+      state.entityIndex.get(state.route.segs[1]) ||
+      (state.detail ? state.detail.entity : null);
+    let guard = 0;
+    while (current && guard < 24) {
+      guard += 1;
+      chain.unshift({
+        kind: "entity",
+        id: current.id,
+        label: displayTitle(current),
+        type: current.type || "Entity",
+      });
+      const parentId = parentIdOf(current);
+      if (!parentId) break;
+      let parent = state.entityIndex.get(parentId);
+      if (!parent && state.detail && state.detail.parent && state.detail.parent.id === parentId) {
+        parent = state.detail.parent;
+      }
+      current = parent;
+    }
+    return trail.concat(chain);
+  }
+
+  function hashFor(kind, id) {
+    return "#/" + kind + "/" + encodeURIComponent(id);
+  }
+
+  function renderBreadcrumbs() {
+    clear(dom.breadcrumbs);
+    const trail = breadcrumbTrail();
+    if (!trail.length) {
+      dom.breadcrumbs.append(
+        el("li", { class: "crumb" }, el("span", { class: "crumb-current", text: "Astraeus" }))
+      );
+      return;
+    }
+    trail.forEach(function (node, index) {
+      const last = index === trail.length - 1;
+      const li = el("li", { class: "crumb" });
+      if (last) {
+        li.append(
+          el("span", {
+            class: "crumb-current",
+            "aria-current": "page",
+            title: node.type,
+            text: node.label,
+          })
+        );
+      } else {
+        li.append(
+          el("a", {
+            class: "crumb-link",
+            href: hashFor(node.kind, node.id),
+            "data-focus-key": "crumb:" + node.kind + ":" + node.id,
+            title: "Go to " + node.type + ": " + node.label,
+            text: node.label,
+          })
+        );
+      }
+      dom.breadcrumbs.append(li);
+    });
+  }
+
+  /* 7c. Canvas ------------------------------------------------------------ */
+
+  function renderCanvas() {
+    clear(dom.canvasContent);
+    dom.canvas.setAttribute("aria-busy", state.loading ? "true" : "false");
+
+    if (!state.booted) {
+      dom.canvasContent.append(canvasState({ spinner: true, title: "Loading…" }));
+      return;
+    }
+
+    if (state.libraries.length === 0) {
+      dom.canvasContent.append(
+        canvasState({
+          title: "No libraries yet",
+          body:
+            "Astraeus has no libraries registered. Create one with POST /api/libraries, " +
+            "then reload this page to browse it.",
+        })
+      );
+      return;
+    }
+
+    const route = state.route;
+    if (!route) {
+      dom.canvasContent.append(
+        canvasState({
+          title: "Pick a library",
+          body: "Choose a library from the left to start browsing your media.",
+        })
+      );
+      return;
+    }
+
+    if (route.segs[0] === "library") {
+      renderLibraryCanvas();
+      return;
+    }
+
+    if (route.segs[0] === "entity") {
+      if (state.detail) {
+        const type = state.detail.entity.type;
+        if (type === "Movie" || type === "Episode") {
+          renderLeafCanvas(state.detail);
+        } else {
+          renderContainerCanvas(state.detail);
+        }
+      } else if (state.loading) {
+        dom.canvasContent.append(canvasState({ spinner: true, title: "Loading…" }));
+      } else {
+        dom.canvasContent.append(
+          canvasState({
+            title: "Could not load this entity",
+            body: "The selection could not be read from the API. See the message above.",
+            actions: [
+              el("button", {
+                type: "button",
+                class: "btn btn-accent",
+                "data-action": "retry",
+                text: "Retry",
+              }),
+            ],
+          })
+        );
+      }
+    }
+  }
+
+  function libraryEntitiesForDisplay() {
+    const all = state.entities;
+    if (state.filterIncomplete) {
+      return all.filter(function (entity) {
+        return entity.status === "Incomplete";
+      });
+    }
+    return all.filter(function (entity) {
+      return !parentIdOf(entity);
+    });
+  }
+
+  function renderLibraryCanvas() {
+    const library = activeLibrary();
+    if (!library) {
+      dom.canvasContent.append(
+        canvasState({
+          title: "Library not found",
+          body: "That library is not in the current list. It may have been deleted.",
+        })
+      );
+      return;
+    }
+
+    const shown = libraryEntitiesForDisplay();
+    let incomplete = 0;
+    for (const entity of state.entities) {
+      if (entity.status === "Incomplete") incomplete += 1;
+    }
+
+    const head = el("header", { class: "browse-head" }, [
+      el("div", { class: "browse-head-text" }, [
+        el("p", {
+          class: "eyebrow",
+          text: "Library · " + kindLabel(library.kind),
+        }),
+        el("h1", { class: "browse-title", text: library.name || "Untitled library" }),
+        el("p", {
+          class: "browse-sub",
+          text:
+            (library.path || "No path recorded") +
+            " · " +
+            formatCount(state.entities.length) +
+            " " +
+            plural(state.entities.length, "entity", "entities") +
+            " · " +
+            formatCount(incomplete) +
+            " incomplete",
+        }),
+      ]),
+    ]);
+
+    const browse = el("div", { class: "browse" }, [head]);
+
+    if (state.loading && state.entities.length === 0) {
+      browse.append(el("p", { class: "browse-sub", text: "Loading entities…" }));
+    } else if (state.entities.length === 0) {
+      browse.append(
+        canvasState({
+          title: "This library is empty",
+          body: "Nothing has been imported from " + (library.path || "this path") + " yet. Run a scan to look for media.",
+          actions: [
+            el("button", {
+              type: "button",
+              class: "btn btn-accent",
+              "data-action": "scan",
+              "data-library-id": library.id,
+              text: "Scan library",
+            }),
+          ],
+        })
+      );
+    } else if (shown.length === 0) {
+      browse.append(
+        canvasState({
+          title: "Nothing needs attention",
+          body: "Every entity in this library already has metadata. Turn off the incomplete filter to see everything.",
+          actions: [
+            el("button", {
+              type: "button",
+              class: "btn",
+              "data-action": "toggle-filter",
+              text: "Show all",
+            }),
+          ],
+        })
+      );
+    } else {
+      if (state.filterIncomplete) {
+        browse.append(
+          el("p", {
+            class: "browse-sub",
+            text:
+              "Showing every entity that still needs metadata, at any depth of the hierarchy.",
+          })
+        );
+      }
+      browse.append(collectionNode(shown, { current: false }));
+    }
+
+    dom.canvasContent.append(browse);
+  }
+
+  function renderLeafCanvas(detail) {
+    const entity = detail.entity;
+    const metadata = metadataOf(entity);
+    const hero = el("article", { class: "hero" }, [
+      artNode(entity, "hero-art"),
+      el("div", { class: "hero-scrim", "aria-hidden": "true" }),
+    ]);
+
+    const titleId = "canvas-title";
+    const body = el("div", { class: "hero-body" }, [
+      el("p", { class: "eyebrow" }, [
+        el("span", { text: entity.type || "Entity" }),
+        statusFlag(entity),
+        episodeLabel(entity) ? el("span", { text: episodeLabel(entity) }) : null,
+        yearOf(entity) ? el("span", { text: yearOf(entity) }) : null,
+      ]),
+      el("h1", { class: "hero-title", id: titleId, text: displayTitle(entity) }),
+      el("p", {
+        class: "hero-desc",
+        text:
+          (metadata && metadata.description) ||
+          "No description has been attached to this entity yet. Enrich metadata to fill this in.",
+      }),
+      el("div", { class: "hero-actions" }, [
+        el("button", {
+          type: "button",
+          class: "btn btn-primary",
+          "data-action": "play",
+          "data-focus-key": "play-hero",
+          disabled: !Array.isArray(detail.objects) || detail.objects.length === 0,
+          "aria-label": "Play " + displayTitle(entity),
+          text: "▶ Play",
+        }),
+      ]),
+    ]);
+
+    hero.append(body);
+    dom.canvasContent.append(hero);
+  }
+
+  function renderContainerCanvas(detail) {
+    const entity = detail.entity;
+    const metadata = metadataOf(entity);
+    const children = Array.isArray(detail.children) ? detail.children : [];
+    const shown = state.filterIncomplete
+      ? children.filter(function (child) {
+          return child.status === "Incomplete";
+        })
+      : children;
+
+    const head = el("header", { class: "browse-head" }, [
+      artNode(entity, "browse-head-art"),
+      el("div", { class: "browse-head-text" }, [
+        el("p", { class: "eyebrow" }, [
+          el("span", { text: entity.type || "Entity" }),
+          statusFlag(entity),
+        ]),
+        el("h1", { class: "browse-title", text: displayTitle(entity) }),
+        el("p", {
+          class: "browse-sub",
+          text:
+            formatCount(children.length) +
+            " " +
+            plural(children.length, "child", "children") +
+            (state.filterIncomplete ? " · filtered to incomplete" : ""),
+        }),
+        metadata && metadata.description
+          ? el("p", { class: "browse-desc", text: metadata.description })
+          : null,
+      ]),
+    ]);
+
+    const browse = el("div", { class: "browse" }, [head]);
+    if (children.length === 0) {
+      browse.append(
+        canvasState({
+          title: "Nothing inside yet",
+          body: "This " + String(entity.type || "entity").toLowerCase() + " has no children recorded.",
+        })
+      );
+    } else if (shown.length === 0) {
+      browse.append(
+        canvasState({
+          title: "Nothing needs attention",
+          body: "All children of this entity already have metadata.",
+          actions: [
+            el("button", {
+              type: "button",
+              class: "btn",
+              "data-action": "toggle-filter",
+              text: "Show all",
+            }),
+          ],
+        })
+      );
+    } else {
+      browse.append(collectionNode(shown, { current: true }));
+    }
+    dom.canvasContent.append(browse);
+  }
+
+  /* 7d. Context panel ----------------------------------------------------- */
+
+  function renderContext() {
+    clear(dom.contextBody);
+    const route = state.route;
+
+    if (route && route.segs[0] === "entity") {
+      if (!state.detail) {
+        dom.contextSub.textContent = "Loading…";
+        dom.contextBody.append(el("p", { class: "muted", text: "Loading…" }));
+        return;
+      }
+      const entity = state.detail.entity;
+      dom.contextSub.textContent = (entity.type || "Entity") + " · " + displayTitle(entity);
+      renderEntityContext(state.detail);
+      return;
+    }
+
+    if (route && route.segs[0] === "library") {
+      const library = activeLibrary();
+      dom.contextSub.textContent = library ? library.name || "Untitled library" : "Library";
+      renderLibraryContext(library);
+      return;
+    }
+
+    dom.contextSub.textContent = "Nothing selected";
+    dom.contextBody.append(
+      el("p", {
+        class: "muted small",
+        text: "Select a movie, episode, series or season to inspect it here.",
+      })
+    );
+  }
+
+  function renderLibraryContext(library) {
+    if (!library) {
+      dom.contextBody.append(el("p", { class: "muted small", text: "Library unavailable." }));
+      return;
+    }
+    let incomplete = 0;
+    for (const entity of state.entities) {
+      if (entity.status === "Incomplete") incomplete += 1;
+    }
+
+    dom.contextBody.append(
+      sectionNode("Library", [
+        el("dl", { class: "meta-grid" }, [
+          metaRow("Name", library.name || "Untitled library"),
+          metaRow("Kind", kindLabel(library.kind)),
+          metaRow("Path", library.path || "—", "mono"),
+          metaRow("Created", formatDate(library.created_at)),
+          metaRow("Entities", formatCount(state.entities.length), "num"),
+          metaRow("Incomplete", formatCount(incomplete), "num"),
+          metaRow("ID", library.id, "mono"),
+        ]),
+      ])
+    );
+
+    const top = state.entities.filter(function (entity) {
+      return !parentIdOf(entity);
+    });
+    dom.contextBody.append(
+      sectionNode(
+        "Top-level entities",
+        top.length
+          ? [
+              el(
+                "ul",
+                { class: "stack-list" },
+                top.map(function (entity) {
+                  return el("li", null, el("div", { class: "stack-item" }, [
+                    el("span", { class: "stack-text", text: displayTitle(entity) }),
+                    el("span", { class: "stack-index", text: entity.type || "" }),
+                  ]));
+                })
+              ),
+            ]
+          : [el("p", { class: "muted small", text: "No entities recorded for this library yet." })]
+      )
+    );
+
+    dom.contextBody.append(
+      sectionNode("Actions", [
+        el("button", {
+          type: "button",
+          class: "btn btn-block",
+          "data-action": "scan",
+          "data-library-id": library.id,
+          "data-focus-key": "scan-context",
+          disabled: state.busyAction === "scan:" + library.id,
+          text: state.busyAction === "scan:" + library.id ? "Scanning…" : "Scan library",
+        }),
+      ])
+    );
+  }
+
+  function renderEntityContext(detail) {
+    const entity = detail.entity;
+    const metadata = metadataOf(entity);
+    const objects = Array.isArray(detail.objects) ? detail.objects : [];
+    const children = Array.isArray(detail.children) ? detail.children : [];
+    const parent = detail.parent || null;
+    const isLeaf = entity.type === "Movie" || entity.type === "Episode";
+
+    dom.contextBody.append(
+      sectionNode("Metadata", [
+        el("dl", { class: "meta-grid" }, [
+          metaRow("Title", displayTitle(entity)),
+          metaRow("Type", entity.type || "—"),
+          metaRow("Status", entity.status || "—"),
+          episodeLabel(entity) ? metaRow("Season / Episode", episodeLabel(entity)) : null,
+          yearOf(entity) ? metaRow("Year", yearOf(entity)) : null,
+          metaRow("Provider", metadata && metadata.provider ? metadata.provider : "None", null),
+          parent ? metaRow("Parent", displayTitle(parent)) : null,
+          metaRow("Updated", formatDate(entity.updated_at)),
+          metaRow("ID", entity.id, "mono"),
+        ]),
+        el("p", {
+          class: "muted small",
+          text:
+            (metadata && metadata.description) ||
+            "No description recorded. This entity has not been enriched yet.",
+        }),
+      ])
+    );
+
+    dom.contextBody.append(renderPlaybackSection(entity, objects, isLeaf));
+    dom.contextBody.append(renderQueueSection(entity, objects, children, isLeaf));
+    dom.contextBody.append(renderFilesSection(objects));
+  }
+
+  function isLeafType(type) {
+    return type === "Movie" || type === "Episode";
+  }
+
+  function modeLabel(mode) {
+    if (mode === "direct_play") return "Direct play";
+    if (mode === "remux") return "Remux → HLS";
+    if (mode === "transcode") return "Transcode → HLS";
+    return "Not negotiated";
+  }
+
+  function modeClass(mode) {
+    if (mode === "direct_play" || mode === "remux" || mode === "transcode") {
+      return "mode-" + mode;
+    }
+    return "mode-unknown";
+  }
+
+  function formatClock(seconds) {
+    if (typeof seconds !== "number" || !isFinite(seconds) || seconds < 0) return "0:00";
+    const total = Math.floor(seconds);
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    if (hours > 0) {
+      return hours + ":" + pad2(minutes) + ":" + pad2(secs);
+    }
+    return minutes + ":" + pad2(secs);
+  }
+
+  /* ── Subtitle selector ───────────────────────────────────────────────── */
+
+  function subtitleOptionId(key) {
+    return "subtitle-opt-" + String(key).replace(/[^A-Za-z0-9_-]/g, "-");
+  }
+
+  /* Native radios give us the group semantics, single tab stop, arrow-key
+     traversal and "checked" announcement for free; the styling is purely
+     visual so nothing about the control becomes custom or unreachable. */
+  function subtitleOptionNode(opts) {
+    const id = subtitleOptionId(opts.key);
+    const input = el("input", {
+      type: "radio",
+      name: "subtitle-track",
+      id: id,
+      value: String(opts.key),
+      checked: opts.checked === true,
+      disabled: opts.disabled === true,
+      "data-action": "select-subtitle",
+      "data-subtitle-key": String(opts.key),
+      "data-focus-key": "subtitle:" + String(opts.key),
+      "aria-describedby": opts.describedBy || null,
+    });
+    return el("label", { class: "subtitle-option", for: id }, [
+      input,
+      el("span", { text: opts.label }),
+    ]);
+  }
+
+  function subtitleSelectorNode(pb, live) {
+    const list = Array.isArray(pb.subtitles) ? pb.subtitles : [];
+    if (!list.length) return null;
+
+    const deliverable = list.filter(subtitleDeliverable);
+    const blocked = list.filter(function (sub) {
+      return !subtitleDeliverable(sub);
+    });
+
+    const options = [
+      subtitleOptionNode({
+        key: "off",
+        label: "Off",
+        checked: pb.subtitleSelection === "off" || deliverable.length === 0,
+        disabled: false,
+      }),
+    ];
+
+    for (const sub of deliverable) {
+      const key = subtitleKey(sub);
+      options.push(
+        subtitleOptionNode({
+          key: key,
+          label: subtitleLabel(sub),
+          checked: pb.subtitleSelection === key,
+          disabled: !live,
+        })
+      );
+    }
+
+    for (const sub of blocked) {
+      options.push(
+        subtitleOptionNode({
+          key: "blocked-" + subtitleKey(sub),
+          label: subtitleLabel(sub),
+          checked: false,
+          disabled: true,
+          describedBy: "subtitle-blocked-reason",
+        })
+      );
+    }
+
+    const body = [el("div", { class: "subtitle-options" }, options)];
+    if (blocked.length) {
+      body.push(
+        el("p", {
+          class: "subtitle-reason",
+          id: "subtitle-blocked-reason",
+          text:
+            "Image-based subtitles are not supported, so these cannot be selected: " +
+            blocked.map(subtitleLabel).join(", ") +
+            ".",
+        })
+      );
+    }
+
+    return el(
+      "fieldset",
+      { class: "subtitle-group" },
+      [el("legend", { class: "ctx-heading", text: "Subtitles" })].concat(body)
+    );
+  }
+
+  function renderPlaybackSection(entity, objects, isLeaf) {
+    const pb = state.playback;
+    const hasObjects = Array.isArray(objects) && objects.length > 0;
+    const playable = isLeafType(entity.type) && hasObjects;
+
+    /* A negotiation belongs to one entity only. */
+    const isCurrent = pb.entityId === entity.id;
+    const status = isCurrent ? pb.status : "idle";
+    const live = isCurrent && (status === "ready" || status === "playing" || status === "paused");
+    const busy = isCurrent && status === "loading";
+
+    const playing = live && pb.started && playerVideo && !playerVideo.paused && !playerVideo.ended;
+
+    const transport = el("div", { class: "transport" }, [
+      el("button", {
+        type: "button",
+        class: "btn btn-primary",
+        "data-action": "play",
+        "data-focus-key": "play",
+        id: "player-toggle",
+        disabled: !playable || busy,
+        "aria-label": playing ? "Pause" : "Play",
+        text: playing ? "❚❚ Pause" : "▶ Play",
+      }),
+      el("button", {
+        type: "button",
+        class: "btn",
+        "data-action": "restart",
+        "data-focus-key": "restart",
+        disabled: !live,
+        "aria-label": "Restart from the beginning",
+        text: "⏮",
+      }),
+      el("button", {
+        type: "button",
+        class: "btn",
+        "data-action": "skip",
+        "data-focus-key": "skip",
+        disabled: !live,
+        "aria-label": "Skip forward 10 seconds",
+        text: "⏭",
+      }),
+      live
+        ? el("button", {
+            type: "button",
+            class: "btn btn-quiet",
+            "data-action": "stop-playback",
+            "data-focus-key": "stop",
+            text: "Stop",
+          })
+        : null,
+    ]);
+
+    /* The seek bar is bound to the real seekable window, never to an assumed
+       duration: a segmented stream grows while ffmpeg produces segments. */
+    const bounds = live ? seekableBounds() : { start: 0, end: 0 };
+    const seekable = live && bounds.end > 0;
+    const growing = live && isEventPlaylistPlayback();
+
+    const seek = el("input", {
+      type: "range",
+      class: "seek",
+      id: "player-seek",
+      min: String(bounds.start),
+      max: String(seekable ? bounds.end : 100),
+      step: "0.1",
+      value: String(seekable ? Math.min(Math.max(pb.currentTime, bounds.start), bounds.end) : 0),
+      disabled: !seekable,
+      "aria-label": growing ? "Seek within the produced part of the stream" : "Seek position",
+      "aria-describedby": "playback-note",
+      "aria-valuetext": seekable
+        ? formatClock(pb.currentTime) + " of " + formatClock(bounds.end)
+        : "unavailable",
+    });
+
+    const time = el("span", {
+      class: "player-time",
+      id: "player-time",
+      text: seekable
+        ? formatClock(pb.currentTime) + " / " + formatClock(bounds.end)
+        : "0:00 / 0:00",
+    });
+
+    const seekRow = el("div", { class: "seek-row" }, [seek, time]);
+
+    const children = [transport, seekRow];
+
+    if (live && pb.mode) {
+      children.push(
+        el("div", { class: "delivery-facts" }, [
+          el("span", { class: "mode-badge " + modeClass(pb.mode), text: modeLabel(pb.mode) }),
+          pb.mediaInfo && pb.mediaInfo.container
+            ? el("span", { class: "chip", text: String(pb.mediaInfo.container) })
+            : null,
+          pb.mediaInfo && pb.mediaInfo.video_codec
+            ? el("span", { class: "chip", text: String(pb.mediaInfo.video_codec) })
+            : null,
+          pb.mediaInfo && pb.mediaInfo.audio_codec
+            ? el("span", { class: "chip", text: String(pb.mediaInfo.audio_codec) })
+            : null,
+          pb.mediaInfo && pb.mediaInfo.width && pb.mediaInfo.height
+            ? el("span", {
+                class: "chip",
+                text: pb.mediaInfo.width + "×" + pb.mediaInfo.height,
+              })
+            : null,
+          bounds.end > 0
+            ? el("span", {
+                class: "chip",
+                text: (growing ? "produced " : "") + formatClock(bounds.end),
+              })
+            : null,
+        ])
+      );
+    }
+
+    /* Say plainly that a segmented stream is being produced as it plays. */
+    if (growing) {
+      children.push(
+        el("p", { class: "delivery-facts" }, [
+          el("span", {
+            class: "chip chip-live",
+            id: "player-window",
+            text: "Growing · seekable to " + formatClock(bounds.end),
+          }),
+        ])
+      );
+    }
+
+    if (live && pb.decision && Array.isArray(pb.decision.reasons) && pb.decision.reasons.length) {
+      children.push(
+        el(
+          "ul",
+          { class: "reasons" },
+          pb.decision.reasons.map(function (reason) {
+            return el("li", { text: String(reason) });
+          })
+        )
+      );
+    }
+
+    /* Subtitle selection belongs to one negotiated session only, so it is
+       shown only while that session is the current one. */
+    if (isCurrent) {
+      const subtitleNode = subtitleSelectorNode(pb, live);
+      if (subtitleNode) children.push(subtitleNode);
+    }
+
+    children.push(el("p", { class: "playback-note", id: "playback-note", "data-state": noteState(status, playable), text: noteText(entity, status, playable, pb) }));
+    children.push(
+      el("p", {
+        class: "muted small",
+        text: hasObjects
+          ? basename(objects[0].file_path) + " · " + (objects[0].mime_type || "unknown type")
+          : "No media object attached.",
+      })
+    );
+
+    return sectionNode("Playback", children);
+  }
+
+  function noteState(status, playable) {
+    if (status === "segmented") return "warn";
+    if (status === "error") return "alert";
+    if (status === "ready" || status === "playing" || status === "paused") return "ok";
+    return playable ? "info" : "warn";
+  }
+
+  function noteText(entity, status, playable, pb) {
+    if (!isLeafType(entity.type)) {
+      return (
+        "This is a " +
+        String(entity.type || "container").toLowerCase() +
+        ", which holds children but has no media file of its own — so there is nothing to play. " +
+        "Select a movie or an episode instead."
+      );
+    }
+    if (!playable) {
+      return "No media file is recorded for this entity, so there is nothing to play.";
+    }
+    if (status === "loading") {
+      return pb && pb.segmented
+        ? "Preparing segmented delivery…"
+        : "Negotiating delivery with the server…";
+    }
+    if (status === "error") {
+      return pb && pb.error ? pb.error : "Playback failed.";
+    }
+    if (status === "segmented") return segmentedMessage(pb, pb.segmentedCause);
+    if (status === "ready" || status === "playing" || status === "paused") {
+      if (pb.mode === "direct_play") {
+        return "Direct play: the server is sending the original file over HTTP range requests, so seeking is exact.";
+      }
+      const engine = pb.engine === "native" ? "the browser's native HLS support" : "the bundled hls.js player over MSE";
+      return (
+        "Segmented delivery via " +
+        engine +
+        ". The server runs ffmpeg when playback starts and produces segments in order, so this" +
+        " stream is being generated while it plays: the seek bar covers only what has been" +
+        " produced so far and grows as more arrives. Seeking backwards is instant; seeking" +
+        " forward is limited to the produced part."
+      );
+    }
+    return (
+      "Press Play to negotiate delivery. The server picks direct play when the file is already " +
+      "browser-compatible, and remux or transcode otherwise."
+    );
+  }
+
+  function renderQueueSection(entity, objects, children, isLeaf) {
+    if (isLeaf) {
+      if (!objects.length) {
+        return sectionNode("Queue", [
+          el("p", { class: "muted small", text: "Nothing queued — no media objects are recorded." }),
+        ]);
+      }
+      return sectionNode(
+        "Queue",
+        [
+          el(
+            "ul",
+            { class: "stack-list" },
+            objects.map(function (object, index) {
+              return el("li", null, el("div", { class: "stack-item" }, [
+                el("span", { class: "stack-index", text: String(index + 1).padStart(2, "0") }),
+                el("span", { class: "stack-text" }, [
+                  el("span", { class: "queue-title", text: basename(object.file_path) }),
+                  el("span", {
+                    class: "card-sub",
+                    text: formatBytes(object.size) + " · " + (object.mime_type || "unknown type"),
+                  }),
+                ]),
+              ]));
+            })
+          ),
+        ]
+      );
+    }
+
+    if (!children.length) {
+      return sectionNode("Children", [
+        el("p", { class: "muted small", text: "This container has no children recorded." }),
+      ]);
+    }
+
+    return sectionNode(
+      "Children · " + formatCount(children.length),
+      [
+        el(
+          "ul",
+          { class: "stack-list" },
+          children.map(function (child) {
+            const current = state.route && state.route.segs[1] === child.id;
+            return el(
+              "li",
+              null,
+              el(
+                "button",
+                {
+                  type: "button",
+                  class: "queue-item",
+                  "data-action": "open-entity",
+                  "data-entity-id": child.id,
+                  "data-focus-key": "queue:" + child.id,
+                  "aria-current": current ? "true" : null,
+                },
+                [
+                  el("span", { class: "queue-kind", text: child.type || "Entity" }),
+                  el("span", { class: "queue-title", text: displayTitle(child) }),
+                  child.status === "Incomplete"
+                    ? el("span", { class: "flag flag-incomplete", text: "Needs metadata" })
+                    : null,
+                ]
+              )
+            );
+          })
+        ),
+      ]
+    );
+  }
+
+  function renderFilesSection(objects) {
+    if (!objects.length) {
+      return sectionNode("Files", [
+        el("p", { class: "muted small", text: "No media objects are recorded for this entity." }),
+      ]);
+    }
+    return sectionNode(
+      "Files · " + formatCount(objects.length),
+      objects.map(function (object) {
+        return el("div", { class: "file-card" }, [
+          el("p", { class: "file-path", text: object.file_path || "—" }),
+          el("div", { class: "file-tags" }, [
+            el("span", { class: "chip", text: formatBytes(object.size) }),
+            el("span", { class: "chip", text: object.mime_type || "unknown type" }),
+            el("span", { class: "chip", text: formatDate(object.created_at) }),
+          ]),
+        ]);
+      })
+    );
+  }
+
+  /* ── 8. Feedback: banner, toasts, status line ────────────────────────── */
+
+  function showError(message, retry) {
+    state.retry = typeof retry === "function" ? retry : null;
+    dom.errorText.textContent = message;
+    dom.errorRetry.hidden = !state.retry;
+    dom.errorBanner.hidden = false;
+  }
+
+  function clearError() {
+    state.retry = null;
+    dom.errorBanner.hidden = true;
+    dom.errorText.textContent = "";
+    dom.errorRetry.hidden = true;
+  }
+
+  function toast(message, kind) {
+    const node = el("div", {
+      class: "toast toast-" + (kind || "info"),
+      text: message,
+    });
+    dom.toasts.append(node);
+    const lifetime = kind === "error" ? 11000 : 7000;
+    setTimeout(function () {
+      node.classList.add("toast-out");
+      setTimeout(function () {
+        node.remove();
+      }, 260);
+    }, lifetime);
+  }
+
+  function setActionStatus(message, kind) {
+    dom.actionStatus.textContent = message || "";
+    if (kind) {
+      dom.actionStatus.dataset.state = kind;
+    } else {
+      delete dom.actionStatus.dataset.state;
+    }
+  }
+
+  function scanSummary(result) {
+    const info = result && typeof result === "object" ? result : {};
+    const parts = [
+      formatCount(info.files_seen) + " files seen",
+      formatCount(info.entities_created) + " created",
+      formatCount(info.entities_reused) + " reused",
+      formatCount(info.objects_created) + " objects added",
+      formatCount(info.objects_updated) + " objects updated",
+    ];
+    const warnings = Array.isArray(info.warnings) ? info.warnings : [];
+    return (
+      "Scan complete — " +
+      parts.join(", ") +
+      (warnings.length
+        ? ". " + formatCount(warnings.length) + " " + plural(warnings.length, "warning", "warnings") + "."
+        : ".")
+    );
+  }
+
+  function enrichSummary(result) {
+    const info = result && typeof result === "object" ? result : {};
+    return (
+      "Enrichment complete — " +
+      formatCount(info.processed) +
+      " processed, " +
+      formatCount(info.enriched) +
+      " enriched, " +
+      formatCount(info.failed) +
+      " failed."
+    );
+  }
+
+  /* ── 9. Actions ──────────────────────────────────────────────────────── */
+
+  async function doScan(libraryId) {
+    if (state.busyAction) return;
+    const library = state.libraries.find(function (item) {
+      return item.id === libraryId;
+    });
+    const label = library ? library.name || "library" : "library";
+    state.busyAction = "scan:" + libraryId;
+    clearError();
+    render();
+    try {
+      const result = await api.scan(libraryId);
+      if (state.libraryId === libraryId) {
+        await refreshEntities(libraryId);
+      }
+      const summary = scanSummary(result);
+      setActionStatus(summary, "ok");
+      toast(summary, "success");
+      const warnings = result && Array.isArray(result.warnings) ? result.warnings : [];
+      if (warnings.length) {
+        toast(
+          "Scan warning: " + String(warnings[0]).slice(0, 220),
+          "warn"
+        );
+      }
+    } catch (error) {
+      const message = "Scanning “" + label + "” failed. " + error.message;
+      setActionStatus(message, "error");
+      showError(message, function () {
+        doScan(libraryId);
+      });
+    } finally {
+      state.busyAction = null;
+      render();
+    }
+  }
+
+  async function doEnrich() {
+    if (state.busyAction) return;
+    state.busyAction = "enrich";
+    clearError();
+    render();
+    try {
+      const result = await api.enrich();
+      if (state.libraryId) await refreshEntities(state.libraryId);
+      if (state.detail) await loadEntity(state.detail.entity.id, currentToken());
+      const summary = enrichSummary(result);
+      setActionStatus(summary, "ok");
+      toast(summary, "success");
+    } catch (error) {
+      const message = "Enrichment failed. " + error.message;
+      setActionStatus(message, "error");
+      showError(message, function () {
+        doEnrich();
+      });
+    } finally {
+      state.busyAction = null;
+      render();
+    }
+  }
+
+  /* ── 9b. Player ──────────────────────────────────────────────────────── */
+
+  /* The <video> lives in #player-layer, which renderCanvas() never clears, so
+     a repaint (filter toggle, toast, metadata refresh) cannot interrupt it. */
+  const playerVideo = document.createElement("video");
+  playerVideo.className = "player-video";
+  playerVideo.setAttribute("playsinline", "");
+  playerVideo.setAttribute("preload", "metadata");
+  playerVideo.setAttribute("aria-label", "Media player");
+  playerVideo.addEventListener("loadedmetadata", function () {
+    if (!state.playback.url) return;
+    state.playback.duration = isFinite(playerVideo.duration) ? playerVideo.duration : 0;
+    if (state.playback.status === "loading") state.playback.status = "ready";
+    if (!state.playback.started) state.playback.status = "ready";
+    syncTransport();
+    /* The seek bar's max depends on the duration, which we only learn now. */
+    render();
+  });
+  playerVideo.addEventListener("durationchange", function () {
+    if (!state.playback.url) return;
+    state.playback.duration = isFinite(playerVideo.duration) ? playerVideo.duration : 0;
+    syncTransport();
+  });
+  playerVideo.addEventListener("timeupdate", function () {
+    if (!state.playback.url) return;
+    state.playback.currentTime = playerVideo.currentTime;
+    syncTransport();
+  });
+  playerVideo.addEventListener("play", function () {
+    state.playback.started = true;
+    state.playback.status = "ready";
+    syncTransport();
+  });
+  playerVideo.addEventListener("pause", syncTransport);
+  playerVideo.addEventListener("ended", syncTransport);
+  playerVideo.addEventListener("progress", syncTransport);
+  playerVideo.addEventListener("seeked", syncTransport);
+  playerVideo.addEventListener("error", onVideoError);
+
+  /* ── hls.js: lazily loaded, single instance, always torn down ────────── */
+
+  const HLS_SCRIPT_SRC = "vendor/hls.min.js";
+
+  /* One injection for the life of the page. Rejected loads reset the promise
+     so a later attempt can retry rather than caching the failure forever. */
+  let hlsLoaderPromise = null;
+  let hlsScriptElement = null;
+  /* At most one live hls.js instance; reassigned only after the previous one
+     has been destroyed. */
+  let hlsInstance = null;
+  /* <track> elements currently attached to the player, paired with the key of
+     the server track they represent. Emptied on every teardown so a stale
+     selector can never show a previous title's tracks. */
+  let subtitleTrackRefs = [];
+
+  function loadHlsLibrary() {
+    if (window.Hls) return Promise.resolve(window.Hls);
+    if (hlsLoaderPromise) return hlsLoaderPromise;
+
+    hlsLoaderPromise = new Promise(function (resolve, reject) {
+      if (hlsScriptElement && hlsScriptElement.parentNode) {
+        /* An injection is already in flight; its own handlers will settle. */
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = HLS_SCRIPT_SRC;
+      script.async = true;
+      script.dataset.astraeusHls = "1";
+      script.addEventListener("load", function () {
+        if (window.Hls) {
+          resolve(window.Hls);
+        } else {
+          hlsLoaderPromise = null;
+          reject(new Error("hls.js loaded but did not expose window.Hls"));
+        }
+      });
+      script.addEventListener("error", function () {
+        hlsLoaderPromise = null;
+        script.remove();
+        hlsScriptElement = null;
+        reject(new Error("could not load " + HLS_SCRIPT_SRC));
+      });
+      hlsScriptElement = script;
+      document.head.append(script);
+    });
+
+    return hlsLoaderPromise;
+  }
+
+  function destroyHls() {
+    if (!hlsInstance) return;
+    const instance = hlsInstance;
+    hlsInstance = null;
+    try {
+      instance.stopLoad();
+      instance.detachMedia();
+      instance.destroy();
+    } catch (error) {
+      /* A half-dead instance is not worth reporting; it is already detached. */
+    }
+  }
+
+  /* hls.js drives the element through a MediaSource object URL, so the
+     element's own `error` event must not be reported twice. */
+  function hlsOwnsMedia() {
+    return !!hlsInstance;
+  }
+
+  function isEventPlaylistPlayback() {
+    /* Only segmented (server-generated) streams grow while they play. */
+    return state.playback.mode !== "direct_play" && state.playback.segmented === true;
+  }
+
+  function handleHlsError(HlsCtor, instance, recovery, data) {
+    if (!data) return;
+    const pb = state.playback;
+    if (instance !== hlsInstance || !pb.url) return;
+
+    if (!data.fatal) {
+      /* hls.js recovers from non-fatal errors on its own. */
+      return;
+    }
+
+    const type = data.type;
+    if (type === HlsCtor.ErrorTypes.NETWORK_ERROR && !recovery.network) {
+      recovery.network = true;
+      try {
+        instance.startLoad();
+        return;
+      } catch (error) {
+        /* fall through to the failure path */
+      }
+    }
+    if (type === HlsCtor.ErrorTypes.MEDIA_ERROR && !recovery.media) {
+      recovery.media = true;
+      try {
+        instance.recoverMediaError();
+        return;
+      } catch (error) {
+        /* fall through to the failure path */
+      }
+    }
+
+    failSegmentedPlayback(
+      "The stream stopped: " +
+        (data.details || data.type || "unknown HLS error") +
+        (data.reason ? " (" + data.reason + ")" : "") +
+        ". Recovery was not possible."
+    );
+  }
+
+  function failSegmentedPlayback(message) {
+    const pb = state.playback;
+    const text = "Playback failed for “" + (pb.title || "this title") + "”: " + message;
+    /* Clear the url first so teardown's own events are not mistaken for a
+       fresh failure, then release everything. */
+    pb.url = null;
+    pb.status = "error";
+    pb.error = text;
+    resetActiveMedia();
+    setActionStatus(text, "error");
+    showError(text, function () {
+      doPlay();
+    });
+    toast(text, "error");
+    render();
+  }
+
+  /**
+   * Blink (Chrome/Chromium/Edge) reports a non-empty canPlayType for HLS even
+   * though it ships no HLS demuxer — measured: "maybe" on Chromium 152. So
+   * canPlayType alone is a liar and trusting it produces exactly the silently
+   * dead player we must avoid. Native HLS is a WebKit/Safari feature; require
+   * both a positive canPlayType and a non-Blink engine before attempting it.
+   */
+  function nativeHlsSupport() {
+    const probe = document.createElement("video");
+    const claim =
+      probe.canPlayType("application/vnd.apple.mpegurl") ||
+      probe.canPlayType("application/x-mpegURL");
+    if (!claim) return false;
+    return !isBlinkEngine();
+  }
+
+  function isBlinkEngine() {
+    const uaData = navigator.userAgentData;
+    if (uaData && Array.isArray(uaData.brands)) {
+      return uaData.brands.some(function (brand) {
+        return /Chromium|Google Chrome|Microsoft Edge/i.test(brand.brand || "");
+      });
+    }
+    return /Chrome|Chromium|Edg\//.test(navigator.userAgent);
+  }
+
+  /**
+   * The last-resort explanation, used only when a segmented stream has no
+   * demuxer at all: no native HLS (Safari/WebKit) and no usable MSE player.
+   * `cause` distinguishes the two ways that happens so the message is true.
+   */
+  function segmentedMessage(pb, cause) {
+    const target = pb && pb.mode ? modeLabel(pb.mode) : "segmented delivery";
+    const reason =
+      pb && Array.isArray(pb.reasons) && pb.reasons.length ? " " + pb.reasons.join(" ") : "";
+    let why;
+    if (cause === "no-mse") {
+      why =
+        " This browser has no Media Source Extensions support, and it has no native HLS" +
+        " demuxer either, so nothing here can play a playlist.";
+    } else if (cause === "no-library") {
+      why =
+        " The bundled HLS player (vendor/hls.min.js) could not be loaded, so the playlist" +
+        " has no demuxer on this page.";
+    } else {
+      why =
+        " Neither native HLS nor the bundled MSE player (vendor/hls.min.js) is available" +
+        " here, so the playlist has no demuxer.";
+    }
+    return (
+      "This title needs " +
+      target +
+      ", which this browser cannot demux on its own." +
+      reason +
+      why +
+      " Nothing was started. Open this title in a browser with native HLS support, or restore" +
+      " vendor/hls.min.js and try again."
+    );
+  }
+
+  function mediaErrorText(code) {
+    switch (code) {
+      case 1:
+        return "the load was aborted";
+      case 2:
+        return "a network error stopped the download";
+      case 3:
+        return "the browser could not decode the media";
+      case 4:
+        return "the source format is not supported by this browser";
+      default:
+        return "the browser reported an unknown media error";
+    }
+  }
+
+  function playbackErrorMessage(entity, error) {
+    const name = entity ? displayTitle(entity) : "this title";
+    if (error && error.status === 409) {
+      return "Cannot deliver “" + name + "”: " + error.message;
+    }
+    if (error && error.status === 400 && error.code === "no_media") {
+      return "“" + name + "” has no media file to play.";
+    }
+    if (error && error.code === "network") {
+      return "Could not reach the playback endpoint for “" + name + "”. " + error.message;
+    }
+    return "Could not start playback for “" + name + "”. " + (error && error.message ? error.message : "");
+  }
+
+  function onPlayRejection(error) {
+    if (!error) return;
+    /* A newer load superseded this one; not a failure worth reporting. */
+    if (error.name === "AbortError") return;
+    const message =
+      error.name === "NotAllowedError"
+        ? "The browser blocked playback until you interact with the page. Press Play to start."
+        : "The browser could not start playback: " + (error.message || error.name) + ".";
+    state.playback.status = "error";
+    setActionStatus(message, "error");
+    toast(message, "warn");
+    render();
+  }
+
+  function onVideoError() {
+    const pb = state.playback;
+    /* Teardown (removeAttribute + load) can surface here; only report a real
+       failure for a source we are actually trying to play. Clearing url first
+       stops the teardown from re-entering this handler. */
+    if (!pb.url) return;
+    /* hls.js owns the element through a MediaSource; its ERROR event carries
+       far better diagnostics, so let that handler report the failure. */
+    if (hlsOwnsMedia()) return;
+    const message =
+      "Playback failed for “" +
+      (pb.title || "this title") +
+      "”: " +
+      mediaErrorText(playerVideo.error ? playerVideo.error.code : 0) +
+      ".";
+    pb.url = null;
+    pb.status = "error";
+    pb.error = message;
+    resetActiveMedia();
+    setActionStatus(message, "error");
+    showError(message, function () {
+      doPlay();
+    });
+    toast(message, "error");
+    render();
+  }
+
+  /**
+   * The actually-seekable window, straight off the element. For a segmented
+   * stream the server grows an EVENT playlist as ffmpeg produces segments, so
+   * this end moves; we never invent a duration we do not have.
+   */
+  function seekableBounds() {
+    const pb = state.playback;
+    let start = 0;
+    let end = 0;
+    if (playerVideo.seekable && playerVideo.seekable.length > 0) {
+      const last = playerVideo.seekable.length - 1;
+      const rawStart = playerVideo.seekable.start(last);
+      const rawEnd = playerVideo.seekable.end(last);
+      if (isFinite(rawStart)) start = rawStart;
+      if (isFinite(rawEnd)) end = rawEnd;
+    }
+    if (!(end > 0) && pb.duration > 0 && isFinite(pb.duration)) {
+      end = pb.duration;
+    }
+    if (end < 0) end = 0;
+    if (start < 0) start = 0;
+    return { start: start, end: end };
+  }
+
+  function syncTransport() {
+    const pb = state.playback;
+    const seek = document.getElementById("player-seek");
+    const time = document.getElementById("player-time");
+    const toggle = document.getElementById("player-toggle");
+    const window_ = document.getElementById("player-window");
+    const mediaLive = !!pb.url;
+
+    const bounds = mediaLive ? seekableBounds() : { start: 0, end: 0 };
+    const seekable = mediaLive && bounds.end > 0;
+    pb.seekableStart = bounds.start;
+    pb.seekableEnd = bounds.end;
+    if (seekable) pb.duration = bounds.end;
+
+    if (seek) {
+      seek.disabled = !seekable;
+      if (seekable) {
+        seek.min = String(bounds.start);
+        seek.max = String(bounds.end);
+        /* Never fight the user while the range itself has focus. */
+        if (document.activeElement !== seek) {
+          seek.value = String(Math.min(Math.max(pb.currentTime, bounds.start), bounds.end));
+        }
+      }
+      seek.setAttribute(
+        "aria-valuetext",
+        seekable
+          ? formatClock(pb.currentTime) + " of " + formatClock(bounds.end)
+          : "unavailable"
+      );
+    }
+    if (time) {
+      time.textContent = seekable
+        ? formatClock(pb.currentTime) + " / " + formatClock(bounds.end)
+        : "0:00 / 0:00";
+    }
+    if (window_) {
+      /* Only meaningful for a growing (segmented) stream. */
+      if (isEventPlaylistPlayback() && seekable) {
+        window_.hidden = false;
+        window_.textContent = "Growing · seekable to " + formatClock(bounds.end);
+      } else {
+        window_.hidden = true;
+        window_.textContent = "";
+      }
+    }
+    if (toggle) {
+      const playing = mediaLive && !playerVideo.paused && !playerVideo.ended;
+      toggle.textContent = playing ? "❚❚ Pause" : "▶ Play";
+      toggle.setAttribute("aria-label", playing ? "Pause" : "Play");
+    }
+  }
+
+  /* Order matters: kill hls.js before touching the element, otherwise the
+     MediaSource teardown surfaces as a spurious media error. */
+  function resetActiveMedia() {
+    destroyHls();
+    teardownVideo();
+  }
+
+  /* ── Subtitle tracks ─────────────────────────────────────────────────── */
+
+  /** Stable identifier for a server track; `index` is authoritative. */
+  function subtitleKey(sub) {
+    if (sub && typeof sub.index === "number" && isFinite(sub.index)) return String(sub.index);
+    return String((sub && sub.language) || "") + ":" + String((sub && sub.label) || "");
+  }
+
+  /** A track is deliverable only when the server handed us a URL for it. */
+  function subtitleDeliverable(sub) {
+    return !!sub && typeof sub.url === "string" && sub.url.length > 0;
+  }
+
+  function subtitleLabel(sub) {
+    if (sub && typeof sub.label === "string" && sub.label) return sub.label;
+    if (sub && typeof sub.language === "string" && sub.language) return sub.language;
+    if (sub && typeof sub.index === "number") return "Track " + sub.index;
+    return "Subtitles";
+  }
+
+  function removeSubtitleTracks() {
+    for (const ref of subtitleTrackRefs) {
+      try {
+        if (ref.element.track) ref.element.track.mode = "disabled";
+      } catch (error) {
+        /* A detached track cannot be muted; removing it is enough. */
+      }
+      ref.element.remove();
+    }
+    subtitleTrackRefs = [];
+    state.playback.subtitleSelection = "off";
+  }
+
+  /**
+   * Attach one <track> per deliverable server track. This has to run after the
+   * media element is loaded (direct play) or attached (MSE), because a load()
+   * resets the element's text tracks. Track elements are children of the
+   * persistent <video>, so a canvas repaint cannot disturb them.
+   */
+  function applySubtitleTracks() {
+    removeSubtitleTracks();
+    const pb = state.playback;
+    const list = Array.isArray(pb.subtitles) ? pb.subtitles : [];
+    let defaultKey = null;
+
+    for (const sub of list) {
+      if (!subtitleDeliverable(sub)) continue;
+      const key = subtitleKey(sub);
+      const element = el("track", {
+        kind: "subtitles",
+        src: sub.url,
+        srclang: sub.language ? String(sub.language) : "und",
+        label: subtitleLabel(sub),
+      });
+      playerVideo.append(element);
+      subtitleTrackRefs.push({ key: key, element: element });
+      /* Honour the server's default flag, but never pick one ourselves. */
+      if (sub.default === true && defaultKey === null) defaultKey = key;
+    }
+
+    pb.subtitleSelection = defaultKey !== null ? defaultKey : "off";
+    applySubtitleModes();
+  }
+
+  /** Exactly one track shows; everything else is disabled. */
+  function applySubtitleModes() {
+    const wanted = state.playback.subtitleSelection;
+    for (const ref of subtitleTrackRefs) {
+      const track = ref.element.track;
+      if (!track) continue;
+      try {
+        track.mode = ref.key === wanted ? "showing" : "disabled";
+      } catch (error) {
+        /* Some engines throw on tracks whose source failed; leave them off. */
+      }
+    }
+  }
+
+  function selectSubtitle(key) {
+    const pb = state.playback;
+    const next = key || "off";
+    if (next !== "off" && !subtitleTrackRefs.some(function (ref) { return ref.key === next; })) return;
+    pb.subtitleSelection = next;
+    applySubtitleModes();
+    /* Repaint so the radio group reflects the choice; focus is restored by
+       data-focus-key, so keyboard users keep their place. */
+    render();
+  }
+
+  function teardownVideo() {
+    try {
+      playerVideo.pause();
+    } catch (error) {
+      /* Nothing useful to do if pause throws. */
+    }
+    removeSubtitleTracks();
+    playerVideo.removeAttribute("src");
+    try {
+      playerVideo.load();
+    } catch (error) {
+      /* load() on an empty source is a no-op we do not need to report. */
+    }
+  }
+
+  function stopPlayback(options) {
+    const opts = options || {};
+    /* Reset state BEFORE tearing the element down: with url already null, the
+       teardown's own `error`/`emptied` events cannot be mistaken for a real
+       playback failure. */
+    state.playback = emptyPlayback();
+    setUnderlayInert(false);
+    resetActiveMedia();
+    dom.playerLayer.hidden = true;
+    clear(dom.playerLayer);
+    if (!opts.silent) render();
+  }
+
+  /* While the player covers the canvas, the hero underneath must not be
+     reachable by Tab or by a screen reader. */
+  function setUnderlayInert(inert) {
+    if (inert) {
+      dom.canvasContent.setAttribute("inert", "");
+      dom.canvasContent.setAttribute("aria-hidden", "true");
+    } else {
+      dom.canvasContent.removeAttribute("inert");
+      dom.canvasContent.removeAttribute("aria-hidden");
+    }
+  }
+
+  function renderPlayerChrome() {
+    clear(dom.playerLayer);
+    const pb = state.playback;
+    dom.playerLayer.append(playerVideo);
+    dom.playerLayer.append(
+      el("div", { class: "player-chrome" }, [
+        el("div", { class: "player-chrome-text" }, [
+          el("p", { class: "player-chrome-title", text: pb.title || "Now playing" }),
+          el("p", {
+            class: "player-chrome-sub",
+            text:
+              modeLabel(pb.mode) +
+              (pb.mediaInfo && pb.mediaInfo.container ? " · " + pb.mediaInfo.container : "") +
+              (pb.sessionId ? " · session " + String(pb.sessionId).slice(0, 8) : ""),
+          }),
+        ]),
+        el("button", {
+          type: "button",
+          class: "btn btn-small",
+          "data-action": "stop-playback",
+          "data-focus-key": "stop-player",
+          text: "Close player",
+        }),
+      ])
+    );
+  }
+
+  function startVideo(url, entity) {
+    const pb = state.playback;
+    pb.status = "ready";
+    pb.url = url;
+    pb.engine = "native";
+    pb.segmented = false;
+    dom.playerLayer.hidden = false;
+    setUnderlayInert(true);
+    renderPlayerChrome();
+    if (playerVideo.getAttribute("src") !== url) {
+      playerVideo.setAttribute("src", url);
+      try {
+        playerVideo.load();
+      } catch (error) {
+        /* load() is best-effort; the error handler reports real failures. */
+      }
+    }
+    /* Attach tracks after load(): the load algorithm resets text tracks. */
+    applySubtitleTracks();
+    const attempt = playerVideo.play();
+    if (attempt && typeof attempt.catch === "function") attempt.catch(onPlayRejection);
+    render();
+    focusTransportIfFocusWasLost();
+  }
+
+  /**
+   * Segmented (HLS) playback. Native HLS is preferred where it exists; every
+   * other browser goes through the vendored hls.js over Media Source
+   * Extensions. If neither is available we fall back to the honest message.
+   */
+  async function startSegmented(url, entity) {
+    const pb = state.playback;
+    pb.segmented = true;
+    pb.status = "loading";
+    pb.url = url;
+    pb.engine = null;
+    dom.playerLayer.hidden = false;
+    setUnderlayInert(true);
+    renderPlayerChrome();
+    render();
+
+    let HlsCtor;
+    try {
+      HlsCtor = await loadHlsLibrary();
+    } catch (error) {
+      /* The asset is missing or unreachable: stay honest, do not throw. */
+      if (state.playback !== pb) return;
+      fallBackToSegmentedMessage("no-library");
+      return;
+    }
+
+    /* The user may have navigated away, stopped, or started something else
+       while the ~600 KB script was in flight. */
+    if (state.playback !== pb || pb.entityId !== entity.id || pb.status !== "loading") return;
+
+    if (!HlsCtor || typeof HlsCtor.isSupported !== "function" || !HlsCtor.isSupported()) {
+      fallBackToSegmentedMessage("no-mse");
+      return;
+    }
+
+    destroyHls();
+    const recovery = { network: false, media: false };
+    const instance = new HlsCtor({ enableWorker: true, lowLatencyMode: false });
+    hlsInstance = instance;
+
+    instance.on(HlsCtor.Events.ERROR, function (event, data) {
+      handleHlsError(HlsCtor, instance, recovery, data);
+    });
+    instance.on(HlsCtor.Events.MANIFEST_PARSED, function () {
+      if (instance !== hlsInstance) return;
+      const attempt = playerVideo.play();
+      if (attempt && typeof attempt.catch === "function") attempt.catch(onPlayRejection);
+      syncTransport();
+    });
+    /* The playlist grows as ffmpeg produces segments; keep the seek bar's
+       window current as each fragment lands. */
+    instance.on(HlsCtor.Events.FRAG_BUFFERED, syncTransport);
+    instance.on(HlsCtor.Events.LEVEL_UPDATED, syncTransport);
+    instance.on(HlsCtor.Events.LEVEL_LOADED, function (event, data) {
+      if (data && data.details && isFinite(data.details.totalduration) && data.details.totalduration > 0) {
+        state.playback.duration = data.details.totalduration;
+      }
+      syncTransport();
+    });
+
+    pb.engine = "hls.js";
+    pb.status = "ready";
+    instance.attachMedia(playerVideo);
+    instance.loadSource(url);
+    /* MSE carries text tracks alongside the media source, so the same
+       <track> elements work here as on the direct-play path. */
+    applySubtitleTracks();
+    /* Single repaint: transport comes alive (Stop button, enabled controls)
+       and the subtitle selector reflects the tracks just attached. */
+    render();
+  }
+
+  function fallBackToSegmentedMessage(cause) {
+    const pb = state.playback;
+    pb.status = "segmented";
+    pb.url = null;
+    pb.engine = null;
+    pb.segmentedCause = cause || null;
+    resetActiveMedia();
+    dom.playerLayer.hidden = true;
+    clear(dom.playerLayer);
+    setUnderlayInert(false);
+    const message = segmentedMessage(pb, cause);
+    setActionStatus(message, null);
+    toast(message, "warn");
+    render();
+  }
+
+  function focusTransportIfFocusWasLost() {
+    /* Making the hero inert can drop focus to <body> when playback was started
+       from the hero button. Hand it to the transport instead of losing it. */
+    if (!document.activeElement || document.activeElement === document.body) {
+      const toggle = document.getElementById("player-toggle");
+      if (toggle) toggle.focus({ preventScroll: true });
+    }
+  }
+
+  function togglePlayPause() {
+    if (!state.playback.url) return;
+    if (playerVideo.paused || playerVideo.ended) {
+      const attempt = playerVideo.play();
+      if (attempt && typeof attempt.catch === "function") attempt.catch(onPlayRejection);
+    } else {
+      playerVideo.pause();
+    }
+  }
+
+  async function negotiatePlayback(entity) {
+    /* Replace the session first (url null), then release the old media, so the
+       teardown's own events cannot be mistaken for a fresh failure. Starting a
+       new session must never leave the old one running. */
+    state.playback = emptyPlayback();
+    const session = state.playback;
+    session.entityId = entity.id;
+    session.title = displayTitle(entity);
+    session.status = "loading";
+    resetActiveMedia();
+    clearError();
+    render();
+
+    try {
+      /* No capability body: the server assumes its browser profile, and we
+         then check what this engine can actually demux. */
+      const result = await api.playback(entity.id);
+      /* Navigation or Stop may have replaced the session during the request. */
+      if (state.playback !== session) return;
+      if (!result || typeof result.url !== "string" || !result.url) {
+        throw new ApiError("The playback endpoint returned no stream URL.", {
+          code: "unexpected_shape",
+        });
+      }
+      const decision = result.decision && typeof result.decision === "object" ? result.decision : null;
+      session.entityId = entity.id;
+      session.title = displayTitle(entity);
+      session.mode = result.mode || (decision ? decision.mode : null) || "unknown";
+      session.url = result.url;
+      session.sessionId = result.session_id || null;
+      session.objectId = result.object_id || null;
+      session.decision = decision;
+      session.mediaInfo = result.media_info && typeof result.media_info === "object" ? result.media_info : null;
+      session.subtitles = Array.isArray(result.subtitles) ? result.subtitles : [];
+      session.reasons = decision && Array.isArray(decision.reasons) ? decision.reasons : [];
+      session.error = null;
+
+      if (session.mode === "direct_play") {
+        session.segmented = false;
+        startVideo(session.url, entity);
+        setActionStatus("Playing “" + session.title + "” directly from the original file.", "ok");
+        return;
+      }
+
+      if (nativeHlsSupport()) {
+        session.segmented = true;
+        startVideo(session.url, entity);
+        session.engine = "native-hls";
+        return;
+      }
+
+      /* Chromium/Firefox: hand the playlist to the vendored hls.js over MSE.
+         If that is impossible, startSegmented() falls back to the honest
+         message rather than attaching a source that cannot work. */
+      await startSegmented(session.url, entity);
+    } catch (error) {
+      if (state.playback !== session) return;
+      session.status = "error";
+      session.error = playbackErrorMessage(entity, error);
+      session.reasons =
+        error && error.body && error.body.decision && Array.isArray(error.body.decision.reasons)
+          ? error.body.decision.reasons
+          : [];
+      setActionStatus(session.error, "error");
+      showError(session.error, function () {
+        doPlay();
+      });
+      toast(session.error, "error");
+      render();
+    }
+  }
+
+  function doPlay() {
+    const detail = state.detail;
+    if (!detail) return;
+    const entity = detail.entity;
+    const objects = Array.isArray(detail.objects) ? detail.objects : [];
+    const pb = state.playback;
+
+    if (!isLeafType(entity.type)) {
+      /* Containers have no media object; the transport is already disabled. */
+      return;
+    }
+    if (!objects.length) {
+      const message = "“" + displayTitle(entity) + "” has no media file recorded, so there is nothing to play.";
+      toast(message, "warn");
+      setActionStatus(message, null);
+      return;
+    }
+    if (pb.entityId === entity.id && pb.status === "loading") return;
+
+    /* Already negotiated for this entity — the button is a play/pause toggle. */
+    if (pb.entityId === entity.id && (pb.status === "ready" || pb.status === "playing" || pb.status === "paused")) {
+      togglePlayPause();
+      return;
+    }
+    if (pb.entityId === entity.id && pb.status === "segmented") {
+      toast(segmentedMessage(pb, pb.segmentedCause), "warn");
+      return;
+    }
+    negotiatePlayback(entity);
+  }
+
+  function restartPlayback() {
+    if (!state.playback.url) return;
+    try {
+      playerVideo.currentTime = state.playback.seekableStart || 0;
+    } catch (error) {
+      /* Some sources are not seekable; the seek bar reflects that. */
+    }
+  }
+
+  function skipForward() {
+    if (!state.playback.url) return;
+    const bounds = seekableBounds();
+    const target = playerVideo.currentTime + 10;
+    /* Forward seeking cannot outrun the transcoder. */
+    try {
+      playerVideo.currentTime = bounds.end > 0 ? Math.min(target, bounds.end) : target;
+    } catch (error) {
+      /* Ignore: the source may not be seekable. */
+    }
+  }
+
+  function seekTo(value) {
+    if (!state.playback.url) return;
+    const seconds = Number(value);
+    if (!isFinite(seconds)) return;
+    const bounds = seekableBounds();
+    let target = seconds;
+    let clamped = false;
+    if (target < bounds.start) {
+      target = bounds.start;
+      clamped = true;
+    }
+    if (bounds.end > 0 && target > bounds.end) {
+      target = bounds.end;
+      clamped = true;
+    }
+    try {
+      playerVideo.currentTime = target;
+    } catch (error) {
+      /* Ignore: the source may not be seekable. */
+    }
+    state.playback.currentTime = target;
+    syncTransport();
+    /* Be explicit when the request was limited by the produced window rather
+       than silently doing nothing. */
+    if (clamped && isEventPlaylistPlayback()) {
+      setActionStatus(
+        "Seeking is limited to the part the server has produced so far (" +
+          formatClock(bounds.end) +
+          "). It grows as transcoding continues.",
+        null
+      );
+    }
+    return target;
+  }
+
+  /* ── 10. Data loading ────────────────────────────────────────────────── */
+
+  function currentToken() {
+    return state.loadToken;
+  }
+
+  async function loadLibraries() {
+    const raw = await api.libraries();
+    state.libraries = expectArray(raw, "libraries");
+    state.booted = true;
+    for (const library of state.libraries) {
+      if (library && typeof library.id === "string") state.entityIndex.delete(library.id);
+    }
+  }
+
+  async function refreshEntities(libraryId) {
+    const raw = await api.libraryEntities(libraryId);
+    if (!Array.isArray(raw)) {
+      throw new ApiError("The API did not return a list of entities.", { code: "unexpected_shape" });
+    }
+    state.entities = raw;
+    state.entitiesLibraryId = libraryId;
+    for (const entity of raw) rememberEntity(entity);
+  }
+
+  async function loadEntity(entityId, token) {
+    const detail = await api.entity(entityId);
+    if (token !== state.loadToken) return;
+    if (!detail || !detail.entity) {
+      throw new ApiError("The API returned an entity payload without an entity.", {
+        code: "unexpected_shape",
+      });
+    }
+    state.detail = detail;
+    rememberEntity(detail.entity);
+    if (detail.parent) rememberEntity(detail.parent);
+    for (const child of Array.isArray(detail.children) ? detail.children : []) rememberEntity(child);
+  }
+
+  /* ── 11. Router ──────────────────────────────────────────────────────── */
+
+  function parseHash() {
+    const raw = location.hash.startsWith("#") ? location.hash.slice(1) : "";
+    /* Fragments that are not routes (the skip link's #main-canvas, for
+       instance) are left alone so in-page anchors keep working. */
+    if (raw.charAt(0) !== "/") return null;
+    const parts = raw.split("?");
+    const segments = parts[0]
+      .split("/")
+      .filter(function (segment) {
+        return segment.length > 0;
+      })
+      .map(function (segment) {
+        try {
+          return decodeURIComponent(segment);
+        } catch (error) {
+          return segment;
+        }
+      });
+    const params = new URLSearchParams(parts[1] || "");
+    return { segs: segments, params: params };
+  }
+
+  function identify(segments) {
+    if (segments.length >= 2 && segments[0] === "library") {
+      return { kind: "library", id: segments[1] };
+    }
+    if (segments.length >= 2 && segments[0] === "entity") {
+      return { kind: "entity", id: segments[1] };
+    }
+    return null;
+  }
+
+  function navigateAndRoute(route) {
+    const target = "#/" + route.segs.join("/");
+    if (location.hash === target) {
+      applyRoute(route);
+      return;
+    }
+    location.hash = target;
+  }
+
+  function goTo(kind, id) {
+    state.focusTarget = "canvas";
+    navigateAndRoute({ segs: [kind, id], params: new URLSearchParams() });
+  }
+
+  async function applyRoute(route) {
+    const identified = identify(route.segs);
+    state.loadToken += 1;
+    const token = state.loadToken;
+    state.route = route;
+    /* Leaving the current entity tears the player down; a stream must never
+       outlive the view that started it. */
+    stopPlayback({ silent: true });
+    state.detail = null;
+    dom.canvas.scrollTop = 0;
+    dom.contextBody.scrollTop = 0;
+
+    if (!identified) {
+      state.loading = false;
+      render();
+      applyFocusTarget();
+      return;
+    }
+
+    if (identified.kind === "library") {
+      const library = state.libraries.find(function (item) {
+        return item.id === identified.id;
+      });
+      if (!library) {
+        state.libraryId = null;
+        state.entities = [];
+        state.loading = false;
+        render();
+        applyFocusTarget();
+        showError(
+          "That library is not in the current list anymore. It may have been deleted.",
+          function () {
+            boot();
+          }
+        );
+        return;
+      }
+      state.libraryId = library.id;
+      state.loading = true;
+      setAmbient(library);
+      render();
+      try {
+        await refreshEntities(library.id);
+        if (token !== state.loadToken) return;
+        clearError();
+      } catch (error) {
+        if (token !== state.loadToken) return;
+        state.entities = [];
+        state.entitiesLibraryId = null;
+        showError("Could not load entities for “" + (library.name || "library") + "”. " + error.message, function () {
+          applyRoute(route);
+        });
+      } finally {
+        if (token === state.loadToken) {
+          state.loading = false;
+          render();
+          applyFocusTarget();
+        }
+      }
+      return;
+    }
+
+    /* Entity route. */
+    state.loading = true;
+    render();
+    try {
+      await loadEntity(identified.id, token);
+      if (token !== state.loadToken) return;
+      const libraryId = state.detail.entity.library_id;
+      if (libraryId && state.entitiesLibraryId !== libraryId) {
+        try {
+          await refreshEntities(libraryId);
+          if (token !== state.loadToken) return;
+          state.libraryId = libraryId;
+        } catch (error) {
+          /* The entity itself loaded; a missing sibling list only costs us
+             breadcrumb depth, so report it without blanking the canvas. */
+          if (token === state.loadToken) {
+            showError(
+              "Loaded the entity, but its library listing failed. " + error.message,
+              function () {
+                applyRoute(route);
+              }
+            );
+          }
+        }
+      }
+      if (token !== state.loadToken) return;
+      if (!state.libraryId && state.detail.entity.library_id) {
+        state.libraryId = state.detail.entity.library_id;
+      }
+      setAmbient(state.detail.entity);
+      clearError();
+    } catch (error) {
+      if (token !== state.loadToken) return;
+      showError("Could not load entity “" + identified.id + "”. " + error.message, function () {
+        applyRoute(route);
+      });
+    } finally {
+      if (token === state.loadToken) {
+        state.loading = false;
+        render();
+        applyFocusTarget();
+      }
+    }
+  }
+
+  function onHashChange() {
+    const route = parseHash();
+    if (!route) return; /* Not an app route — leave the view untouched. */
+    applyRoute(route);
+  }
+
+  async function boot() {
+    state.booted = false;
+    render();
+    try {
+      await loadLibraries();
+    } catch (error) {
+      state.booted = true;
+      state.libraries = [];
+      render();
+      showError("Could not load libraries. " + error.message, function () {
+        boot();
+      });
+      return;
+    }
+    const route = parseHash();
+    if (route && identify(route.segs)) {
+      applyRoute(route);
+      return;
+    }
+    if (state.libraries.length > 0) {
+      const first = state.libraries[0];
+      const target = hashFor("library", first.id);
+      let swapped = false;
+      try {
+        /* replaceState keeps the back button clean and — unlike assigning
+           location.hash — does not fire hashchange, so the view loads once. */
+        history.replaceState(null, "", target);
+        swapped = true;
+      } catch (error) {
+        swapped = false;
+      }
+      if (!swapped) location.replace(target);
+      applyRoute({ segs: ["library", first.id], params: new URLSearchParams() });
+      return;
+    }
+    render();
+  }
+
+  async function checkHealth() {
+    try {
+      const health = await api.health();
+      const service = health && health.service ? health.service : "astraeus";
+      dom.healthPill.textContent = "● " + service + " online";
+      dom.healthPill.dataset.state = "ok";
+    } catch (error) {
+      dom.healthPill.textContent = "● API unreachable";
+      dom.healthPill.dataset.state = "down";
+    }
+  }
+
+  /* ── 12. Events ──────────────────────────────────────────────────────── */
+
+  document.addEventListener("click", function (event) {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+
+    /* In-app anchors (breadcrumbs, library list) route through the hash, so
+       the click never reaches the data-action branch below — record that the
+       next painted view should take focus. */
+    if (target.closest('a[href^="#/"]')) state.focusTarget = "canvas";
+
+    const trigger = target.closest("[data-action]");
+    if (!trigger) return;
+    const action = trigger.dataset.action;
+
+    if (action === "open-entity") {
+      event.preventDefault();
+      goTo("entity", trigger.dataset.entityId);
+    } else if (action === "scan") {
+      doScan(trigger.dataset.libraryId);
+    } else if (action === "play") {
+      doPlay();
+    } else if (action === "restart") {
+      restartPlayback();
+    } else if (action === "skip") {
+      skipForward();
+    } else if (action === "stop-playback") {
+      stopPlayback();
+    } else if (action === "toggle-filter") {
+      state.filterIncomplete = !state.filterIncomplete;
+      render();
+    } else if (action === "retry") {
+      if (state.retry) {
+        const retry = state.retry;
+        retry();
+      }
+    }
+  });
+
+  /* The seek bar is rebuilt on every render, so its events are delegated. */
+  document.addEventListener("input", function (event) {
+    const target = event.target;
+    if (target instanceof Element && target.id === "player-seek") {
+      state.playback.seeking = true;
+      seekTo(target.value);
+    }
+  });
+
+  document.addEventListener("change", function (event) {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    if (target.id === "player-seek") {
+      state.playback.seeking = false;
+      seekTo(target.value);
+      return;
+    }
+    /* Covers mouse selection and arrow-key traversal of the radio group. */
+    if (target.dataset && target.dataset.action === "select-subtitle") {
+      selectSubtitle(target.dataset.subtitleKey);
+    }
+  });
+
+  dom.filterToggle.addEventListener("click", function () {
+    state.filterIncomplete = !state.filterIncomplete;
+    render();
+  });
+
+  dom.enrichButton.addEventListener("click", function () {
+    doEnrich();
+  });
+
+  dom.errorDismiss.addEventListener("click", function () {
+    clearError();
+  });
+
+  dom.errorRetry.addEventListener("click", function () {
+    const retry = state.retry;
+    clearError();
+    if (retry) retry();
+  });
+
+  window.addEventListener("hashchange", onHashChange);
+
+  /* A second click on the app's own CSP-free world is enough to wire up the
+     remaining global listeners; nothing else needs bootstrapping. */
+  function init() {
+    render();
+    checkHealth();
+    boot();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
