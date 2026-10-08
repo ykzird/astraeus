@@ -3,7 +3,9 @@
 **As of the round-11 work of 2026-10-08 — the documentation restructure. 130
 tracked files; the in-tree version is `dev` and a release takes its number from
 its tag (the next tag would be v0.17.0).** (`git log` names the commits; the
-previous handoff was `db4b6b4`. Round 10 was release automation and going public,
+previous handoff was `442bbc1`, and a refresh on top of it added §10 — a QEMU VM
+for the systemd unit and the release run — and moved those two untested claims to
+the top of §7. Round 10 was release automation and going public,
 which found a ladder defect the development host's ffmpeg had been hiding; round
 9 made a quality choice cap a ladder; round 8 was OCR for PGS image subtitles;
 round 7 front-end unit tests; round 6 trace export; round 5 API rate limiting;
@@ -298,6 +300,9 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/repo zricethezav/gitleaks:
   detect --source=/repo --redact -v
 ```
 
+Two claims cannot be checked on this host at all — the systemd unit, because there
+is no reachable systemd manager, and the release workflow, because nothing has
+been tagged. **§10** is a QEMU VM that covers both.
 
 ---
 
@@ -848,20 +853,48 @@ the fixture's caption. The unit passes `systemd-analyze verify` and scores 1.6
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **A TLS example.** Release automation landed in round 10 (see §6), so a tag
+The first two are the claims the documentation currently marks *untested*, and
+both need something this development host does not have: a pushed tag, and a
+systemd manager. Both are cheap on a QEMU VM — see §10, which is a plan rather
+than a recipe that has been run.
+
+1. **Run the release workflow, for real.** `.github/workflows/release.yml` has
+   never executed: every step was run by hand, CI proves the same commit builds,
+   but no tag has been pushed, so the GitHub Release and the GHCR push are
+   unverified. Two passes, cheapest first:
+   `gh workflow run release.yml -f dry_run=true` builds the archives and the
+   multi-arch image and publishes nothing; check all three jobs and the uploaded
+   artifacts. Then a real tag (`git tag -a v0.17.0 && git push origin v0.17.0`)
+   and check the release page, `sha256sum -c checksums.txt` on a downloaded
+   archive, `docker pull ghcr.io/ykzird/astraeus:0.17.0`, and the provenance and
+   SBOM attestations (`docker buildx imagetools inspect`). One trap to know
+   before tagging: **a tag push does not run `ci.yml`**, because its `push`
+   trigger is filtered to `main` (GitHub runs a filtered event only for the refs
+   it names). The release gate is `vet` plus the unit tests; the tagged commit is
+   a `main` commit that already passed the full suite, so cut tags from `main`
+   and nowhere else.
+2. **Test the systemd unit.** `systemctl` has never been reachable from this
+   host, so `ProtectSystem=strict`, `ReadWritePaths`, `StateDirectory` and
+   `SystemCallFilter=@system-service` are reasoned about rather than observed.
+   The syscall filter is the one line that can break playback, so "it starts" is
+   not the test: it has to start **and then serve a request that runs ffmpeg**.
+   §10 has the VM. Two results are worth capturing: `systemd-analyze security`
+   run *inside* the guest (the number `deploy/README.md` quotes today comes from
+   `--offline=yes`), and the service surviving a transcode.
+3. **A TLS example.** Release automation landed in round 10 (see §6), so a tag
    now builds and publishes the archives and the image; what is still missing is
    the reverse-proxy configuration beside the unit, and the runbook for the
    access-gate interaction a proxy creates.
-2. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
+4. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
    VobSub (or DVB) track keeps its refusal and its burn because it lives in a
    different container with a different palette, and no such sample exists here.
    This is the natural continuation of round 8 and is smaller than it was: the
    pipeline, the routing and the fixture font all exist, so the work is one more
    decoder plus a fixture. See the OCR bullet in §8 for what is unverified.
-3. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
+5. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
    the gate remains instance-wide: it admits a request, it does not decide what
    the request may see, so every admitted viewer sees the whole library.
-4. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
+6. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
@@ -1035,6 +1068,16 @@ Priority order, with the reasoning. Take it top-down.
   down to the produced segment (10-bit, `bt2020nc`/`smpte2084`/`bt2020`), not to
   a compositor showing it correctly — which is why the client has to declare
   `supports_hdr` rather than being assumed capable.
+- **A tag push does not run the full test suite.** `ci.yml`'s `push` trigger is
+  filtered to `main`, so GitHub runs the integration tests when a commit lands on
+  `main` and not again when a tag is pushed (a filtered event runs only for the
+  refs it names). The release workflow's gate re-runs `vet` and the unit tests, so
+  a tag cut anywhere but `main` would publish with less coverage than a merge.
+  Tag from `main`; see §7 item 1.
+- **The QEMU VM in §10 is a plan, not a recipe that has been run.** The tooling
+  exists on this host and the cloud image is reachable, but nothing in §10 has
+  been executed, so its commands should be corrected from what the first run
+  teaches rather than trusted.
 - **Packaging is verified unevenly, and the gaps are known.** The container was
   built, started and exercised. The systemd unit was checked with
   `systemd-analyze verify` and `security`, but never *started*: the development
@@ -1122,3 +1165,68 @@ documentation without hardware to check them against.
   mis-tagging. Worth improving if it is ever seen in the wild.
 - **`docs/review/*` name types that no longer exist** (`library.SQLiteRepository`,
   `MetadataProvider`). They are point-in-time records with headers saying so.
+
+---
+
+## 10. A QEMU VM for the two things this host cannot do
+
+§7's first two items both need an environment the development host does not have:
+a systemd manager, and a released artifact to install. A small cloud-image VM
+gives both, and the tooling is already installed here — `qemu-system-x86_64`,
+`qemu-img`, `cloud-localds`, `virt-install`, `genisoimage`, `xorriso`.
+
+The host has **no `/dev/kvm`**, so a guest runs under TCG (software emulation).
+That is fine for "did the service start, answer, and survive an ffmpeg run" and
+useless as a benchmark: keep fixtures tiny (a generated three-second clip is
+plenty — the point is that ffmpeg *executes* inside the unit's sandbox, not what
+it produces).
+
+**This is a plan, not a recipe that has been run.** The next session should treat
+it as a starting point and correct it from what it learns; the sketch below is
+what the environment supports, not something observed.
+
+```sh
+# A Debian cloud image, and a copy-on-write disk so the base image stays clean.
+curl -LO https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
+qemu-img create -f qcow2 -F qcow2 -b debian-12-genericcloud-amd64.qcow2 test.qcow2 20G
+
+# cloud-init: one user, a key, and ffmpeg. Anything else is installed later so
+# that what the runbook says is what actually happens.
+cat > user-data <<'YAML'
+#cloud-config
+users:
+  - name: astraeus
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys: [ "ssh-ed25519 AAAA... you" ]
+packages: [ffmpeg, curl, sqlite3]
+YAML
+printf 'instance-id: astraeus-test\n' > meta-data
+cloud-localds seed.iso user-data meta-data
+
+qemu-system-x86_64 -m 4096 -smp 4 -nographic \
+  -drive file=test.qcow2,if=virtio -drive file=seed.iso,if=virtio,format=raw \
+  -netdev user,id=n0,hostfwd=tcp::2222-:22 -device virtio-net-pci,netdev=n0
+```
+
+Then, inside the guest, follow `deploy/README.md`'s systemd runbook and nothing
+else — that is the second half of the point, because the runbook is what a user
+follows:
+
+- install the **release archive** from §7 item 1, not a local build: the binary,
+  `web/`, `docs/`, the unit, the env file, `systemd-analyze verify`, `start`;
+- `curl -s localhost:8642/api/health`, then `systemd-analyze security astraeus`
+  for the *real* score (the 1.6 in `deploy/README.md` comes from
+  `--offline=yes`, which is a static best-effort, not this);
+- generate a clip, scan it, and play it, so the server forks ffmpeg **inside**
+  `SystemCallFilter=@system-service`. A direct play proves nothing about the
+  filter; a transcode is what exercises it. If a session dies with `EPERM`, the
+  filter (or `ProtectSystem`/`ReadWritePaths`) is the first suspect and the
+  ffmpeg log line is the evidence;
+- note what the unit's `StateDirectory`/`CacheDirectory` (or the explicit paths)
+  actually create, and whether `/data` is writable as the `astraeus` user.
+
+Worth the time, in order: the unit starts and answers; ffmpeg runs under the
+sandbox; `systemd-analyze security` inside the guest; only then a longer
+transcode. Report the numbers and paste the failing log lines if it does not
+start — a unit that cannot start on a clean VM is exactly the defect this is
+looking for, and it is worth finding before someone else does.
