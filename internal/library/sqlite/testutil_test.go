@@ -1,30 +1,21 @@
-package library_test
+package sqlite
 
 import (
 	"context"
-	"github.com/jok/astraeus-media/internal/library"
-	"io"
-	"log/slog"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jok/astraeus-media/internal/library/sqlite"
+	"github.com/jok/astraeus-media/internal/library"
 )
 
-// Test helpers shared by the library package tests.
-
-func newTestLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
-// newTestRepo returns a repository backed by a fresh database file. The file
-// lives in t.TempDir so tests never share state.
-func newTestRepo(t *testing.T) *sqlite.Repository {
+// newTestRepo returns a migrated repository on a fresh database file. Each test
+// gets its own file, so tests never share state and can run in parallel.
+func newTestRepo(t *testing.T) *Repository {
 	t.Helper()
 
-	repo, err := sqlite.Open(filepath.Join(t.TempDir(), "astraeus-test.db"))
+	repo, err := Open(filepath.Join(t.TempDir(), "astraeus-test.db"))
 	if err != nil {
 		t.Fatalf("opening test database: %v", err)
 	}

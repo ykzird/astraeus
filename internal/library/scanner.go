@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -320,7 +319,7 @@ func moviePlacement(relPath, absPath string) (entitySpec, bool) {
 
 	title, year := ParseMovieName(source)
 	if title == "" {
-		title = cleanTitle(strings.TrimSuffix(filepath.Base(absPath), filepath.Ext(absPath)))
+		title = TitleFromPath(absPath)
 	}
 	if title == "" {
 		return entitySpec{}, false

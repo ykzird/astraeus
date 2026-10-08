@@ -28,13 +28,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite"
 
 	"github.com/jok/astraeus-media/internal/access"
 	"github.com/jok/astraeus-media/internal/api"
 	"github.com/jok/astraeus-media/internal/images"
 	"github.com/jok/astraeus-media/internal/library"
+	"github.com/jok/astraeus-media/internal/library/sqlite"
 	"github.com/jok/astraeus-media/internal/metadata"
 	"github.com/jok/astraeus-media/internal/observability"
 	"github.com/jok/astraeus-media/internal/streaming"
@@ -133,12 +133,11 @@ func (c *config) newLogger() (*slog.Logger, error) {
 
 // env bundles the wired-up application dependencies.
 type env struct {
-	repo     library.Repository
+	repo     *sqlite.Repository
 	scanner  *library.Scanner
 	worker   *metadata.Worker
 	provider metadata.Provider
 	logger   *slog.Logger
-	db       *sqlx.DB
 }
 
 func (c *config) open() (*env, error) {
@@ -147,14 +146,13 @@ func (c *config) open() (*env, error) {
 		return nil, err
 	}
 
-	db, err := sqlx.Connect("sqlite", library.SQLiteDSN(c.dbPath))
+	repo, err := sqlite.Open(c.dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening database %s: %w", c.dbPath, err)
+		return nil, err
 	}
 
-	repo := library.NewSQLiteRepository(db)
 	if err := repo.Migrate(context.Background()); err != nil {
-		_ = db.Close()
+		_ = repo.Close()
 		return nil, err
 	}
 
@@ -176,11 +174,10 @@ func (c *config) open() (*env, error) {
 		worker:   metadata.NewWorker(repo, provider, 6*time.Hour, logger),
 		provider: provider,
 		logger:   logger,
-		db:       db,
 	}, nil
 }
 
-func (e *env) close() error { return e.db.Close() }
+func (e *env) close() error { return e.repo.Close() }
 
 // ---- serve -----------------------------------------------------------------
 

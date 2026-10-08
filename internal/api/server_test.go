@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite"
 
 	"github.com/jok/astraeus-media/internal/images"
 	"github.com/jok/astraeus-media/internal/library"
+	"github.com/jok/astraeus-media/internal/library/sqlite"
 	"github.com/jok/astraeus-media/internal/metadata"
 	"github.com/jok/astraeus-media/internal/observability"
 	"github.com/jok/astraeus-media/internal/streaming"
@@ -58,13 +58,12 @@ func withSubtitles(converter SubtitleConverter) envOption {
 func newTestEnv(t *testing.T, opts ...envOption) *testEnv {
 	t.Helper()
 
-	db, err := sqlx.Connect("sqlite", library.SQLiteDSN(filepath.Join(t.TempDir(), "api-test.db")))
+	repo, err := sqlite.Open(filepath.Join(t.TempDir(), "api-test.db"))
 	if err != nil {
 		t.Fatalf("connecting to test database: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { _ = repo.Close() })
 
-	repo := library.NewSQLiteRepository(db)
 	if err := repo.Migrate(context.Background()); err != nil {
 		t.Fatalf("migrating test database: %v", err)
 	}

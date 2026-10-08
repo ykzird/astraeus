@@ -44,3 +44,9 @@ type Repository interface {
 	// to that transaction; returning an error rolls the whole thing back.
 	WithTx(ctx context.Context, fn func(tx Repository) error) error
 }
+
+// PruneResult reports what a prune removed.
+type PruneResult struct {
+	ObjectsPruned  int `json:"objects_pruned"`
+	EntitiesPruned int `json:"entities_pruned"`
+}

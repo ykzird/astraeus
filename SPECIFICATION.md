@@ -154,7 +154,7 @@ dependency, and the migrations also repair data written by the earlier
 prototype (backfilling `name`, resetting entities that were marked `Complete`
 without a `MetadataSet`).
 
-`library.SQLiteDSN` opens every pooled connection with `busy_timeout(5000)`,
+`sqlite.DSN` (`internal/library/sqlite`) opens every pooled connection with `busy_timeout(5000)`,
 `journal_mode(WAL)`, `synchronous(NORMAL)` and `foreign_keys(1)`. WAL is what
 lets a reader proceed during a write and makes bulk scans fast, at the cost of
 keeping recent writes in `<db>-wal` and `<db>-shm` sidecars until a checkpoint:

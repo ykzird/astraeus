@@ -1,4 +1,4 @@
-package library
+package sqlite
 
 import "strings"
 
@@ -30,8 +30,8 @@ var sqlitePragmas = []string{
 	"_pragma=foreign_keys(1)",
 }
 
-// SQLiteDSN builds the connection string for a SQLite database at path.
-func SQLiteDSN(path string) string {
+// DSN builds the connection string for a SQLite database at path.
+func DSN(path string) string {
 	if path == "" {
 		return ""
 	}

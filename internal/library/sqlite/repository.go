@@ -1,4 +1,4 @@
-package library
+package sqlite
 
 import (
 	"context"
@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite"
+
+	"github.com/jok/astraeus-media/internal/library"
 )
 
 // sqlxExecutor is satisfied by both *sqlx.DB and *sqlx.Tx, which lets the same
@@ -23,19 +24,41 @@ type sqlxExecutor interface {
 	SelectContext(ctx context.Context, dest any, query string, args ...any) error
 }
 
-// SQLiteRepository implements the Repository interface using SQLite.
-type SQLiteRepository struct {
+// A compile-time guarantee that this adapter still satisfies the port it exists
+// to implement. library.Repository itself is checked at the composition root.
+var _ library.Repository = (*Repository)(nil)
+
+// Repository implements library.Repository on SQLite.
+type Repository struct {
 	db *sqlx.DB
 	tx *sqlx.Tx
 }
 
-// NewSQLiteRepository creates a new SQLiteRepository.
-func NewSQLiteRepository(db *sqlx.DB) *SQLiteRepository {
-	return &SQLiteRepository{db: db}
+// New wraps an existing connection.
+func New(db *sqlx.DB) *Repository {
+	return &Repository{db: db}
+}
+
+// Open connects to the database at path with the pragmas this project needs and
+// returns a repository on it. This is the constructor callers want.
+func Open(path string) (*Repository, error) {
+	db, err := sqlx.Connect("sqlite", DSN(path))
+	if err != nil {
+		return nil, fmt.Errorf("opening database %s: %w", path, err)
+	}
+	return New(db), nil
+}
+
+// Close releases the underlying connection pool.
+func (r *Repository) Close() error {
+	if r.db == nil {
+		return nil
+	}
+	return r.db.Close()
 }
 
 // exec returns the transaction when one is active, otherwise the pool.
-func (r *SQLiteRepository) exec() sqlxExecutor {
+func (r *Repository) exec() sqlxExecutor {
 	if r.tx != nil {
 		return r.tx
 	}
@@ -43,7 +66,7 @@ func (r *SQLiteRepository) exec() sqlxExecutor {
 }
 
 // WithTx runs fn inside a transaction.
-func (r *SQLiteRepository) WithTx(ctx context.Context, fn func(tx Repository) error) error {
+func (r *Repository) WithTx(ctx context.Context, fn func(tx library.Repository) error) error {
 	if r.tx != nil {
 		// Already inside a transaction; reuse it rather than nesting.
 		return fn(r)
@@ -54,7 +77,7 @@ func (r *SQLiteRepository) WithTx(ctx context.Context, fn func(tx Repository) er
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 
-	if err := fn(&SQLiteRepository{db: r.db, tx: tx}); err != nil {
+	if err := fn(&Repository{db: r.db, tx: tx}); err != nil {
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 			return errors.Join(err, fmt.Errorf("rollback: %w", rbErr))
 		}
@@ -71,7 +94,7 @@ func (r *SQLiteRepository) WithTx(ctx context.Context, fn func(tx Repository) er
 
 // Migrate creates the schema if needed, upgrades databases written by earlier
 // versions, and backfills the data those upgrades depend on. It is idempotent.
-func (r *SQLiteRepository) Migrate(ctx context.Context) error {
+func (r *Repository) Migrate(ctx context.Context) error {
 	baseline := []string{
 		`CREATE TABLE IF NOT EXISTS schema_migrations (
 			version INTEGER PRIMARY KEY,
@@ -138,7 +161,7 @@ func (r *SQLiteRepository) Migrate(ctx context.Context) error {
 	// metadata worker will pick them up.
 	if _, err := r.exec().ExecContext(ctx,
 		`UPDATE media_entities SET status = ? WHERE status = ? AND metadata IS NULL`,
-		string(StatusIncomplete), string(StatusComplete),
+		string(library.StatusIncomplete), string(library.StatusComplete),
 	); err != nil {
 		return fmt.Errorf("repairing entity statuses: %w", err)
 	}
@@ -176,7 +199,7 @@ func (r *SQLiteRepository) Migrate(ctx context.Context) error {
 
 // ensureColumn adds a column when it does not already exist. SQLite has no
 // ADD COLUMN IF NOT EXISTS, so the table definition is inspected first.
-func (r *SQLiteRepository) ensureColumn(ctx context.Context, table, column, ddl string) error {
+func (r *Repository) ensureColumn(ctx context.Context, table, column, ddl string) error {
 	var columns []struct {
 		Name string `db:"name"`
 	}
@@ -196,10 +219,10 @@ func (r *SQLiteRepository) ensureColumn(ctx context.Context, table, column, ddl 
 
 // backfillEntityNames gives a name to entities created before the name column
 // existed, deriving it from the file that represents them.
-func (r *SQLiteRepository) backfillEntityNames(ctx context.Context) error {
+func (r *Repository) backfillEntityNames(ctx context.Context) error {
 	var rows []struct {
-		ID   string     `db:"id"`
-		Type EntityType `db:"type"`
+		ID   string             `db:"id"`
+		Type library.EntityType `db:"type"`
 	}
 	if err := r.exec().SelectContext(ctx, &rows, `SELECT id, type FROM media_entities WHERE name = ''`); err != nil {
 		return fmt.Errorf("finding unnamed entities: %w", err)
@@ -212,8 +235,7 @@ func (r *SQLiteRepository) backfillEntityNames(ctx context.Context) error {
 			`SELECT file_path FROM media_objects WHERE media_entity_id = ? LIMIT 1`, row.ID)
 		switch {
 		case err == nil && filePath != "":
-			base := filepath.Base(filePath)
-			name = cleanTitle(strings.TrimSuffix(base, filepath.Ext(base)))
+			name = library.TitleFromPath(filePath)
 		case err != nil && !errors.Is(err, sql.ErrNoRows):
 			return fmt.Errorf("looking up object for entity %s: %w", row.ID, err)
 		}
@@ -230,7 +252,7 @@ func (r *SQLiteRepository) backfillEntityNames(ctx context.Context) error {
 
 // ---- libraries -------------------------------------------------------------
 
-func (r *SQLiteRepository) CreateLibrary(ctx context.Context, lib *Library) error {
+func (r *Repository) CreateLibrary(ctx context.Context, lib *library.Library) error {
 	_, err := r.exec().NamedExecContext(ctx,
 		`INSERT INTO libraries (id, name, path, kind, created_at)
 		 VALUES (:id, :name, :path, :kind, :created_at)`,
@@ -247,39 +269,39 @@ func (r *SQLiteRepository) CreateLibrary(ctx context.Context, lib *Library) erro
 	return nil
 }
 
-func (r *SQLiteRepository) GetLibrary(ctx context.Context, id string) (*Library, error) {
+func (r *Repository) GetLibrary(ctx context.Context, id string) (*library.Library, error) {
 	var row libraryRow
 	err := r.exec().GetContext(ctx, &row,
 		`SELECT id, name, path, kind, created_at FROM libraries WHERE id = ?`, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("library %s: %w", id, ErrNotFound)
+			return nil, fmt.Errorf("library %s: %w", id, library.ErrNotFound)
 		}
 		return nil, fmt.Errorf("getting library %s: %w", id, err)
 	}
 	return row.toLibrary()
 }
 
-func (r *SQLiteRepository) GetLibraryByPath(ctx context.Context, path string) (*Library, error) {
+func (r *Repository) GetLibraryByPath(ctx context.Context, path string) (*library.Library, error) {
 	var row libraryRow
 	err := r.exec().GetContext(ctx, &row,
 		`SELECT id, name, path, kind, created_at FROM libraries WHERE path = ?`, path)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("library at %s: %w", path, ErrNotFound)
+			return nil, fmt.Errorf("library at %s: %w", path, library.ErrNotFound)
 		}
 		return nil, fmt.Errorf("getting library at %s: %w", path, err)
 	}
 	return row.toLibrary()
 }
 
-func (r *SQLiteRepository) ListLibraries(ctx context.Context) ([]Library, error) {
+func (r *Repository) ListLibraries(ctx context.Context) ([]library.Library, error) {
 	var rows []libraryRow
 	if err := r.exec().SelectContext(ctx, &rows,
 		`SELECT id, name, path, kind, created_at FROM libraries ORDER BY name`); err != nil {
 		return nil, fmt.Errorf("listing libraries: %w", err)
 	}
-	libs := make([]Library, 0, len(rows))
+	libs := make([]library.Library, 0, len(rows))
 	for _, row := range rows {
 		lib, err := row.toLibrary()
 		if err != nil {
@@ -292,11 +314,6 @@ func (r *SQLiteRepository) ListLibraries(ctx context.Context) ([]Library, error)
 
 // DeleteLibrary removes a library together with its entities and objects.
 // PruneResult reports what a prune removed.
-type PruneResult struct {
-	ObjectsPruned  int `json:"objects_pruned"`
-	EntitiesPruned int `json:"entities_pruned"`
-}
-
 // PruneLibrary removes objects for files this pass did not see, then any entity
 // left with neither objects nor children, working upwards so an emptied season
 // is removed and then an emptied series.
@@ -304,11 +321,11 @@ type PruneResult struct {
 // Deletion order matters now that foreign keys are enforced: objects reference
 // entities, and entities reference their parent, so the children have to go
 // before the parents.
-func (r *SQLiteRepository) PruneLibrary(ctx context.Context, libraryID string, keepPaths map[string]bool) (PruneResult, error) {
-	var result PruneResult
+func (r *Repository) PruneLibrary(ctx context.Context, libraryID string, keepPaths map[string]bool) (library.PruneResult, error) {
+	var result library.PruneResult
 
-	err := r.WithTx(ctx, func(tx Repository) error {
-		inner := tx.(*SQLiteRepository)
+	err := r.WithTx(ctx, func(tx library.Repository) error {
+		inner := tx.(*Repository)
 
 		type row struct {
 			ID       string `db:"id"`
@@ -358,21 +375,21 @@ func (r *SQLiteRepository) PruneLibrary(ctx context.Context, libraryID string, k
 		return nil
 	})
 	if err != nil {
-		return PruneResult{}, err
+		return library.PruneResult{}, err
 	}
 	return result, nil
 }
 
-func (r *SQLiteRepository) DeleteLibrary(ctx context.Context, id string) error {
-	return r.WithTx(ctx, func(tx Repository) error {
-		if err := tx.(*SQLiteRepository).deleteLibraryRows(ctx, id); err != nil {
+func (r *Repository) DeleteLibrary(ctx context.Context, id string) error {
+	return r.WithTx(ctx, func(tx library.Repository) error {
+		if err := tx.(*Repository).deleteLibraryRows(ctx, id); err != nil {
 			return err
 		}
 		return nil
 	})
 }
 
-func (r *SQLiteRepository) deleteLibraryRows(ctx context.Context, id string) error {
+func (r *Repository) deleteLibraryRows(ctx context.Context, id string) error {
 	if _, err := r.exec().ExecContext(ctx,
 		`DELETE FROM media_objects WHERE media_entity_id IN (SELECT id FROM media_entities WHERE library_id = ?)`, id); err != nil {
 		return fmt.Errorf("deleting objects for library %s: %w", id, err)
@@ -385,7 +402,7 @@ func (r *SQLiteRepository) deleteLibraryRows(ctx context.Context, id string) err
 		return fmt.Errorf("deleting library %s: %w", id, err)
 	}
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
-		return fmt.Errorf("library %s: %w", id, ErrNotFound)
+		return fmt.Errorf("library %s: %w", id, library.ErrNotFound)
 	}
 	return nil
 }
@@ -398,16 +415,16 @@ type libraryRow struct {
 	CreatedAt string `db:"created_at"`
 }
 
-func (row libraryRow) toLibrary() (*Library, error) {
+func (row libraryRow) toLibrary() (*library.Library, error) {
 	createdAt, err := parseTime(row.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("library %s: parsing created_at: %w", row.ID, err)
 	}
-	return &Library{
+	return &library.Library{
 		ID:        row.ID,
 		Name:      row.Name,
 		Path:      row.Path,
-		Kind:      LibraryKind(row.Kind),
+		Kind:      library.LibraryKind(row.Kind),
 		CreatedAt: createdAt,
 	}, nil
 }
@@ -418,19 +435,19 @@ func (row libraryRow) toLibrary() (*Library, error) {
 const entityColumns = `id, library_id, parent_id, type, name, status, created_at, updated_at, metadata`
 
 type entityRow struct {
-	ID        string       `db:"id"`
-	LibraryID string       `db:"library_id"`
-	ParentID  *string      `db:"parent_id"`
-	Type      EntityType   `db:"type"`
-	Name      string       `db:"name"`
-	Status    EntityStatus `db:"status"`
-	CreatedAt string       `db:"created_at"`
-	UpdatedAt string       `db:"updated_at"`
+	ID        string               `db:"id"`
+	LibraryID string               `db:"library_id"`
+	ParentID  *string              `db:"parent_id"`
+	Type      library.EntityType   `db:"type"`
+	Name      string               `db:"name"`
+	Status    library.EntityStatus `db:"status"`
+	CreatedAt string               `db:"created_at"`
+	UpdatedAt string               `db:"updated_at"`
 	// Metadata is NULL for entities that have never been enriched.
 	Metadata *string `db:"metadata"`
 }
 
-func (row entityRow) toEntity() (*MediaEntity, error) {
+func (row entityRow) toEntity() (*library.MediaEntity, error) {
 	createdAt, err := parseTime(row.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("entity %s: parsing created_at: %w", row.ID, err)
@@ -448,7 +465,7 @@ func (row entityRow) toEntity() (*MediaEntity, error) {
 		parentID = nil
 	}
 
-	entity := &MediaEntity{
+	entity := &library.MediaEntity{
 		ID:        row.ID,
 		LibraryID: row.LibraryID,
 		ParentID:  parentID,
@@ -460,7 +477,7 @@ func (row entityRow) toEntity() (*MediaEntity, error) {
 	}
 
 	if row.Metadata != nil && *row.Metadata != "" {
-		var meta MetadataSet
+		var meta library.MetadataSet
 		if err := json.Unmarshal([]byte(*row.Metadata), &meta); err != nil {
 			return nil, fmt.Errorf("entity %s: unmarshalling metadata: %w", row.ID, err)
 		}
@@ -470,18 +487,18 @@ func (row entityRow) toEntity() (*MediaEntity, error) {
 }
 
 type entityWriteParams struct {
-	ID        string       `db:"id"`
-	LibraryID string       `db:"library_id"`
-	ParentID  *string      `db:"parent_id"`
-	Type      EntityType   `db:"type"`
-	Name      string       `db:"name"`
-	Status    EntityStatus `db:"status"`
-	CreatedAt string       `db:"created_at"`
-	UpdatedAt string       `db:"updated_at"`
-	Metadata  string       `db:"metadata"`
+	ID        string               `db:"id"`
+	LibraryID string               `db:"library_id"`
+	ParentID  *string              `db:"parent_id"`
+	Type      library.EntityType   `db:"type"`
+	Name      string               `db:"name"`
+	Status    library.EntityStatus `db:"status"`
+	CreatedAt string               `db:"created_at"`
+	UpdatedAt string               `db:"updated_at"`
+	Metadata  string               `db:"metadata"`
 }
 
-func entityParams(e *MediaEntity) (entityWriteParams, error) {
+func entityParams(e *library.MediaEntity) (entityWriteParams, error) {
 	metadata, err := marshalMetadata(e.Metadata)
 	if err != nil {
 		return entityWriteParams{}, err
@@ -499,7 +516,7 @@ func entityParams(e *MediaEntity) (entityWriteParams, error) {
 	}, nil
 }
 
-func (r *SQLiteRepository) CreateEntity(ctx context.Context, entity *MediaEntity) error {
+func (r *Repository) CreateEntity(ctx context.Context, entity *library.MediaEntity) error {
 	params, err := entityParams(entity)
 	if err != nil {
 		return err
@@ -513,7 +530,7 @@ func (r *SQLiteRepository) CreateEntity(ctx context.Context, entity *MediaEntity
 	return nil
 }
 
-func (r *SQLiteRepository) UpdateEntity(ctx context.Context, entity *MediaEntity) error {
+func (r *Repository) UpdateEntity(ctx context.Context, entity *library.MediaEntity) error {
 	params, err := entityParams(entity)
 	if err != nil {
 		return err
@@ -527,25 +544,25 @@ func (r *SQLiteRepository) UpdateEntity(ctx context.Context, entity *MediaEntity
 		return fmt.Errorf("updating entity %s: %w", entity.ID, err)
 	}
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
-		return fmt.Errorf("entity %s: %w", entity.ID, ErrNotFound)
+		return fmt.Errorf("entity %s: %w", entity.ID, library.ErrNotFound)
 	}
 	return nil
 }
 
-func (r *SQLiteRepository) GetEntity(ctx context.Context, id string) (*MediaEntity, error) {
+func (r *Repository) GetEntity(ctx context.Context, id string) (*library.MediaEntity, error) {
 	var row entityRow
 	err := r.exec().GetContext(ctx, &row,
 		`SELECT `+entityColumns+` FROM media_entities WHERE id = ?`, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("entity %s: %w", id, ErrNotFound)
+			return nil, fmt.Errorf("entity %s: %w", id, library.ErrNotFound)
 		}
 		return nil, fmt.Errorf("getting entity %s: %w", id, err)
 	}
 	return row.toEntity()
 }
 
-func (r *SQLiteRepository) FindEntity(ctx context.Context, libraryID string, parentID *string, entityType EntityType, name string) (*MediaEntity, error) {
+func (r *Repository) FindEntity(ctx context.Context, libraryID string, parentID *string, entityType library.EntityType, name string) (*library.MediaEntity, error) {
 	var row entityRow
 	// `IS` compares NULL-safely, so a nil parentID matches top-level entities.
 	err := r.exec().GetContext(ctx, &row,
@@ -554,14 +571,14 @@ func (r *SQLiteRepository) FindEntity(ctx context.Context, libraryID string, par
 		libraryID, parentID, entityType, name)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("entity %q: %w", name, ErrNotFound)
+			return nil, fmt.Errorf("entity %q: %w", name, library.ErrNotFound)
 		}
 		return nil, fmt.Errorf("finding entity %q: %w", name, err)
 	}
 	return row.toEntity()
 }
 
-func (r *SQLiteRepository) ListEntities(ctx context.Context) ([]MediaEntity, error) {
+func (r *Repository) ListEntities(ctx context.Context) ([]library.MediaEntity, error) {
 	var rows []entityRow
 	if err := r.exec().SelectContext(ctx, &rows,
 		`SELECT `+entityColumns+` FROM media_entities ORDER BY type, name`); err != nil {
@@ -570,7 +587,7 @@ func (r *SQLiteRepository) ListEntities(ctx context.Context) ([]MediaEntity, err
 	return entitiesFromRows(rows)
 }
 
-func (r *SQLiteRepository) ListEntitiesByLibrary(ctx context.Context, libraryID string) ([]MediaEntity, error) {
+func (r *Repository) ListEntitiesByLibrary(ctx context.Context, libraryID string) ([]library.MediaEntity, error) {
 	var rows []entityRow
 	if err := r.exec().SelectContext(ctx, &rows,
 		`SELECT `+entityColumns+` FROM media_entities WHERE library_id = ? ORDER BY type, name`, libraryID); err != nil {
@@ -579,7 +596,7 @@ func (r *SQLiteRepository) ListEntitiesByLibrary(ctx context.Context, libraryID 
 	return entitiesFromRows(rows)
 }
 
-func (r *SQLiteRepository) ListChildren(ctx context.Context, parentID string) ([]MediaEntity, error) {
+func (r *Repository) ListChildren(ctx context.Context, parentID string) ([]library.MediaEntity, error) {
 	var rows []entityRow
 	if err := r.exec().SelectContext(ctx, &rows,
 		`SELECT `+entityColumns+` FROM media_entities WHERE parent_id = ? ORDER BY type, name`, parentID); err != nil {
@@ -588,8 +605,8 @@ func (r *SQLiteRepository) ListChildren(ctx context.Context, parentID string) ([
 	return entitiesFromRows(rows)
 }
 
-func entitiesFromRows(rows []entityRow) ([]MediaEntity, error) {
-	entities := make([]MediaEntity, 0, len(rows))
+func entitiesFromRows(rows []entityRow) ([]library.MediaEntity, error) {
+	entities := make([]library.MediaEntity, 0, len(rows))
 	for _, row := range rows {
 		entity, err := row.toEntity()
 		if err != nil {
@@ -611,12 +628,12 @@ type objectRow struct {
 	CreatedAt     string `db:"created_at"`
 }
 
-func (row objectRow) toObject() (*MediaObject, error) {
+func (row objectRow) toObject() (*library.MediaObject, error) {
 	createdAt, err := parseTime(row.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("object %s: parsing created_at: %w", row.ID, err)
 	}
-	return &MediaObject{
+	return &library.MediaObject{
 		ID:            row.ID,
 		MediaEntityID: row.MediaEntityID,
 		FilePath:      row.FilePath,
@@ -637,7 +654,7 @@ type objectWriteParams struct {
 
 const objectColumns = `id, media_entity_id, file_path, size, mime_type, created_at`
 
-func (r *SQLiteRepository) CreateObject(ctx context.Context, obj *MediaObject) error {
+func (r *Repository) CreateObject(ctx context.Context, obj *library.MediaObject) error {
 	_, err := r.exec().NamedExecContext(ctx,
 		`INSERT INTO media_objects (id, media_entity_id, file_path, size, mime_type, created_at)
 		 VALUES (:id, :media_entity_id, :file_path, :size, :mime_type, :created_at)`,
@@ -648,7 +665,7 @@ func (r *SQLiteRepository) CreateObject(ctx context.Context, obj *MediaObject) e
 	return nil
 }
 
-func (r *SQLiteRepository) UpdateObject(ctx context.Context, obj *MediaObject) error {
+func (r *Repository) UpdateObject(ctx context.Context, obj *library.MediaObject) error {
 	res, err := r.exec().NamedExecContext(ctx,
 		`UPDATE media_objects
 		 SET media_entity_id = :media_entity_id, file_path = :file_path, size = :size, mime_type = :mime_type
@@ -658,44 +675,44 @@ func (r *SQLiteRepository) UpdateObject(ctx context.Context, obj *MediaObject) e
 		return fmt.Errorf("updating object %s: %w", obj.ID, err)
 	}
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
-		return fmt.Errorf("object %s: %w", obj.ID, ErrNotFound)
+		return fmt.Errorf("object %s: %w", obj.ID, library.ErrNotFound)
 	}
 	return nil
 }
 
-func (r *SQLiteRepository) GetObject(ctx context.Context, id string) (*MediaObject, error) {
+func (r *Repository) GetObject(ctx context.Context, id string) (*library.MediaObject, error) {
 	var row objectRow
 	err := r.exec().GetContext(ctx, &row,
 		`SELECT `+objectColumns+` FROM media_objects WHERE id = ?`, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("object %s: %w", id, ErrNotFound)
+			return nil, fmt.Errorf("object %s: %w", id, library.ErrNotFound)
 		}
 		return nil, fmt.Errorf("getting object %s: %w", id, err)
 	}
 	return row.toObject()
 }
 
-func (r *SQLiteRepository) GetObjectByPath(ctx context.Context, filePath string) (*MediaObject, error) {
+func (r *Repository) GetObjectByPath(ctx context.Context, filePath string) (*library.MediaObject, error) {
 	var row objectRow
 	err := r.exec().GetContext(ctx, &row,
 		`SELECT `+objectColumns+` FROM media_objects WHERE file_path = ?`, filePath)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("object %s: %w", filePath, ErrNotFound)
+			return nil, fmt.Errorf("object %s: %w", filePath, library.ErrNotFound)
 		}
 		return nil, fmt.Errorf("getting object %s: %w", filePath, err)
 	}
 	return row.toObject()
 }
 
-func (r *SQLiteRepository) GetObjectsByEntity(ctx context.Context, entityID string) ([]MediaObject, error) {
+func (r *Repository) GetObjectsByEntity(ctx context.Context, entityID string) ([]library.MediaObject, error) {
 	var rows []objectRow
 	if err := r.exec().SelectContext(ctx, &rows,
 		`SELECT `+objectColumns+` FROM media_objects WHERE media_entity_id = ? ORDER BY file_path`, entityID); err != nil {
 		return nil, fmt.Errorf("getting objects for entity %s: %w", entityID, err)
 	}
-	objects := make([]MediaObject, 0, len(rows))
+	objects := make([]library.MediaObject, 0, len(rows))
 	for _, row := range rows {
 		obj, err := row.toObject()
 		if err != nil {
@@ -708,7 +725,7 @@ func (r *SQLiteRepository) GetObjectsByEntity(ctx context.Context, entityID stri
 
 // ---- helpers ---------------------------------------------------------------
 
-func marshalMetadata(meta *MetadataSet) (string, error) {
+func marshalMetadata(meta *library.MetadataSet) (string, error) {
 	if meta == nil {
 		return "", nil
 	}

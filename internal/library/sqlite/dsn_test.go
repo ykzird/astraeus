@@ -1,4 +1,4 @@
-package library
+package sqlite
 
 import (
 	"path/filepath"
@@ -9,7 +9,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestSQLiteDSN(t *testing.T) {
+func TestDSN(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -49,30 +49,30 @@ func TestSQLiteDSN(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := SQLiteDSN(tt.path)
+			got := DSN(tt.path)
 			if tt.equals != "" {
 				if got != tt.equals {
-					t.Errorf("SQLiteDSN(%q) = %q, want %q", tt.path, got, tt.equals)
+					t.Errorf("DSN(%q) = %q, want %q", tt.path, got, tt.equals)
 				}
 				return
 			}
 			for _, want := range tt.contains {
 				if !strings.Contains(got, want) {
-					t.Errorf("SQLiteDSN(%q) = %q, missing %q", tt.path, got, want)
+					t.Errorf("DSN(%q) = %q, missing %q", tt.path, got, want)
 				}
 			}
 		})
 	}
 }
 
-// TestSQLiteDSN_AppliesPragmasToEveryConnection is the regression test for the
+// TestDSN_AppliesPragmasToEveryConnection is the regression test for the
 // bug this fixes: the pragmas must cover pooled connections, not just the first
 // one, which is why they ride in the DSN rather than being run once.
-func TestSQLiteDSN_AppliesPragmasToEveryConnection(t *testing.T) {
+func TestDSN_AppliesPragmasToEveryConnection(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "pragmas.db")
-	db, err := sqlx.Connect("sqlite", SQLiteDSN(path))
+	db, err := sqlx.Connect("sqlite", DSN(path))
 	if err != nil {
 		t.Fatalf("connecting: %v", err)
 	}

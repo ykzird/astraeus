@@ -21,13 +21,12 @@ type Store interface {
 }
 
 // The library repository is what the server hands this package, so the port has
-// to stay satisfied by it. These assertions fail the build if the repository
-// drifts away from what the worker needs, rather than failing at the call site
-// with a confusing type error.
-var (
-	_ Store = (*library.SQLiteRepository)(nil)
-	_ Store = (library.Repository)(nil)
-)
+// to stay satisfied by it. This fails the build if the repository drifts away
+// from what the worker needs, rather than failing at the call site with a
+// confusing type error. The concrete SQLite adapter is asserted at the
+// composition root, where the two are actually wired together, so this package
+// never has to know which implementation exists.
+var _ Store = (library.Repository)(nil)
 
 // EnrichResult reports the outcome of one enrichment pass.
 type EnrichResult struct {

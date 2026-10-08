@@ -1,8 +1,9 @@
-package library
+package sqlite
 
 import (
 	"context"
 	"errors"
+	"github.com/jok/astraeus-media/internal/library"
 	"path/filepath"
 	"testing"
 	"time"
@@ -44,7 +45,7 @@ const legacyTimestamp = "2026-10-07 16:23:13.732481079 +0200 CEST m=+0.100313790
 func TestMigrate_UpgradesLegacyDatabase(t *testing.T) {
 	t.Parallel()
 
-	db, err := sqlx.Connect("sqlite", SQLiteDSN(filepath.Join(t.TempDir(), "legacy.db")))
+	db, err := sqlx.Connect("sqlite", DSN(filepath.Join(t.TempDir(), "legacy.db")))
 	if err != nil {
 		t.Fatalf("connecting to legacy database: %v", err)
 	}
@@ -54,13 +55,13 @@ func TestMigrate_UpgradesLegacyDatabase(t *testing.T) {
 	db.MustExec(
 		`INSERT INTO media_entities (id, parent_id, type, status, created_at, updated_at, metadata)
 		 VALUES (?, NULL, ?, ?, ?, ?, NULL)`,
-		"entity-1", string(MovieEntity), string(StatusComplete), legacyTimestamp, legacyTimestamp)
+		"entity-1", string(library.MovieEntity), string(library.StatusComplete), legacyTimestamp, legacyTimestamp)
 	db.MustExec(
 		`INSERT INTO media_objects (id, media_entity_id, file_path, size, mime_type, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		"object-1", "entity-1", "/media/test_media/episode1.mkv", 0, "video/x-matroska", legacyTimestamp)
 
-	repo := NewSQLiteRepository(db)
+	repo := New(db)
 	ctx := context.Background()
 
 	if err := repo.Migrate(ctx); err != nil {
@@ -82,9 +83,9 @@ func TestMigrate_UpgradesLegacyDatabase(t *testing.T) {
 	if got.Metadata != nil {
 		t.Errorf("metadata = %+v, want nil for a never-enriched entity", got.Metadata)
 	}
-	if got.Status != StatusIncomplete {
+	if got.Status != library.StatusIncomplete {
 		t.Errorf("status = %q, want %q: an entity without metadata is not complete",
-			got.Status, StatusIncomplete)
+			got.Status, library.StatusIncomplete)
 	}
 	if got.CreatedAt.IsZero() {
 		t.Error("created_at was not parsed from the legacy timestamp format")
@@ -101,8 +102,8 @@ func TestListEntities_EntityWithoutMetadata(t *testing.T) {
 
 	repo := newTestRepo(t)
 	ctx := context.Background()
-	lib := mustCreateLibrary(t, repo, "Movies", MoviesLibrary)
-	created := mustCreateEntity(t, repo, lib.ID, nil, MovieEntity, "Dune")
+	lib := mustCreateLibrary(t, repo, "Movies", library.MoviesLibrary)
+	created := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Dune")
 
 	entities, err := repo.ListEntities(ctx)
 	if err != nil {
@@ -124,10 +125,10 @@ func TestEntity_RoundTripsMetadata(t *testing.T) {
 
 	repo := newTestRepo(t)
 	ctx := context.Background()
-	lib := mustCreateLibrary(t, repo, "Movies", MoviesLibrary)
-	entity := mustCreateEntity(t, repo, lib.ID, nil, MovieEntity, "Dune")
+	lib := mustCreateLibrary(t, repo, "Movies", library.MoviesLibrary)
+	entity := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Dune")
 
-	want := &MetadataSet{
+	want := &library.MetadataSet{
 		Title:        "Dune",
 		Description:  "A duke's son leads desert warriors.",
 		PosterPath:   "/poster.jpg",
@@ -136,7 +137,7 @@ func TestEntity_RoundTripsMetadata(t *testing.T) {
 		Extra:        map[string]string{"year": "2021"},
 	}
 	entity.Metadata = want
-	entity.Status = StatusComplete
+	entity.Status = library.StatusComplete
 	entity.UpdatedAt = time.Now().Truncate(time.Second)
 	if err := repo.UpdateEntity(ctx, entity); err != nil {
 		t.Fatalf("updating entity: %v", err)
@@ -155,8 +156,8 @@ func TestEntity_RoundTripsMetadata(t *testing.T) {
 	if got.Metadata.Extra["year"] != "2021" {
 		t.Errorf("metadata extra year = %q, want %q", got.Metadata.Extra["year"], "2021")
 	}
-	if got.Status != StatusComplete {
-		t.Errorf("status = %q, want %q", got.Status, StatusComplete)
+	if got.Status != library.StatusComplete {
+		t.Errorf("status = %q, want %q", got.Status, library.StatusComplete)
 	}
 }
 
@@ -166,8 +167,8 @@ func TestGetEntity_NotFound(t *testing.T) {
 	repo := newTestRepo(t)
 
 	_, err := repo.GetEntity(context.Background(), "does-not-exist")
-	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("error = %v, want ErrNotFound", err)
+	if !errors.Is(err, library.ErrNotFound) {
+		t.Fatalf("error = %v, want library.ErrNotFound", err)
 	}
 }
 
@@ -175,18 +176,18 @@ func TestUpdateEntity_NotFound(t *testing.T) {
 	t.Parallel()
 
 	repo := newTestRepo(t)
-	entity := &MediaEntity{
+	entity := &library.MediaEntity{
 		ID:        "missing",
-		Type:      MovieEntity,
+		Type:      library.MovieEntity,
 		Name:      "Nope",
-		Status:    StatusComplete,
+		Status:    library.StatusComplete,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
 
 	err := repo.UpdateEntity(context.Background(), entity)
-	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("error = %v, want ErrNotFound", err)
+	if !errors.Is(err, library.ErrNotFound) {
+		t.Fatalf("error = %v, want library.ErrNotFound", err)
 	}
 }
 
@@ -198,19 +199,19 @@ func TestFindEntity_ScopesSeasonsToTheirSeries(t *testing.T) {
 
 	repo := newTestRepo(t)
 	ctx := context.Background()
-	lib := mustCreateLibrary(t, repo, "Shows", ShowsLibrary)
+	lib := mustCreateLibrary(t, repo, "Shows", library.ShowsLibrary)
 
-	breakingBad := mustCreateEntity(t, repo, lib.ID, nil, SeriesEntity, "Breaking Bad")
-	betterCallSaul := mustCreateEntity(t, repo, lib.ID, nil, SeriesEntity, "Better Call Saul")
+	breakingBad := mustCreateEntity(t, repo, lib.ID, nil, library.SeriesEntity, "Breaking Bad")
+	betterCallSaul := mustCreateEntity(t, repo, lib.ID, nil, library.SeriesEntity, "Better Call Saul")
 
-	bbSeason := mustCreateEntity(t, repo, lib.ID, &breakingBad.ID, SeasonEntity, "Season 1")
-	bcsSeason := mustCreateEntity(t, repo, lib.ID, &betterCallSaul.ID, SeasonEntity, "Season 1")
+	bbSeason := mustCreateEntity(t, repo, lib.ID, &breakingBad.ID, library.SeasonEntity, "Season 1")
+	bcsSeason := mustCreateEntity(t, repo, lib.ID, &betterCallSaul.ID, library.SeasonEntity, "Season 1")
 
-	gotBB, err := repo.FindEntity(ctx, lib.ID, &breakingBad.ID, SeasonEntity, "Season 1")
+	gotBB, err := repo.FindEntity(ctx, lib.ID, &breakingBad.ID, library.SeasonEntity, "Season 1")
 	if err != nil {
 		t.Fatalf("finding Breaking Bad season: %v", err)
 	}
-	gotBCS, err := repo.FindEntity(ctx, lib.ID, &betterCallSaul.ID, SeasonEntity, "Season 1")
+	gotBCS, err := repo.FindEntity(ctx, lib.ID, &betterCallSaul.ID, library.SeasonEntity, "Season 1")
 	if err != nil {
 		t.Fatalf("finding Better Call Saul season: %v", err)
 	}
@@ -231,10 +232,10 @@ func TestFindEntity_TopLevelUsesNilParent(t *testing.T) {
 
 	repo := newTestRepo(t)
 	ctx := context.Background()
-	lib := mustCreateLibrary(t, repo, "Shows", ShowsLibrary)
-	series := mustCreateEntity(t, repo, lib.ID, nil, SeriesEntity, "The Wire")
+	lib := mustCreateLibrary(t, repo, "Shows", library.ShowsLibrary)
+	series := mustCreateEntity(t, repo, lib.ID, nil, library.SeriesEntity, "The Wire")
 
-	got, err := repo.FindEntity(ctx, lib.ID, nil, SeriesEntity, "The Wire")
+	got, err := repo.FindEntity(ctx, lib.ID, nil, library.SeriesEntity, "The Wire")
 	if err != nil {
 		t.Fatalf("finding top-level series: %v", err)
 	}
@@ -245,9 +246,9 @@ func TestFindEntity_TopLevelUsesNilParent(t *testing.T) {
 		t.Errorf("parent id = %v, want nil", *got.ParentID)
 	}
 
-	_, err = repo.FindEntity(ctx, lib.ID, nil, SeriesEntity, "Missing Show")
-	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("error = %v, want ErrNotFound", err)
+	_, err = repo.FindEntity(ctx, lib.ID, nil, library.SeriesEntity, "Missing Show")
+	if !errors.Is(err, library.ErrNotFound) {
+		t.Fatalf("error = %v, want library.ErrNotFound", err)
 	}
 }
 
@@ -256,10 +257,10 @@ func TestListChildren(t *testing.T) {
 
 	repo := newTestRepo(t)
 	ctx := context.Background()
-	lib := mustCreateLibrary(t, repo, "Shows", ShowsLibrary)
-	series := mustCreateEntity(t, repo, lib.ID, nil, SeriesEntity, "The Wire")
-	mustCreateEntity(t, repo, lib.ID, &series.ID, SeasonEntity, "Season 2")
-	mustCreateEntity(t, repo, lib.ID, &series.ID, SeasonEntity, "Season 1")
+	lib := mustCreateLibrary(t, repo, "Shows", library.ShowsLibrary)
+	series := mustCreateEntity(t, repo, lib.ID, nil, library.SeriesEntity, "The Wire")
+	mustCreateEntity(t, repo, lib.ID, &series.ID, library.SeasonEntity, "Season 2")
+	mustCreateEntity(t, repo, lib.ID, &series.ID, library.SeasonEntity, "Season 1")
 
 	children, err := repo.ListChildren(ctx, series.ID)
 	if err != nil {
@@ -278,16 +279,16 @@ func TestWithTx_RollsBackOnError(t *testing.T) {
 
 	repo := newTestRepo(t)
 	ctx := context.Background()
-	lib := mustCreateLibrary(t, repo, "Movies", MoviesLibrary)
+	lib := mustCreateLibrary(t, repo, "Movies", library.MoviesLibrary)
 
 	sentinel := errors.New("boom")
-	err := repo.WithTx(ctx, func(tx Repository) error {
-		if err := tx.CreateEntity(ctx, &MediaEntity{
+	err := repo.WithTx(ctx, func(tx library.Repository) error {
+		if err := tx.CreateEntity(ctx, &library.MediaEntity{
 			ID:        "rolled-back",
 			LibraryID: lib.ID,
-			Type:      MovieEntity,
+			Type:      library.MovieEntity,
 			Name:      "Rolled Back",
-			Status:    StatusIncomplete,
+			Status:    library.StatusIncomplete,
 			CreatedAt: time.Now(),
 			UpdatedAt: time.Now(),
 		}); err != nil {
@@ -300,7 +301,7 @@ func TestWithTx_RollsBackOnError(t *testing.T) {
 	}
 
 	_, err = repo.GetEntity(ctx, "rolled-back")
-	if !errors.Is(err, ErrNotFound) {
+	if !errors.Is(err, library.ErrNotFound) {
 		t.Fatalf("entity survived a rolled-back transaction: %v", err)
 	}
 }
@@ -310,13 +311,13 @@ func TestLibraryLifecycle(t *testing.T) {
 
 	repo := newTestRepo(t)
 	ctx := context.Background()
-	lib := mustCreateLibrary(t, repo, "Movies", MoviesLibrary)
+	lib := mustCreateLibrary(t, repo, "Movies", library.MoviesLibrary)
 
 	byID, err := repo.GetLibrary(ctx, lib.ID)
 	if err != nil {
 		t.Fatalf("getting library by id: %v", err)
 	}
-	if byID.Name != "Movies" || byID.Kind != MoviesLibrary {
+	if byID.Name != "Movies" || byID.Kind != library.MoviesLibrary {
 		t.Errorf("library = %+v, want name Movies kind movies", byID)
 	}
 
@@ -337,8 +338,8 @@ func TestLibraryLifecycle(t *testing.T) {
 	}
 
 	// Deleting a library removes its entities and objects too.
-	series := mustCreateEntity(t, repo, lib.ID, nil, MovieEntity, "Dune")
-	if err := repo.CreateObject(ctx, &MediaObject{
+	series := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Dune")
+	if err := repo.CreateObject(ctx, &library.MediaObject{
 		ID: "obj-1", MediaEntityID: series.ID, FilePath: "/media/dune.mkv",
 		Size: 10, MimeType: "video/x-matroska", CreatedAt: time.Now(),
 	}); err != nil {
@@ -349,13 +350,13 @@ func TestLibraryLifecycle(t *testing.T) {
 		t.Fatalf("deleting library: %v", err)
 	}
 
-	if _, err := repo.GetLibrary(ctx, lib.ID); !errors.Is(err, ErrNotFound) {
+	if _, err := repo.GetLibrary(ctx, lib.ID); !errors.Is(err, library.ErrNotFound) {
 		t.Errorf("library still present after delete: %v", err)
 	}
-	if _, err := repo.GetEntity(ctx, series.ID); !errors.Is(err, ErrNotFound) {
+	if _, err := repo.GetEntity(ctx, series.ID); !errors.Is(err, library.ErrNotFound) {
 		t.Errorf("entity still present after library delete: %v", err)
 	}
-	if _, err := repo.GetObjectByPath(ctx, "/media/dune.mkv"); !errors.Is(err, ErrNotFound) {
+	if _, err := repo.GetObjectByPath(ctx, "/media/dune.mkv"); !errors.Is(err, library.ErrNotFound) {
 		t.Errorf("object still present after library delete: %v", err)
 	}
 }
@@ -366,8 +367,8 @@ func TestGetObjectByPath_NotFound(t *testing.T) {
 	repo := newTestRepo(t)
 
 	_, err := repo.GetObjectByPath(context.Background(), "/nothing/here.mkv")
-	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("error = %v, want ErrNotFound", err)
+	if !errors.Is(err, library.ErrNotFound) {
+		t.Fatalf("error = %v, want library.ErrNotFound", err)
 	}
 }
 

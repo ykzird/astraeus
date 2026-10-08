@@ -91,7 +91,8 @@ type MediaEntity struct {
 	CreatedAt time.Time    `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time    `json:"updated_at" db:"updated_at"`
 
-	// Metadata is stored as a JSON column and is not mapped directly by sqlx.
+	// Metadata is the descriptive set attached once a provider succeeds. It is
+	// nil while the entity is Incomplete.
 	Metadata *MetadataSet `json:"metadata,omitempty" db:"-"`
 }
 

@@ -1,7 +1,8 @@
-package library
+package library_test
 
 import (
 	"context"
+	"github.com/jok/astraeus-media/internal/library"
 	"path/filepath"
 	"testing"
 	"time"
@@ -18,10 +19,10 @@ func TestScanScheduler_ScanAll(t *testing.T) {
 	showsRoot := t.TempDir()
 	writeFile(t, filepath.Join(showsRoot, "Show", "Season 01", "Show.S01E01.mkv"), "ep")
 
-	mustLibraryAt(t, repo, moviesRoot, MoviesLibrary)
-	mustLibraryAt(t, repo, showsRoot, ShowsLibrary)
+	mustLibraryAt(t, repo, moviesRoot, library.MoviesLibrary)
+	mustLibraryAt(t, repo, showsRoot, library.ShowsLibrary)
 
-	scheduler := NewScanScheduler(repo, NewScanner(repo, newTestLogger()), time.Hour, newTestLogger())
+	scheduler := library.NewScanScheduler(repo, library.NewScanner(repo, newTestLogger()), time.Hour, newTestLogger())
 
 	outcomes, err := scheduler.ScanAll(ctx)
 	if err != nil {
@@ -63,9 +64,9 @@ func TestScanScheduler_ScansNewFilesOnTheNextPass(t *testing.T) {
 	root := t.TempDir()
 
 	writeFile(t, filepath.Join(root, "Dune (2021).mkv"), "dune")
-	mustLibraryAt(t, repo, root, MoviesLibrary)
+	mustLibraryAt(t, repo, root, library.MoviesLibrary)
 
-	scheduler := NewScanScheduler(repo, NewScanner(repo, newTestLogger()), time.Hour, newTestLogger())
+	scheduler := library.NewScanScheduler(repo, library.NewScanner(repo, newTestLogger()), time.Hour, newTestLogger())
 	if _, err := scheduler.ScanAll(ctx); err != nil {
 		t.Fatalf("first ScanAll: %v", err)
 	}
@@ -94,21 +95,21 @@ func TestScanScheduler_RecordsPerLibraryFailures(t *testing.T) {
 
 	goodRoot := t.TempDir()
 	writeFile(t, filepath.Join(goodRoot, "Dune (2021).mkv"), "dune")
-	mustLibraryAt(t, repo, goodRoot, MoviesLibrary)
+	mustLibraryAt(t, repo, goodRoot, library.MoviesLibrary)
 
 	// A library whose directory has since disappeared.
-	missing := &Library{
+	missing := &library.Library{
 		ID:        "missing-library",
 		Name:      "Missing",
 		Path:      filepath.Join(t.TempDir(), "gone"),
-		Kind:      MoviesLibrary,
+		Kind:      library.MoviesLibrary,
 		CreatedAt: time.Now(),
 	}
 	if err := repo.CreateLibrary(ctx, missing); err != nil {
 		t.Fatalf("creating library: %v", err)
 	}
 
-	scheduler := NewScanScheduler(repo, NewScanner(repo, newTestLogger()), time.Hour, newTestLogger())
+	scheduler := library.NewScanScheduler(repo, library.NewScanner(repo, newTestLogger()), time.Hour, newTestLogger())
 	outcomes, err := scheduler.ScanAll(ctx)
 	if err != nil {
 		t.Fatalf("ScanAll: %v", err)
@@ -134,7 +135,7 @@ func TestScanScheduler_StartStopsOnContextCancel(t *testing.T) {
 	t.Parallel()
 
 	repo := newTestRepo(t)
-	scheduler := NewScanScheduler(repo, NewScanner(repo, newTestLogger()), 10*time.Millisecond, newTestLogger())
+	scheduler := library.NewScanScheduler(repo, library.NewScanner(repo, newTestLogger()), 10*time.Millisecond, newTestLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -156,7 +157,7 @@ func TestScanScheduler_DisabledIntervalReturnsImmediately(t *testing.T) {
 	t.Parallel()
 
 	repo := newTestRepo(t)
-	scheduler := NewScanScheduler(repo, NewScanner(repo, newTestLogger()), 0, newTestLogger())
+	scheduler := library.NewScanScheduler(repo, library.NewScanner(repo, newTestLogger()), 0, newTestLogger())
 
 	done := make(chan struct{})
 	go func() {

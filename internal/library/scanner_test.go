@@ -1,7 +1,8 @@
-package library
+package library_test
 
 import (
 	"context"
+	"github.com/jok/astraeus-media/internal/library"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,12 +22,12 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
-func mustLibraryAt(t *testing.T, repo Repository, root string, kind LibraryKind) *Library {
+func mustLibraryAt(t *testing.T, repo library.Repository, root string, kind library.LibraryKind) *library.Library {
 	t.Helper()
 
-	lib := &Library{
+	lib := &library.Library{
 		ID:        uuid.NewString(),
-		Name:      "Test Library",
+		Name:      "Test library.Library",
 		Path:      root,
 		Kind:      kind,
 		CreatedAt: time.Now(),
@@ -37,7 +38,7 @@ func mustLibraryAt(t *testing.T, repo Repository, root string, kind LibraryKind)
 	return lib
 }
 
-func countObjects(t *testing.T, repo Repository, entities []MediaEntity) int {
+func countObjects(t *testing.T, repo library.Repository, entities []library.MediaEntity) int {
 	t.Helper()
 
 	total := 0
@@ -56,7 +57,7 @@ func TestPlacementFor(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		kind           LibraryKind
+		kind           library.LibraryKind
 		relPath        string
 		absPath        string
 		wantContainers []string
@@ -65,7 +66,7 @@ func TestPlacementFor(t *testing.T) {
 	}{
 		{
 			name:     "movie in a year-named folder",
-			kind:     MoviesLibrary,
+			kind:     library.MoviesLibrary,
 			relPath:  "Blade Runner 2049 (2017)/Blade Runner 2049 (2017) 1080p.mkv",
 			absPath:  "/media/Blade Runner 2049 (2017)/Blade Runner 2049 (2017) 1080p.mkv",
 			wantLeaf: "Movie:Blade Runner 2049",
@@ -73,7 +74,7 @@ func TestPlacementFor(t *testing.T) {
 		},
 		{
 			name:     "movie file at the library root",
-			kind:     MoviesLibrary,
+			kind:     library.MoviesLibrary,
 			relPath:  "Dune (2021).mp4",
 			absPath:  "/media/Dune (2021).mp4",
 			wantLeaf: "Movie:Dune",
@@ -81,7 +82,7 @@ func TestPlacementFor(t *testing.T) {
 		},
 		{
 			name:     "movie in a folder without a year uses the file name",
-			kind:     MoviesLibrary,
+			kind:     library.MoviesLibrary,
 			relPath:  "Action/Heat (1995).mkv",
 			absPath:  "/media/Action/Heat (1995).mkv",
 			wantLeaf: "Movie:Heat",
@@ -89,7 +90,7 @@ func TestPlacementFor(t *testing.T) {
 		},
 		{
 			name:           "episode in a series and season folder",
-			kind:           ShowsLibrary,
+			kind:           library.ShowsLibrary,
 			relPath:        "Breaking Bad/Season 02/Breaking Bad S02E05 - Breakage.mkv",
 			absPath:        "/media/Breaking Bad/Season 02/Breaking Bad S02E05 - Breakage.mkv",
 			wantContainers: []string{"Series:Breaking Bad", "Season:Season 2"},
@@ -98,7 +99,7 @@ func TestPlacementFor(t *testing.T) {
 		},
 		{
 			name:           "episode without a season folder",
-			kind:           ShowsLibrary,
+			kind:           library.ShowsLibrary,
 			relPath:        "The Wire/The.Wire.S03E07.mkv",
 			absPath:        "/media/The Wire/The.Wire.S03E07.mkv",
 			wantContainers: []string{"Series:The Wire", "Season:Season 3"},
@@ -107,7 +108,7 @@ func TestPlacementFor(t *testing.T) {
 		},
 		{
 			name:    "episode directly in the library root cannot be placed",
-			kind:    ShowsLibrary,
+			kind:    library.ShowsLibrary,
 			relPath: "S01E01.mkv",
 			absPath: "/media/S01E01.mkv",
 			wantOK:  false,
@@ -118,10 +119,10 @@ func TestPlacementFor(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			lib := &Library{Name: "Test", Kind: tt.kind}
-			containers, leaf, ok := PlacementFor(lib, tt.relPath, tt.absPath)
+			lib := &library.Library{Name: "Test", Kind: tt.kind}
+			containers, leaf, ok := library.PlacementFor(lib, tt.relPath, tt.absPath)
 			if ok != tt.wantOK {
-				t.Fatalf("PlacementFor(%q) ok = %v, want %v", tt.relPath, ok, tt.wantOK)
+				t.Fatalf("library.PlacementFor(%q) ok = %v, want %v", tt.relPath, ok, tt.wantOK)
 			}
 			if !tt.wantOK {
 				return
@@ -159,8 +160,8 @@ func TestScanner_ScanLibrary_MoviesIsIdempotent(t *testing.T) {
 	writeFile(t, movieB, "bb")
 	writeFile(t, filepath.Join(root, "notes.txt"), "not media")
 
-	lib := mustLibraryAt(t, repo, root, MoviesLibrary)
-	scanner := NewScanner(repo, newTestLogger())
+	lib := mustLibraryAt(t, repo, root, library.MoviesLibrary)
+	scanner := library.NewScanner(repo, newTestLogger())
 
 	first, err := scanner.ScanLibrary(ctx, lib)
 	if err != nil {
@@ -221,8 +222,8 @@ func TestScanner_ScanLibrary_MoviesIsIdempotent(t *testing.T) {
 	// Entities start out incomplete so the administrator can see what needs
 	// metadata.
 	for _, entity := range entities {
-		if entity.Status != StatusIncomplete {
-			t.Errorf("entity %q status = %q, want %q", entity.Name, entity.Status, StatusIncomplete)
+		if entity.Status != library.StatusIncomplete {
+			t.Errorf("entity %q status = %q, want %q", entity.Name, entity.Status, library.StatusIncomplete)
 		}
 	}
 }
@@ -238,8 +239,8 @@ func TestScanner_ScanLibrary_ShowsBuildsHierarchy(t *testing.T) {
 	writeFile(t, filepath.Join(root, "Show", "Season 01", "Show.S01E02 - Second.mkv"), "2")
 	writeFile(t, filepath.Join(root, "Other Show", "Season 01", "Other.Show.S01E01.mkv"), "3")
 
-	lib := mustLibraryAt(t, repo, root, ShowsLibrary)
-	scanner := NewScanner(repo, newTestLogger())
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	scanner := library.NewScanner(repo, newTestLogger())
 
 	if _, err := scanner.ScanLibrary(ctx, lib); err != nil {
 		t.Fatalf("scan: %v", err)
@@ -250,24 +251,24 @@ func TestScanner_ScanLibrary_ShowsBuildsHierarchy(t *testing.T) {
 		t.Fatalf("listing entities: %v", err)
 	}
 
-	byType := map[EntityType]int{}
+	byType := map[library.EntityType]int{}
 	for _, e := range entities {
 		byType[e.Type]++
 	}
-	if byType[SeriesEntity] != 2 {
-		t.Errorf("series count = %d, want 2", byType[SeriesEntity])
+	if byType[library.SeriesEntity] != 2 {
+		t.Errorf("series count = %d, want 2", byType[library.SeriesEntity])
 	}
-	if byType[SeasonEntity] != 2 {
-		t.Errorf("season count = %d, want 2", byType[SeasonEntity])
+	if byType[library.SeasonEntity] != 2 {
+		t.Errorf("season count = %d, want 2", byType[library.SeasonEntity])
 	}
-	if byType[EpisodeEntity] != 3 {
-		t.Errorf("episode count = %d, want 3", byType[EpisodeEntity])
+	if byType[library.EpisodeEntity] != 3 {
+		t.Errorf("episode count = %d, want 3", byType[library.EpisodeEntity])
 	}
 	if got := countObjects(t, repo, entities); got != 3 {
 		t.Errorf("object count = %d, want 3", got)
 	}
 
-	show, err := repo.FindEntity(ctx, lib.ID, nil, SeriesEntity, "Show")
+	show, err := repo.FindEntity(ctx, lib.ID, nil, library.SeriesEntity, "Show")
 	if err != nil {
 		t.Fatalf("finding series: %v", err)
 	}
@@ -303,7 +304,7 @@ func TestScanner_ScanLibrary_ShowsBuildsHierarchy(t *testing.T) {
 	}
 
 	// The two series each keep their own Season 1.
-	other, err := repo.FindEntity(ctx, lib.ID, nil, SeriesEntity, "Other Show")
+	other, err := repo.FindEntity(ctx, lib.ID, nil, library.SeriesEntity, "Other Show")
 	if err != nil {
 		t.Fatalf("finding second series: %v", err)
 	}
@@ -327,8 +328,8 @@ func TestScanner_ScanLibrary_WarnsOnUnplaceableFile(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "S01E01.mkv"), "loose")
 
-	lib := mustLibraryAt(t, repo, root, ShowsLibrary)
-	result, err := NewScanner(repo, newTestLogger()).ScanLibrary(ctx, lib)
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	result, err := library.NewScanner(repo, newTestLogger()).ScanLibrary(ctx, lib)
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -352,15 +353,15 @@ func TestScanner_ScanLibrary_MissingDirectory(t *testing.T) {
 	t.Parallel()
 
 	repo := newTestRepo(t)
-	lib := &Library{
+	lib := &library.Library{
 		ID:        uuid.NewString(),
 		Name:      "Missing",
 		Path:      filepath.Join(t.TempDir(), "does-not-exist"),
-		Kind:      MoviesLibrary,
+		Kind:      library.MoviesLibrary,
 		CreatedAt: time.Now(),
 	}
 
-	if _, err := NewScanner(repo, newTestLogger()).ScanLibrary(context.Background(), lib); err == nil {
+	if _, err := library.NewScanner(repo, newTestLogger()).ScanLibrary(context.Background(), lib); err == nil {
 		t.Fatal("expected an error for a missing library directory")
 	}
 }
@@ -376,8 +377,8 @@ func TestScanner_ScanLibrary_SkipsIgnoredDirectories(t *testing.T) {
 	writeFile(t, filepath.Join(root, "Sample", "sample.mkv"), "s")
 	writeFile(t, filepath.Join(root, ".hidden", "secret.mkv"), "h")
 
-	lib := mustLibraryAt(t, repo, root, MoviesLibrary)
-	result, err := NewScanner(repo, newTestLogger()).ScanLibrary(ctx, lib)
+	lib := mustLibraryAt(t, repo, root, library.MoviesLibrary)
+	result, err := library.NewScanner(repo, newTestLogger()).ScanLibrary(ctx, lib)
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -398,8 +399,8 @@ func TestScanner_ScanLibrary_CountsDistinctEntities(t *testing.T) {
 	writeFile(t, filepath.Join(root, "Show", "Season 01", "Show.S01E02.mkv"), "2")
 	writeFile(t, filepath.Join(root, "Show", "Season 01", "Show.S01E03.mkv"), "3")
 
-	lib := mustLibraryAt(t, repo, root, ShowsLibrary)
-	scanner := NewScanner(repo, newTestLogger())
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	scanner := library.NewScanner(repo, newTestLogger())
 
 	// One series plus one season plus three episodes. The containers are looked
 	// up three times each, but they are two entities.
@@ -458,8 +459,8 @@ func TestScanner_PrunesFilesThatAreGone(t *testing.T) {
 	writeFile(t, second, "video")
 
 	repo := newTestRepo(t)
-	lib := mustLibraryAt(t, repo, root, ShowsLibrary)
-	scanner := NewScanner(repo, newTestLogger())
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	scanner := library.NewScanner(repo, newTestLogger())
 
 	initial, err := scanner.ScanLibrary(context.Background(), lib)
 	if err != nil {
@@ -532,8 +533,8 @@ func TestScanner_DoesNotPruneWhenTheScanIsBlind(t *testing.T) {
 	writeFile(t, filepath.Join(root, "Astraeus Show", "Season 1", "S01E01 - Pilot.mkv"), "video")
 
 	repo := newTestRepo(t)
-	lib := mustLibraryAt(t, repo, root, ShowsLibrary)
-	scanner := NewScanner(repo, newTestLogger())
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	scanner := library.NewScanner(repo, newTestLogger())
 
 	if _, err := scanner.ScanLibrary(context.Background(), lib); err != nil {
 		t.Fatalf("first scan: %v", err)
@@ -582,13 +583,13 @@ func TestDeleteLibrary_WithHierarchyAndForeignKeys(t *testing.T) {
 
 	repo := newTestRepo(t)
 	ctx := context.Background()
-	lib := mustCreateLibrary(t, repo, "Hierarchy", ShowsLibrary)
+	lib := mustCreateLibrary(t, repo, "Hierarchy", library.ShowsLibrary)
 
-	series := mustCreateEntity(t, repo, lib.ID, nil, SeriesEntity, "Show")
-	season := mustCreateEntity(t, repo, lib.ID, &series.ID, SeasonEntity, "Season 1")
-	episode := mustCreateEntity(t, repo, lib.ID, &season.ID, EpisodeEntity, "Episode 1")
+	series := mustCreateEntity(t, repo, lib.ID, nil, library.SeriesEntity, "Show")
+	season := mustCreateEntity(t, repo, lib.ID, &series.ID, library.SeasonEntity, "Season 1")
+	episode := mustCreateEntity(t, repo, lib.ID, &season.ID, library.EpisodeEntity, "Episode 1")
 
-	if err := repo.CreateObject(ctx, &MediaObject{
+	if err := repo.CreateObject(ctx, &library.MediaObject{
 		ID:            uuid.NewString(),
 		MediaEntityID: episode.ID,
 		FilePath:      filepath.Join(t.TempDir(), "s01e01.mkv"),
@@ -605,7 +606,7 @@ func TestDeleteLibrary_WithHierarchyAndForeignKeys(t *testing.T) {
 }
 
 // hasEntityNamed reports whether any entity carries this name.
-func hasEntityNamed(entities []MediaEntity, name string) bool {
+func hasEntityNamed(entities []library.MediaEntity, name string) bool {
 	for _, entity := range entities {
 		if entity.Name == name {
 			return true

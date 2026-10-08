@@ -168,6 +168,18 @@ func ParseMovieName(name string) (title string, year int) {
 	return cleanTitle(base), year
 }
 
+// TitleFromPath derives a readable display name from a media file path: the
+// base name without its extension, and without release-name noise such as
+// "1080p" or "x265".
+//
+// The scanner names new entities with it, and the migration that backfills
+// names for entities written by earlier versions uses it too, so an entity
+// renamed by a migration ends up with the same name a scan would give it.
+func TitleFromPath(path string) string {
+	base := filepath.Base(path)
+	return cleanTitle(strings.TrimSuffix(base, filepath.Ext(base)))
+}
+
 // cleanTitle turns separator-heavy release names into readable titles.
 func cleanTitle(s string) string {
 	s = strings.Trim(s, " ._-")
