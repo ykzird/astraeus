@@ -25,7 +25,7 @@ Whatever you pick, four facts decide whether the install is sound:
 ## Container
 
 ```sh
-docker build -t astraeus-media:0.16.0 .
+docker build -t astraeus-media:0.18.0 .
 
 # The image's default command serves on :8642 with every writable path inside
 # /data. This one has no access gate, so keep it on loopback.
@@ -33,7 +33,7 @@ docker run -d --name astraeus \
   -p 127.0.0.1:8642:8642 \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.16.0
+  astraeus-media:0.18.0
 ```
 
 Flags are passed through the entrypoint, so the server's own options can be
@@ -63,7 +63,7 @@ docker run -d --name astraeus \
   -e ASTRAEUS_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.16.0 \
+  astraeus-media:0.18.0 \
   serve --addr 0.0.0.0:8642 --web-dir /app/web \
         --db /data/astraeus.db --stream-root /data/streams \
         --image-cache /data/images --subtitle-cache /data/subtitles \
@@ -227,8 +227,8 @@ A release is a tag. Pushing one that starts with `v` runs
 archives, publishes a GitHub Release and pushes a multi-arch image to GHCR:
 
 ```sh
-git tag -a v0.17.0 -m "v0.17.0"
-git push origin v0.17.0
+git tag -a v0.18.0 -m "v0.18.0"
+git push origin v0.18.0
 ```
 
 The same workflow has a `dry_run` option in the Actions tab: it builds every
@@ -248,7 +248,7 @@ reviews — which are about building the server rather than using it:
 
 ```sh
 sha256sum -c checksums.txt          # from inside the extracted release dir
-./astraeus-server version           # astraeus-server 0.17.0
+./astraeus-server version           # astraeus-server 0.18.0
 ```
 
 The image is published as both `:<version>` and `:latest`, one manifest covering
@@ -264,8 +264,8 @@ before the repository had a remote.
 
 ```sh
 # This host reaches go through mise; CI has it on PATH.
-mise exec -- scripts/build-release.sh 0.17.0
-mise exec -- scripts/build-release.sh 0.17.0 linux/amd64 linux/arm64 darwin/arm64
+mise exec -- scripts/build-release.sh 0.18.0
+mise exec -- scripts/build-release.sh 0.18.0 linux/amd64 linux/arm64 darwin/arm64
 ```
 
 **What was verified, and what was not.** The archives were built for amd64 and

@@ -1,18 +1,21 @@
 # Handoff
 
-**As of the round-12 work of 2026-10-09 — the first real release run and the first
-real systemd start. 130 tracked files; `v0.17.0` is released, so the in-tree
-version is `dev` and the next tag would be `v0.17.1`.** (`git log` names the
-commits. Round 11 was the documentation restructure, which added §10 — a QEMU VM
-for the systemd unit and the release run — and moved those two untested claims to
-the top of §7. Round 12 went and did them: the release workflow ran for real on a
-tag and found two defects in itself, both now fixed (§6), and the unit was then
-started on a clean VM and made to transcode under its own syscall filter. Round 10
-was release automation and going public, which found a ladder defect the
-development host's ffmpeg had been hiding; round 9 made a quality choice cap a
-ladder; round 8 was OCR for PGS image subtitles; round 7 front-end unit tests;
-round 6 trace export; round 5 API rate limiting; round 4 image subtitles by
-burn-in; round 3 per-viewer progress; earlier rounds are in `git log`.)
+**As of the round-13 work of 2026-10-09 — the documentation sweep and the cut of
+`v0.18.0`. 127 tracked files; `v0.17.0` is released and `v0.18.0` is the next tag,
+so the in-tree version is `dev`.** (`git log` names the commits. Round 12 ran the
+release workflow for real and started the systemd unit on a clean VM, finding two
+defects in the packaging and one in the release job, all since fixed (§6). Round
+13 removed the point-in-time reviews from the tree, narrowed the release archive
+to the pages a user actually needs, and made every relative link inside that
+archive resolve — `docs/development.md` and `web/vendor/icons.md` now point at
+`scripts/` on GitHub, because the archive ships the server and the pages but none
+of the development tooling. Round 11 was the documentation restructure, which
+added §10 — a QEMU VM for the systemd unit and the release run. Round 10 was
+release automation and going public, which found a ladder defect the development
+host's ffmpeg had been hiding; round 9 made a quality choice cap a ladder; round
+8 was OCR for PGS image subtitles; round 7 front-end unit tests; round 6 trace
+export; round 5 API rate limiting; round 4 image subtitles by burn-in; round 3
+per-viewer progress; earlier rounds are in `git log`.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -273,17 +276,17 @@ the version it bakes in is the only difference between this and a plain build:
 
 ```sh
 # Archives for the default platforms (linux/amd64, linux/arm64) in ./dist.
-mise exec -- scripts/build-release.sh 0.17.0
+mise exec -- scripts/build-release.sh 0.18.0
 (cd dist && sha256sum -c checksums.txt)
-tar -xzf dist/astraeus-server_0.17.0_linux_amd64.tar.gz -C /tmp
-/tmp/astraeus-server_0.17.0_linux_amd64/astraeus-server version   # 0.17.0
+tar -xzf dist/astraeus-server_0.18.0_linux_amd64.tar.gz -C /tmp
+/tmp/astraeus-server_0.18.0_linux_amd64/astraeus-server version   # 0.18.0
 
 # The image carries the version and the OCI provenance labels; both are read
 # back from the built artefact rather than from the Dockerfile.
-docker build --build-arg VERSION=0.17.0 --build-arg REVISION="$(git rev-parse --short HEAD)" \
-  -t astraeus-media:0.17.0 .
-docker inspect astraeus-media:0.17.0 --format '{{json .Config.Labels}}' | python3 -m json.tool
-docker run --rm astraeus-media:0.17.0 version
+docker build --build-arg VERSION=0.18.0 --build-arg REVISION="$(git rev-parse --short HEAD)" \
+  -t astraeus-media:0.18.0 .
+docker inspect astraeus-media:0.18.0 --format '{{json .Config.Labels}}' | python3 -m json.tool
+docker run --rm astraeus-media:0.18.0 version
 
 # Both workflows lint clean; actionlint runs from a container, so nothing is
 # installed on the host.
@@ -313,14 +316,14 @@ release archive and then follows `deploy/README.md` verbatim.
 A published release is checked against its artefacts, not its YAML:
 
 ```sh
-gh release view v0.17.0                       # the assets, the notes, not a draft
-gh release download v0.17.0 -D /tmp/rel
+gh release view v0.18.0                       # the assets, the notes, not a draft
+gh release download v0.18.0 -D /tmp/rel
 (cd /tmp/rel && sha256sum -c checksums.txt)   # both archives, against the checksums
-docker pull ghcr.io/ykzird/astraeus:0.17.0
+docker pull ghcr.io/ykzird/astraeus:0.18.0
 # Both platform manifests, and an attestation manifest per platform.
-docker buildx imagetools inspect ghcr.io/ykzird/astraeus:0.17.0
+docker buildx imagetools inspect ghcr.io/ykzird/astraeus:0.18.0
 # The version is baked in at build time, so this reads it back from the image.
-docker run --rm --entrypoint astraeus-server ghcr.io/ykzird/astraeus:0.17.0 version
+docker run --rm --entrypoint astraeus-server ghcr.io/ykzird/astraeus:0.18.0 version
 ```
 
 ---
@@ -619,9 +622,12 @@ archive now carries only the pages a reader of the installed README needs —
 working documents is ever staged again. `docs/adversarial-review.md` and
 `docs/review/` were point-in-time records that named types the code no longer
 has, so they left the tree altogether and now live only in history; §1 and
-`docs/index.md` no longer link to them. The one cost is deliberate and recorded:
-the installed `README.md` links to `docs/handoff.md`, which stays repository-only,
-so that link resolves in a checkout and not in an installed tree.
+`docs/index.md` no longer link to them. Narrowing the archive broke four relative
+links, which a checker over every `.md` in the extracted tree found — the handoff
+pair, plus `docs/development.md` and `web/vendor/icons.md` reaching into `scripts/`,
+which does not ship. All four now point at the repository by URL, so the archive
+has no dangling relative link and a reader of an installed tree can still follow
+them.
 
 `v0.17.0` was then re-cut onto the fixed commit and the whole workflow is green.
 The GitHub Release exists with both archives and `checksums.txt` and generated

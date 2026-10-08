@@ -70,8 +70,8 @@ button without its accessible name.
 ## Updating
 
 1. Add or change the entry in the `WANTED` table in
-   [`scripts/fetch-icons.mjs`](../../scripts/fetch-icons.mjs), which maps each
-   registry key to a BoxIcons name.
+   [`scripts/fetch-icons.mjs`](https://github.com/ykzird/astraeus/blob/main/scripts/fetch-icons.mjs),
+   which maps each registry key to a BoxIcons name.
 2. Run `node scripts/fetch-icons.mjs`. It fails loudly if a name does not exist
    in the set, so a typo cannot silently produce a blank icon.
 3. Update the size, SHA-256 and icon table above with the values the generator
