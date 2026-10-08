@@ -290,6 +290,14 @@ func clientAddr(r *http.Request) (netip.Addr, bool) {
 	return addr.Unmap(), true
 }
 
+// ClientAddress exposes the peer address the gate is willing to trust, so other
+// middleware can key on the same address rather than deriving a second, weaker
+// opinion about X-Forwarded-For. It returns false when the address cannot be
+// parsed, which a caller must treat as "unattributable" rather than "trusted".
+func ClientAddress(r *http.Request) (netip.Addr, bool) {
+	return clientAddr(r)
+}
+
 // ParseTrustedProxies parses comma-separated CIDRs or bare addresses.
 func ParseTrustedProxies(values []string) ([]netip.Prefix, error) {
 	var prefixes []netip.Prefix

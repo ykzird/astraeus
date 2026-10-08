@@ -357,7 +357,17 @@ refuses to start. `X-Forwarded-For` is deliberately not used to establish trust.
 The authenticated identity is recorded on every request log line, and grants and
 denials are counted. `--auth-mode none` remains the default for a trusted LAN.
 
-Rate limiting is not implemented.
+Rate limiting is implemented as a token bucket per client in front of the API
+(`--rate-limit`, off by default; `--rate-limit-burst`). Only `/api/` paths are
+bounded: the UI, its assets and the HLS segments are delivery rather than work,
+sessions are capped separately by `--max-sessions`, and `/api/health` stays open
+for liveness probes. A client is the gate's identity when there is one — behind a
+proxy every request arrives from the proxy's address, so an address-keyed limit
+would be one global bucket for everyone it serves — and otherwise the peer
+address, with `X-Forwarded-For` ignored for the same reason the gate ignores it.
+A refusal is a `429` in the API's error shape with a `Retry-After`. The limiter
+is per process: several servers behind one proxy each hold their own buckets, so
+the effective limit is their sum.
 
 ### 9.5 Artwork, subtitles and scanning
 

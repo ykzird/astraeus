@@ -78,7 +78,12 @@ type Deps struct {
 	// WebDir is a directory of static UI assets served at /. When it is empty
 	// or missing, only the API is served.
 	WebDir string
-	Logger *slog.Logger
+	// RateLimit, when set, wraps the mux and may refuse a request before it is
+	// routed. It is a middleware rather than a policy because what a client is
+	// keyed by - the gate's identity, or a peer address - is decided at the
+	// composition root, where both are known.
+	RateLimit func(http.Handler) http.Handler
+	Logger    *slog.Logger
 }
 
 // Server renders library state as JSON over HTTP.
@@ -94,6 +99,7 @@ type Server struct {
 	metrics   *observability.Metrics
 	subtitles SubtitleConverter
 	webFS     http.Handler
+	rateLimit func(http.Handler) http.Handler
 	logger    *slog.Logger
 }
 
@@ -115,6 +121,7 @@ func NewServer(deps Deps) *Server {
 		images:    deps.Images,
 		metrics:   deps.Metrics,
 		subtitles: deps.Subtitles,
+		rateLimit: deps.RateLimit,
 		logger:    logger,
 	}
 
@@ -167,7 +174,13 @@ func (s *Server) Handler() http.Handler {
 
 	// Security headers wrap the whole mux, so a route added later cannot forget
 	// them; the request log wraps that, so it records what was actually served.
-	return s.withRequestLogging(s.withSecurityHeaders(mux))
+	// The rate limiter sits inside both on purpose: a refusal is a response like
+	// any other, so it carries the same headers and appears in the same log.
+	handler := http.Handler(mux)
+	if s.rateLimit != nil {
+		handler = s.rateLimit(handler)
+	}
+	return s.withRequestLogging(s.withSecurityHeaders(handler))
 }
 
 // contentSecurityPolicy is the policy the web UI actually needs, and nothing

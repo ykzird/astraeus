@@ -37,12 +37,13 @@ import (
 	"github.com/jok/astraeus-media/internal/library/sqlite"
 	"github.com/jok/astraeus-media/internal/metadata"
 	"github.com/jok/astraeus-media/internal/observability"
+	"github.com/jok/astraeus-media/internal/ratelimit"
 	"github.com/jok/astraeus-media/internal/streaming"
 	"github.com/jok/astraeus-media/internal/subtitles"
 )
 
 // version is the build identifier reported by `astraeus-server version`.
-const version = "0.11.0"
+const version = "0.12.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -217,6 +218,10 @@ func runServe(args []string) error {
 		"bearer token for token mode; prefer setting ASTRAEUS_AUTH_TOKEN over passing it as an argument")
 	authExempt := fs.String("auth-exempt", "/api/health",
 		"paths that bypass the access gate (comma separated, exact matches)")
+	rateLimit := fs.Float64("rate-limit", 0,
+		"API requests per second allowed per client (0 disables; only /api paths are limited)")
+	rateLimitBurst := fs.Int("rate-limit-burst", 0,
+		"requests a client may make at once above the rate (0 means the rate rounded up)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -280,6 +285,31 @@ func runServe(args []string) error {
 		Metrics:    metrics,
 		WebDir:     *webDir,
 		Logger:     app.logger,
+	}
+
+	if *rateLimit > 0 {
+		limiter, err := ratelimit.New(ratelimit.Config{
+			Rate:  *rateLimit,
+			Burst: *rateLimitBurst,
+			Key:   apiClientKey,
+			// Only the API is bounded. The UI, its assets and the HLS segments
+			// are delivery rather than work: a page load pulls several files at
+			// once and one playback fetches a segment every few seconds, and
+			// neither is what a limit is for. Sessions are capped separately by
+			// --max-sessions. /api/health stays open for liveness probes.
+			Exempt: func(r *http.Request) bool {
+				return !strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api/health"
+			},
+			Metrics: metrics,
+			Logger:  app.logger,
+		})
+		if err != nil {
+			return err
+		}
+		deps.RateLimit = limiter.Middleware
+		app.logger.Info("API rate limit enabled",
+			"rate_per_second", *rateLimit, "burst", limiter.Burst(),
+			"keyed_by", "access identity when present, otherwise the peer address")
 	}
 
 	// The media engine is optional: without ffmpeg/ffprobe the library still
@@ -649,4 +679,22 @@ func splitList(value string) []string {
 		}
 	}
 	return out
+}
+
+// apiClientKey names the client a rate-limit bucket belongs to.
+//
+// The access gate's identity is preferred when there is one. Behind a proxy every
+// request arrives from the proxy's own address, so an address-keyed limit would
+// be one global bucket for everyone the proxy serves - which is the opposite of
+// what a per-client limit means. With no gate there is no identity, and the peer
+// address is the honest answer: the same address the gate itself trusts, with
+// X-Forwarded-For ignored for the same reason the gate ignores it.
+func apiClientKey(r *http.Request) string {
+	if identity := access.IdentityFromContext(r.Context()); identity != "" {
+		return "identity:" + identity
+	}
+	if addr, ok := access.ClientAddress(r); ok {
+		return "address:" + addr.String()
+	}
+	return ""
 }

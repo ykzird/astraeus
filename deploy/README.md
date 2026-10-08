@@ -19,7 +19,7 @@ Whatever you pick, three facts decide whether the install is sound:
 ## Container
 
 ```sh
-docker build -t astraeus-media:0.11.0 .
+docker build -t astraeus-media:0.12.0 .
 
 # The image's default command serves on :8642 with every writable path inside
 # /data. This one has no access gate, so keep it on loopback.
@@ -27,7 +27,7 @@ docker run -d --name astraeus \
   -p 127.0.0.1:8642:8642 \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.11.0
+  astraeus-media:0.12.0
 ```
 
 Flags are passed through the entrypoint, so the server's own options can be
@@ -57,7 +57,7 @@ docker run -d --name astraeus \
   -e ASTRAEUS_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.11.0 \
+  astraeus-media:0.12.0 \
   serve --addr 0.0.0.0:8642 --web-dir /app/web \
         --db /data/astraeus.db --stream-root /data/streams \
         --image-cache /data/images --subtitle-cache /data/subtitles \
@@ -74,6 +74,13 @@ Cloudflare Access forwarding an identity header) gives each person their own
 place. `--auth-mode token` reports every API client as `token`, which is right
 for a script and means they share one place; `none` has a single `local` viewer
 and is the correct choice only where there is one viewer.
+
+**Rate limiting follows the same rule.** `--rate-limit 20` bounds API calls per
+second per client. Behind `proxy` mode that is per person; in `token` mode every
+API client shares one bucket, and with the gate off the peer address is used —
+which, behind a reverse proxy, is the proxy's own address, so the limit becomes
+global. The limiter is per process, so several replicas behind one proxy each
+hold their own buckets.
 
 **Hardware acceleration.** A container does not see the GPU unless it is passed
 in: add `--device /dev/dri` for VAAPI, and the container's ffmpeg must be able to

@@ -96,7 +96,11 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Artwork is loaded only through the server's own proxy; the metadata
       provider's absolute URLs are no longer fetched by the browser, and
       `img-src 'self'` makes that structural rather than a convention
-- [ ] Rate limiting
+- [x] Rate limiting: a token bucket per client in front of `/api/` only, keyed by
+      the gate's identity when there is one and the peer address otherwise, off by
+      default (`--rate-limit`), answering `429` with a `Retry-After` and counted in
+      `astraeus_rate_limited_total`. Per process, so several servers behind one
+      proxy limit as a sum
 - [ ] OpenTelemetry tracing
 
 ## Phase 4: Spatial Web UI — complete for MVP scope

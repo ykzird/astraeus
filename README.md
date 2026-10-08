@@ -257,7 +257,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.11.0`).
+identifier (currently `0.12.0`).
 
 ## HTTP API
 
@@ -352,6 +352,7 @@ metric and absence-based alerting works.
 | `astraeus_stream_sessions_active`, `astraeus_probe_errors_total` | Operational |
 | `astraeus_transcode_fallbacks_total` | Hardware transcodes retried in software |
 | `astraeus_auth_granted_total`, `astraeus_auth_denied_total{reason}` | Access gate grants and denials |
+| `astraeus_rate_limited_total` | API requests refused by the rate limiter |
 
 Errors are `{"code": "...", "message": "..."}` with a matching status code.
 
@@ -630,6 +631,38 @@ the gate is doing.
 
 A browser cannot attach a bearer token to a plain navigation, so browser access
 belongs behind `proxy` mode; `token` mode suits clients and automation.
+
+## Rate limiting
+
+`--rate-limit` (requests per second per client, default `0` = off) bounds how
+often the API may be called, and `--rate-limit-burst` sets how many requests a
+client may make at once (default: the rate rounded up, which is the smallest
+bucket a normal page load still fits in).
+
+```sh
+./astraeus-server serve --rate-limit 20 --rate-limit-burst 40
+```
+
+The limit is a token bucket, so a client that behaves gets its allowance back
+rather than being cut off for the rest of a window. Only `/api/` is limited:
+the UI, its assets and the HLS segments are *delivery*, and a page load pulls
+several files at once while one playback fetches a segment every few seconds.
+Sessions are capped separately by `--max-sessions`, and `/api/health` stays open
+for liveness probes. A refusal is a `429` in the API's error shape with a
+`Retry-After: 1`, and is counted in `astraeus_rate_limited_total`.
+
+**What a client is depends on the gate.** With an identity from `proxy` mode the
+bucket is per person, which is the point: behind a proxy every request arrives
+from the proxy's own address, so an address-keyed limit would be one global
+bucket for everyone it serves. With no gate, the peer address is used — the same
+address the access gate trusts, with `X-Forwarded-For` ignored for the same
+reason. In `token` mode every API client shares the `token` identity and so
+shares one bucket. A request the server cannot attribute at all is allowed
+rather than charged to a bucket it shares with everyone else.
+
+The limiter is per process. Several servers behind one proxy each hold their own
+buckets, so the effective limit is the sum; a shared limit would need a shared
+store.
 
 ## Testing
 

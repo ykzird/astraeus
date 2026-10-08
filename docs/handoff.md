@@ -1,11 +1,11 @@
 # Handoff
 
-**As of the round-4 work of 2026-10-08 — image subtitles by burn-in. Version
-0.11.0. 99 tracked files.** (`git log` names the commits; the previous handoff was
-`f5a8973`, which landed per-viewer playback progress. Round 2 landed HDR/Dolby
-Vision, packaging, the bitrate ceiling, the adaptive ladder, audio track
-selection, resumable playback, the continue-watching list and response
-hardening.)
+**As of the round-5 work of 2026-10-08 — API rate limiting. Version 0.12.0. 102
+tracked files.** (`git log` names the commits; the previous handoff was
+`5458ab2`, which delivered image subtitles by burn-in. Round 3 landed per-viewer
+progress; round 2 landed HDR/Dolby Vision, packaging, the bitrate ceiling, the
+adaptive ladder, audio track selection, resumable playback, the continue-watching
+list and response hardening.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -126,6 +126,17 @@ mise exec -- go test -v -run 'PerViewer|LocalOne|WidensProgress|UngatedServer|Fi
 # without the burn. The unit tests pin the negotiation and the command line.
 mise exec -- go test -tags=integration -run BurnIn -v ./internal/streaming/
 mise exec -- go test -run 'BurnsAnImageSubtitle|DoesNotBurnATextSubtitle|BurnIndexThatDoesNotExist' ./internal/streaming/ ./internal/api/
+
+# Rate limiting: the bucket's behaviour is unit-tested with an injected clock,
+# and the wiring is checked against the running binary - a burst is allowed, the
+# next call is a 429 with Retry-After, /api/health and the UI are untouched, and
+# the refusal is counted.
+mise exec -- go test -race -run 'Limiter|RateLimit' ./internal/ratelimit/ ./internal/api/
+./astraeus-server serve --db .tmp/demo-verify.db --web-dir web --addr 127.0.0.1:8927 \
+  --enrich-interval 0 --scan-interval 0 --stream-root "$PWD/.tmp/rl-streams" \
+  --rate-limit 1 --rate-limit-burst 2 &
+for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code}\n' localhost:8927/api/entities; done  # 200 200 429
+curl -s localhost:8927/metrics | grep '^astraeus_rate_limited_total'                # 1
 
 # Both resume paths in a real browser - direct play seeks the element itself,
 # segmented delivery is started at the offset by the server - plus the
@@ -316,6 +327,29 @@ HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
 Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 10/10 subtitles. Full Go suite green with race and integration.
 
+**API rate limiting** landed as of 0.12.0: `internal/ratelimit` is a token bucket
+per client in front of `/api/` only, off by default, with `--rate-limit` and
+`--rate-limit-burst`. The two decisions that matter are both about what a client
+*is* and what is worth bounding: the bucket is keyed by the access gate's
+identity when there is one (behind a proxy every request arrives from the proxy's
+address, so an address-keyed limit would be one global bucket for everyone the
+proxy serves) and by the peer address otherwise, with `X-Forwarded-For` ignored
+for the same reason the gate ignores it; and the UI, its assets and the HLS
+segments are deliberately **not** limited, because they are delivery rather than
+work — a page load pulls several files at once and one playback fetches a segment
+every few seconds — while sessions stay bounded by `--max-sessions`.
+`/api/health` is exempt so a limit can never make a busy server look unhealthy.
+A refusal is a `429` in the API's error shape with `Retry-After: 1`, and is
+counted in `astraeus_rate_limited_total`. The limiter sits *inside* the security
+headers and the request log, so a refusal carries the same headers and appears in
+the same log as any other response. The unit tests inject the clock (burst,
+refill, independent keys, exempt, unattributable, the idle sweep, and a
+misconfiguration that would throttle everyone as one) and a wiring test pins the
+wrapper order; the running binary was checked by hand for the burst → `429` →
+metric sequence. The sweep test caught a real bug: the bucket being created was
+stamped after the sweep ran, so a sweep evicted the live bucket and handed a
+heavy client a fresh allowance.
+
 **Response hardening** landed as of 0.9.0: a content security policy with no
 `unsafe-inline` and no `unsafe-eval`, `img-src 'self'`, plus nosniff, referrer,
 frame, cross-origin and permissions headers. The policy is strict because the
@@ -447,11 +481,11 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **Rate limiting and OpenTelemetry**, then **UI unit tests** (the front end is
-   one 133 KB file with no seam — `web/core.js` for the pure timeline maths is the
-   cheapest first cut). CSP, security headers and the artwork leak are done as of
-   0.9.0, per-user progress as of 0.10.0, and image subtitles by burn-in as of
-   0.11.0.
+1. **OpenTelemetry tracing**, then **UI unit tests** (the front end is one 133 KB
+   file with no seam — `web/core.js` for the pure timeline maths is the cheapest
+   first cut). CSP, security headers and the artwork leak are done as of 0.9.0,
+   per-user progress as of 0.10.0, image subtitles by burn-in as of 0.11.0, and
+   API rate limiting as of 0.12.0.
 2. **OCR for image subtitles, if the burn-in cost is unwanted.** A burn is exact
    but needs a re-encode, cannot be toggled without one, and cannot be searched or
    restyled. OCR (tesseract is already installed on the development host) would
@@ -509,6 +543,13 @@ Priority order, with the reasoning. Take it top-down.
   be refused at runtime and show up as a console error in the harness — which is
   the point of the policy, but it means a front-end change that adds one will
   fail verification rather than merely being flagged.
+- **Rate limiting is verified by unit tests and one manual run, not by a real
+  proxy or a load test.** The identity-keyed path is exercised through the gate's
+  context in a test, not by Tailscale or Cloudflare Access forwarding headers on a
+  real network; `token` mode puts every API client in one bucket; and the limiter
+  is per process, so several replicas behind one proxy limit as a sum. The idle
+  sweep that bounds bucket memory is unit-tested with a two-key threshold, but has
+  not been observed under a flood of distinct addresses.
 - **One transport assertion is timing-sensitive on a 4K transcode.** A harness
   run against the 17 GB film reported 31/32 once, with the failing check outside
   the captured tail, and two immediate re-runs passed 32/32 on the same code.
