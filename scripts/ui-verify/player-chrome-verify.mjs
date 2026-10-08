@@ -119,6 +119,13 @@ const SNAPSHOT = `(() => {
     qualityValue: quality ? quality.value : null,
     timeText: timeText ? timeText.textContent.trim() : null,
     storedAudio: (() => { try { return localStorage.getItem("astraeus.audio"); } catch (e) { return null; } })(),
+    subtitleKeys: Array.from(document.querySelectorAll('[data-action="select-subtitle"]'))
+      .map((r) => ({ key: r.dataset.subtitleKey, checked: r.checked })),
+    subtitleChecked: (() => {
+      const chosen = Array.from(document.querySelectorAll('[data-action="select-subtitle"]'))
+        .find((r) => r.checked);
+      return chosen ? chosen.dataset.subtitleKey : null;
+    })(),
     iconAudit: iconAudit,
     fullscreenIconD: fullscreenIconD,
     paused: video ? video.paused : null,
@@ -399,6 +406,24 @@ async function main() {
 
     const before = seeked;
 
+    // A re-negotiation rebuilds the tracks, and the server's default must not
+    // quietly win over what the viewer chose.
+    const subtitleChoice = await cdp.eval(`(() => {
+      const radios = Array.from(document.querySelectorAll('[data-action="select-subtitle"]'));
+      if (radios.length < 2) return null;
+      const checked = radios.find((r) => r.checked);
+      // Pick something that is not the current selection, preferring Off.
+      const target = radios.find((r) => r.dataset.subtitleKey === "off" && !r.checked) ||
+                     radios.find((r) => !r.checked && r !== checked);
+      if (!target) return null;
+      target.checked = true;
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+      return target.dataset.subtitleKey;
+    })()`);
+    if (subtitleChoice !== null) {
+      note("chose subtitle track " + JSON.stringify(subtitleChoice) + " before switching quality");
+    }
+
     // Choose a different rendition, preferring the lowest to make the switch cheap.
     const target = state.qualityOptions
       .filter((o) => o.value && o.value !== state.qualityValue)
@@ -426,6 +451,13 @@ async function main() {
 
       const after = parseClock(resumed ? resumed.timeText : null);
       // The whole point of start_seconds: the viewer does not go back to the title card.
+      if (subtitleChoice !== null) {
+        const kept = await cdp.eval(SNAPSHOT);
+        record("the subtitle choice survives re-negotiation",
+          String(kept.subtitleChecked) === String(subtitleChoice),
+          "chose " + JSON.stringify(subtitleChoice) + " after switch " + JSON.stringify(kept.subtitleChecked));
+      }
+
       record("quality switching resumes near where the viewer was, not at zero",
         before !== null && after !== null && after > 20 && Math.abs(after - before) < 120,
         "clock " + (afterSeek ? afterSeek.timeText : "?") + " -> " + (resumed ? resumed.timeText : "?"));

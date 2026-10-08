@@ -34,6 +34,17 @@ const (
 	stderrLimit = 8 << 10
 )
 
+// ErrTooManySessions is returned when the concurrent stream limit is reached.
+var ErrTooManySessions = errors.New("streaming: too many concurrent sessions")
+
+// sessionMarkerFile marks a directory as ours. The reaper removes only
+// directories carrying it.
+const sessionMarkerFile = ".astraeus-session"
+
+// defaultMaxSessions is generous for a household and small enough that a loop
+// of requests cannot fork unbounded ffmpeg processes.
+const defaultMaxSessions = 8
+
 // ErrDirectPlayHasNoSession is returned when a session is requested for a
 // decision that does not need one.
 var ErrDirectPlayHasNoSession = errors.New("direct play does not use a streaming session")
@@ -136,6 +147,11 @@ type ManagerConfig struct {
 	SessionTTL time.Duration
 	// Server describes the encoders available on this host.
 	Server ServerCapability
+	// MaxSessions caps how many segmented streams may run at once. Each one is
+	// an ffmpeg process and a directory of segments, so an unauthenticated
+	// caller that loops on the playback endpoint can exhaust the host. Zero
+	// means the default.
+	MaxSessions int
 	// Metrics collects the streaming KPIs. A nil value disables instrumentation.
 	Metrics *observability.Metrics
 	Logger  *slog.Logger
@@ -160,6 +176,9 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	}
 	if cfg.SessionTTL <= 0 {
 		cfg.SessionTTL = defaultSessionTTL
+	}
+	if cfg.MaxSessions <= 0 {
+		cfg.MaxSessions = defaultMaxSessions
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -202,6 +221,12 @@ func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration) {
 			continue
 		}
 		path := filepath.Join(root, entry.Name())
+		// Only ever remove directories this server created. Without the marker
+		// a mistyped or shared --stream-root turns an age check into deleting
+		// somebody else's data.
+		if _, err := os.Stat(filepath.Join(path, sessionMarkerFile)); err != nil {
+			continue
+		}
 		if err := os.RemoveAll(path); err != nil {
 			m.cfg.Logger.Warn("removing stale session directory", "path", path, "error", err)
 			continue
@@ -278,6 +303,14 @@ func withoutHardware(cfg ManagerConfig) ManagerConfig {
 
 // startOnce prepares and launches one session with the given configuration.
 func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, decision Decision, cfg ManagerConfig, startSeconds float64) (*Session, error) {
+	m.mu.Lock()
+	active := len(m.sessions)
+	limit := m.cfg.MaxSessions
+	m.mu.Unlock()
+	if limit > 0 && active >= limit {
+		return nil, fmt.Errorf("%w (%d running, limit %d)", ErrTooManySessions, active, limit)
+	}
+
 	if decision.Mode == ModeDirectPlay {
 		return nil, ErrDirectPlayHasNoSession
 	}
@@ -289,6 +322,11 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 	dir := filepath.Join(cfg.RootDir, sessionID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating session directory: %w", err)
+	}
+	// The marker is what entitles the reaper to delete this directory later.
+	if err := os.WriteFile(filepath.Join(dir, sessionMarkerFile), []byte(sessionID+"\n"), 0o644); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("writing session marker: %w", err)
 	}
 
 	args, err := BuildFFmpegArgsAt(dir, objectPath, decision, cfg, startSeconds)

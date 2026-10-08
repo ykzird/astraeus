@@ -37,6 +37,14 @@ served by the binary and plays both direct and segmented streams. Concretely:
 play when the codecs are ones it supports (typically mp4/H.264/AAC).
 
 `remux` and `transcode` produce **HLS**. Safari demuxes HLS natively; Chromium
+Astraeus Media is released under the [MIT Licence](LICENSE). An adversarial review of the
+codebase, its known gaps and the competitive landscape lives in
+[`docs/adversarial-review.md`](docs/adversarial-review.md).
+
+Astraeus Media is released under the [MIT Licence](LICENSE). Vendored
+third-party components and their notices are listed in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
 and Firefox do not, so the UI loads the vendored **hls.js** (MSE) for those
 browsers. See [`web/vendor/README.md`](web/vendor/README.md) for the pinned
 version, licence and provenance, and
@@ -96,7 +104,10 @@ title TMDB cannot find stays `Incomplete` so it shows up as work for an
 administrator, rather than being quietly filled in with a placeholder.
 
 `--stream-root` controls where HLS session output is written (default:
-`$TMPDIR/astraeus-streams`). `--device-dir` (default `/dev/dri`) is where
+`$TMPDIR/astraeus-streams`) and `--max-sessions` (default `8`) caps how many
+segmented streams may run at once — each is an ffmpeg process, so the cap is
+what stops a loop of playback requests from forking the host to death.
+Requesting one over the limit answers `429 too_many_sessions`. `--device-dir` (default `/dev/dri`) is where
 hardware transcoding devices are looked for.
 
 ### Hardware acceleration
@@ -113,7 +124,21 @@ If a hardware encoder is chosen and still fails at runtime, the session is
 retried once in software and `astraeus_transcode_fallbacks_total` counts it,
 rather than failing the request when a working software path exists.
 
-`GET /api/system/capabilities` reports what survived that check. `--scan-interval` (default `6h`,
+`GET /api/system/capabilities` reports what survived that check.
+
+### Scanning
+
+A scan is idempotent: re-running it reuses entities rather than duplicating
+them, and it reports distinct entities rather than lookups. It also **prunes**:
+a file that is gone stops appearing, and any entity left holding neither an
+object nor a child is removed with it, working upwards so an emptied season
+takes its series with it.
+
+Pruning deletes data, so it refuses to run whenever the scan's view of the disk
+might be incomplete — if any path was unreadable, or if the scan found zero
+files while the library still holds entities, which is the shape of a drive
+that is not mounted. Silently emptying a library is far worse than leaving a
+ghost entry behind. `--scan-interval` (default `6h`,
 `0` disables) re-scans every library for new files; `--enrich-interval` does the
 same for metadata. `--image-cache` and `--subtitle-cache` place the artwork and
 WebVTT caches.
@@ -146,6 +171,7 @@ Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 | DELETE | `/api/libraries/{id}` | Remove a library and its entities |
 | POST | `/api/libraries/{id}/scan` | Scan, returns a `ScanResult` |
 | POST | `/api/scan` | Re-scan every library, returns a `ScanOutcome` each |
+| DELETE | `/api/streams/{id}` | Stop a streaming session now, `204` |
 | GET | `/api/libraries/{id}/entities` | Entities, optionally `?status=Incomplete` |
 | GET | `/api/entities` | All entities, optionally `?status=` |
 | GET | `/api/entities/{id}` | Entity with its objects, children and parent |
@@ -248,6 +274,11 @@ needs re-encoding but cannot play HLS); the reasons explain why.
 The decision also carries the concrete targets it chose — `target_height` for a
 downscale and `target_audio_channels` for a downmix — so a client can see not
 just that it will be re-encoded but what it will get.
+
+A manifest naming a codec that does not exist is refused with `400` before it
+can reach ffmpeg. A codec that exists but that this host cannot encode is a
+negotiation outcome, not a bad request: the server picks another codec the
+client accepts if there is one, and otherwise answers `409` saying so.
 
 An omitted limit means **unrestricted**, so a client that says nothing about
 channels gets the source's own channel count. That is the right default for a

@@ -24,7 +24,7 @@ func newTestLogger() *slog.Logger {
 func newTestRepo(t *testing.T) *SQLiteRepository {
 	t.Helper()
 
-	db, err := sqlx.Connect("sqlite", filepath.Join(t.TempDir(), "astraeus-test.db"))
+	db, err := sqlx.Connect("sqlite", SQLiteDSN(filepath.Join(t.TempDir(), "astraeus-test.db")))
 	if err != nil {
 		t.Fatalf("connecting to test database: %v", err)
 	}

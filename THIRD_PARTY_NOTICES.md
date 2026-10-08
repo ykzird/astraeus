@@ -46,7 +46,8 @@ document.
 
 ---
 
-## Not covered here
+## The project itself
 
-The project's own licence is not yet decided; this file records third-party
-terms only. Fonts, if any are added later, need their own entry.
+Astraeus Media is released under the MIT Licence — see [`LICENSE`](LICENSE).
+The notices above cover the third-party components it bundles; they apply in
+addition to, not instead of, the project's own licence.

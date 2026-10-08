@@ -536,7 +536,11 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	decision := streaming.Negotiate(info, capability)
+	// The pure negotiation answers what the client and the media allow. This
+	// server may still be unable to encode the chosen target - no libx264, or a
+	// client that only accepts AV1 - and that has to be a 409 with a reason
+	// rather than a 500 from ffmpeg later.
+	decision := streaming.NegotiateForServer(info, capability, s.server)
 	s.metrics.IncCounter("astraeus_playback_decisions_total",
 		"Playback negotiations, by the mode they chose.",
 		map[string]string{"mode": string(decision.Mode)})
@@ -568,6 +572,13 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 
 	session, err := s.streams.StartAt(ctx, entity.ID, object.FilePath, decision, startSeconds)
 	if err != nil {
+		// A full server is not a fault in the request, and retrying later is
+		// exactly what the client should do.
+		if errors.Is(err, streaming.ErrTooManySessions) {
+			s.logger.WarnContext(ctx, "refusing a streaming session: at capacity", "entity_id", entity.ID)
+			writeError(w, http.StatusTooManyRequests, "too_many_sessions", err.Error())
+			return
+		}
 		s.logger.ErrorContext(ctx, "starting streaming session", "entity_id", entity.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "stream_start_failed", err.Error())
 		return

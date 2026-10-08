@@ -44,7 +44,7 @@ const legacyTimestamp = "2026-10-07 16:23:13.732481079 +0200 CEST m=+0.100313790
 func TestMigrate_UpgradesLegacyDatabase(t *testing.T) {
 	t.Parallel()
 
-	db, err := sqlx.Connect("sqlite", filepath.Join(t.TempDir(), "legacy.db"))
+	db, err := sqlx.Connect("sqlite", SQLiteDSN(filepath.Join(t.TempDir(), "legacy.db")))
 	if err != nil {
 		t.Fatalf("connecting to legacy database: %v", err)
 	}

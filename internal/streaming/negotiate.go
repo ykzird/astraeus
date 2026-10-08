@@ -254,6 +254,7 @@ type ServerCapability struct {
 	FFprobeAvailable     bool     `json:"ffprobe_available"`
 	HardwareAcceleration string   `json:"hardware_acceleration,omitempty"`
 	VideoEncoders        []string `json:"video_encoders,omitempty"`
+	AudioEncoders        []string `json:"audio_encoders,omitempty"`
 	HLS                  bool     `json:"hls"`
 }
 
@@ -307,7 +308,10 @@ func DetectServerCapability(ctx context.Context, ffmpegBin, ffprobeBin, deviceDi
 	// Software encoders are trusted once listed; hardware encoders have to
 	// prove themselves, because the failure mode of a wrong guess is that no
 	// transcode works at all.
-	for _, encoder := range videoEncodersOnly(ParseEncoders(stdout.String())) {
+	compiled := ParseEncoders(stdout.String())
+	capability.AudioEncoders = audioEncodersOnly(compiled)
+
+	for _, encoder := range videoEncodersOnly(compiled) {
 		if isHardwareEncoder(encoder) && !encoderWorks(ctx, ffmpegBin, encoder, deviceDir) {
 			continue
 		}
@@ -372,6 +376,25 @@ func firstRenderNode(deviceDir string) (string, bool) {
 	return "", false
 }
 
+// audioEncodersOnly keeps the audio encoders this project knows how to ask for.
+// Unlike the video encoders these are not proved by running one: an audio
+// encoder that is listed is reliable, and proving each would slow startup for
+// no real gain.
+func audioEncodersOnly(encoders []string) []string {
+	known := map[string]bool{
+		"aac": true, "libopus": true, "libmp3lame": true, "libvorbis": true,
+		"ac3": true, "eac3": true, "flac": true, "libfdk_aac": true,
+	}
+	kept := make([]string, 0, len(encoders))
+	for _, encoder := range encoders {
+		if known[encoder] {
+			kept = append(kept, encoder)
+		}
+	}
+	sort.Strings(kept)
+	return kept
+}
+
 // videoEncodersOnly keeps the encoders this project can actually target.
 func videoEncodersOnly(encoders []string) []string {
 	known := map[string]bool{
@@ -415,9 +438,12 @@ func EncoderFor(codec string, server ServerCapability) string {
 			if hardwareSuffix == "" || !strings.HasSuffix(candidate, hardwareSuffix) {
 				continue
 			}
-			if !containsFold(server.VideoEncoders, candidate) {
-				continue
-			}
+		}
+		// Every candidate has to be one the host actually reported. A software
+		// encoder is not a safe assumption either: this build of ffmpeg may not
+		// have it, and claiming otherwise turns a 409 into a 500.
+		if !containsFold(server.VideoEncoders, candidate) {
+			continue
 		}
 		return candidate
 	}
@@ -426,4 +452,108 @@ func EncoderFor(codec string, server ServerCapability) string {
 
 func isHardwareEncoder(name string) bool {
 	return strings.HasSuffix(name, "_qsv") || strings.HasSuffix(name, "_vaapi")
+}
+
+// knownVideoCodecs and knownAudioCodecs are the vocabulary a client may declare.
+// A manifest naming something outside it is a malformed request, not an
+// unsupported one, and saying so is friendlier than letting the name reach
+// ffmpeg and come back as a 500.
+var knownVideoCodecs = []string{
+	"h264", "hevc", "av1", "vp8", "vp9", "mpeg2", "mpeg4",
+	"vc1", "theora", "prores", "dnxhd", "wmv3", "flv1", "h263",
+}
+
+var knownAudioCodecs = []string{
+	"aac", "ac3", "eac3", "dts", "truehd", "opus", "vorbis",
+	"mp3", "flac", "alac", "mp2", "wmav2", "pcm_s16le", "pcm_s24le",
+}
+
+// audioEncoderPreference maps a target audio codec onto the encoders that can
+// produce it, most portable first.
+var audioEncoderPreference = map[string][]string{
+	"aac":    {"aac"},
+	"opus":   {"libopus"},
+	"mp3":    {"libmp3lame"},
+	"vorbis": {"libvorbis"},
+	"ac3":    {"ac3"},
+	"eac3":   {"eac3"},
+	"flac":   {"flac"},
+}
+
+// AudioEncoderFor returns the ffmpeg encoder for an audio codec, or "" when this
+// server cannot produce it.
+func AudioEncoderFor(codec string, server ServerCapability) string {
+	for _, candidate := range audioEncoderPreference[NormaliseAudioCodec(codec)] {
+		if containsFold(server.AudioEncoders, candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// NegotiateForServer narrows a negotiation to what this server can actually
+// deliver.
+//
+// Negotiate is pure: it compares the client against the media and knows nothing
+// about the host. That is the right shape, but it means it can choose a target
+// codec no encoder here produces - a client that only accepts AV1 on a build
+// without an AV1 encoder - and the failure would surface much later as ffmpeg
+// exiting with a confusing message. This wrapper retargets to another codec the
+// client accepts when one is available, and otherwise marks the decision
+// undeliverable so the caller can answer 409 with a reason.
+func NegotiateForServer(info *MediaInfo, capability ClientCapability, server ServerCapability) Decision {
+	decision := Negotiate(info, capability)
+	if !decision.Deliverable || decision.Mode != ModeTranscode {
+		return decision
+	}
+
+	if decision.VideoAction == ActionTranscode && EncoderFor(decision.TargetVideoCodec, server) == "" {
+		if alternative := encodableVideoCodec(capability, server); alternative != "" {
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("this server cannot encode %q; using %q instead",
+					decision.TargetVideoCodec, alternative))
+			decision.TargetVideoCodec = alternative
+		} else {
+			decision.Deliverable = false
+			decision.Reasons = append(decision.Reasons,
+				"this server has no encoder for any video codec the client accepts")
+		}
+	}
+
+	if decision.AudioAction == ActionTranscode && AudioEncoderFor(decision.TargetAudioCodec, server) == "" {
+		if alternative := encodableAudioCodec(capability, server); alternative != "" {
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("this server cannot encode %q audio; using %q instead",
+					decision.TargetAudioCodec, alternative))
+			decision.TargetAudioCodec = alternative
+		} else {
+			decision.Deliverable = false
+			decision.Reasons = append(decision.Reasons,
+				"this server has no encoder for any audio codec the client accepts")
+		}
+	}
+
+	return decision
+}
+
+// encodableVideoCodec returns the client's most preferred video codec this
+// server can encode, or "".
+func encodableVideoCodec(capability ClientCapability, server ServerCapability) string {
+	for _, codec := range videoCodecPreference {
+		if capability.SupportsVideo(codec) && EncoderFor(codec, server) != "" {
+			return codec
+		}
+	}
+	return ""
+}
+
+// encodableAudioCodec returns the client's most preferred audio codec this
+// server can encode, or "".
+func encodableAudioCodec(capability ClientCapability, server ServerCapability) string {
+	for _, codec := range audioCodecPreference {
+		if capability.SupportsAudio(codec) && AudioEncoderFor(codec, server) != "" {
+			return codec
+		}
+	}
+	return ""
 }

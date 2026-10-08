@@ -209,7 +209,7 @@ func TestEncoderFor(t *testing.T) {
 	t.Parallel()
 
 	software := ServerCapability{VideoEncoders: []string{"libx264", "libx265"}}
-	quickSync := ServerCapability{VideoEncoders: []string{"h264_qsv", "hevc_qsv", "libx264"}, HardwareAcceleration: "qsv"}
+	quickSync := ServerCapability{VideoEncoders: []string{"h264_qsv", "hevc_qsv", "libx264", "libvpx-vp9"}, HardwareAcceleration: "qsv"}
 	vaapiOnly := ServerCapability{VideoEncoders: []string{"h264_vaapi"}, HardwareAcceleration: "vaapi"}
 	// An encoder can be compiled into ffmpeg without a usable device being
 	// present; that must not be mistaken for a working hardware path.
@@ -229,7 +229,8 @@ func TestEncoderFor(t *testing.T) {
 		{name: "hardware is skipped for a codec it cannot do", codec: "vp9", server: quickSync, want: "libvpx-vp9"},
 		{name: "compiled-in hardware without a device falls back to software", codec: "h264", server: compiledButUnusable, want: "libx264"},
 		{name: "unknown codec", codec: "theora", server: software, want: ""},
-		{name: "nothing available", codec: "h264", server: none, want: "libx264"},
+		{name: "nothing available", codec: "h264", server: none, want: ""},
+		{name: "a software encoder that is not present is never assumed", codec: "h264", server: ServerCapability{VideoEncoders: []string{"libx265"}}, want: ""},
 	}
 
 	for _, tt := range tests {
@@ -741,5 +742,132 @@ func TestBuildFFmpegArgsAt_SeeksOnTheInput(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(plain, " "), "-ss") {
 		t.Errorf("a zero offset should not emit -ss:\n%s", strings.Join(plain, " "))
+	}
+}
+
+func TestAudioEncoderFor(t *testing.T) {
+	t.Parallel()
+
+	server := ServerCapability{AudioEncoders: []string{"aac", "libopus", "libmp3lame"}}
+
+	tests := []struct {
+		codec string
+		want  string
+	}{
+		{codec: "aac", want: "aac"},
+		{codec: "opus", want: "libopus"},
+		{codec: "mp3", want: "libmp3lame"},
+		{codec: "ac3", want: ""}, // not offered by this host
+		{codec: "totally-bogus", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.codec, func(t *testing.T) {
+			t.Parallel()
+			if got := AudioEncoderFor(tt.codec, server); got != tt.want {
+				t.Errorf("AudioEncoderFor(%q) = %q, want %q", tt.codec, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNegotiateForServer covers the gap the pure negotiation cannot see: the
+// client and the media may agree on a codec that this host cannot encode.
+func TestNegotiateForServer(t *testing.T) {
+	t.Parallel()
+
+	// 4K HEVC that has to be re-encoded for a browser-shaped client.
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "hevc", AudioCodec: "dts",
+		Width: 3840, Height: 1600, BitDepth: 10, AudioChannels: 6,
+	}
+
+	t.Run("retargets to a codec the host can encode", func(t *testing.T) {
+		t.Parallel()
+
+		// The client's most preferred codecs are ones this host cannot encode,
+		// but it accepts a lower-preference codec that the host can.
+		capability := BrowserCapability()
+		capability.VideoCodecs = []string{"hevc", "vp9"}
+		capability.AudioCodecs = []string{"ac3", "mp3"}
+		server := ServerCapability{
+			VideoEncoders: []string{"libvpx-vp9"},
+			AudioEncoders: []string{"libmp3lame"},
+		}
+
+		decision := NegotiateForServer(info, capability, server)
+		if !decision.Deliverable {
+			t.Fatalf("undeliverable: %v", decision.Reasons)
+		}
+		if decision.TargetVideoCodec != "vp9" {
+			t.Errorf("target video codec = %q, want vp9", decision.TargetVideoCodec)
+		}
+		if decision.TargetAudioCodec != "mp3" {
+			t.Errorf("target audio codec = %q, want mp3", decision.TargetAudioCodec)
+		}
+		joined := strings.Join(decision.Reasons, "; ")
+		if !strings.Contains(joined, "cannot encode") {
+			t.Errorf("the substitution should be explained: %s", joined)
+		}
+	})
+
+	t.Run("undeliverable when nothing the client accepts can be encoded", func(t *testing.T) {
+		t.Parallel()
+
+		capability := BrowserCapability()
+		capability.VideoCodecs = []string{"av1"}
+		capability.AudioCodecs = []string{"opus"}
+		server := ServerCapability{VideoEncoders: []string{"libx264"}, AudioEncoders: []string{"aac"}}
+
+		decision := NegotiateForServer(info, capability, server)
+		if decision.Deliverable {
+			t.Fatal("a host with no AV1 encoder must not claim it can deliver AV1")
+		}
+		if joined := strings.Join(decision.Reasons, "; "); !strings.Contains(joined, "no encoder") {
+			t.Errorf("the refusal should explain itself: %s", joined)
+		}
+	})
+
+	t.Run("a decision that needs no transcode is untouched", func(t *testing.T) {
+		t.Parallel()
+
+		playable := &MediaInfo{Container: "mp4", VideoCodec: "h264", AudioCodec: "aac", Width: 1920, Height: 1080}
+		decision := NegotiateForServer(playable, BrowserCapability(), ServerCapability{})
+		if decision.Mode != ModeDirectPlay {
+			t.Errorf("mode = %q, want direct play", decision.Mode)
+		}
+	})
+}
+
+func TestValidateRejectsUnknownCodecNames(t *testing.T) {
+	t.Parallel()
+
+	valid := ClientCapability{
+		Containers:  []string{"hls"},
+		VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"},
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("a valid manifest was rejected: %v", err)
+	}
+
+	badVideo := valid
+	badVideo.VideoCodecs = []string{"h264", "definitely-not-a-codec"}
+	if err := badVideo.Validate(); err == nil {
+		t.Error("an unknown video codec name should be refused before it reaches ffmpeg")
+	}
+
+	badAudio := valid
+	badAudio.AudioCodecs = []string{"totally-bogus"}
+	if err := badAudio.Validate(); err == nil {
+		t.Error("an unknown audio codec name should be refused before it reaches ffmpeg")
+	}
+
+	// A codec this host cannot encode is still a legitimate thing to declare;
+	// it is a negotiation outcome, not a malformed request.
+	unsupported := valid
+	unsupported.VideoCodecs = []string{"av1"}
+	if err := unsupported.Validate(); err != nil {
+		t.Errorf("a real codec the host cannot encode must not be rejected as invalid: %v", err)
 	}
 }

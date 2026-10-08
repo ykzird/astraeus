@@ -81,7 +81,16 @@ Subtitle tracks returned by the playback endpoint are served as WebVTT
 which works on both the native and the MSE path. The player's subtitle menu
 offers an **Off** option plus one per deliverable track; image-based tracks
 (PGS/VobSub) have no URL and are shown disabled with the reason. Nothing is
-selected unless the server marks a track as default.
+selected unless the server marks a track as default — and a choice the viewer
+made sticks: a quality change or a re-negotiating seek rebuilds the tracks from
+a fresh response, so the selection is carried across and only falls back to the
+server's default if that track is no longer there.
+
+A refused autoplay is **not** an error. Every `play()` here happens after an
+`await`, outside the user-gesture task, so a blocked start is the common case:
+the session is left `ready` with the stream already attached, and the next Play
+press toggles playback instead of opening a second session for a stream that
+already exists.
 
 ### Player chrome
 

@@ -74,8 +74,14 @@ Status as of the current build. Evidence for each claim is the test suite
 ## Known gaps
 
 - Transcoding runs one rendition per request; there is no adaptive bitrate
-  ladder, and seeking on a segmented stream is bounded by how far the transcoder
-  has produced (Plex and Jellyfin restart ffmpeg at an offset; we do not yet).
+  ladder, and `max_bitrate_kbps` is accepted but not yet acted on.
+- Seeking is no longer bounded by how far the transcoder has got: the client
+  re-negotiates with `start_seconds` and ffmpeg seeks the input, so any point
+  in the film is reachable in a couple of seconds. The landing point is
+  keyframe-aligned, so it can be a second or two early.
+- Playback position is not stored, so there is no resume across sessions or
+  devices; the offset machinery it needs now exists.
+- Hardware encoders are QSV and VAAPI only — no NVENC, AMF or VideoToolbox.
 - Image-based subtitles (PGS, VobSub) are detected and reported but not
   delivered — that needs OCR or bitmap overlay support.
 - Multi-audio-track selection is not implemented; the first audio stream wins.

@@ -76,10 +76,31 @@ func (c ClientCapability) Validate() error {
 	if len(c.AudioCodecs) == 0 {
 		return fmt.Errorf("capability must list at least one audio codec")
 	}
-	if c.MaxWidth < 0 || c.MaxHeight < 0 || c.MaxBitrateKbps < 0 {
+	if c.MaxWidth < 0 || c.MaxHeight < 0 || c.MaxBitrateKbps < 0 ||
+		c.MaxBitDepth < 0 || c.MaxAudioChannels < 0 {
 		return fmt.Errorf("capability limits must not be negative")
 	}
+	if unknown := firstUnknown(c.VideoCodecs, knownVideoCodecs, NormaliseVideoCodec); unknown != "" {
+		return fmt.Errorf("unknown video codec %q", unknown)
+	}
+	if unknown := firstUnknown(c.AudioCodecs, knownAudioCodecs, NormaliseAudioCodec); unknown != "" {
+		return fmt.Errorf("unknown audio codec %q", unknown)
+	}
 	return nil
+}
+
+// firstUnknown returns the first value that is not part of the known
+// vocabulary, or "" when they all are.
+func firstUnknown(values, known []string, normalise func(string) string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if !containsFold(known, normalise(value)) {
+			return value
+		}
+	}
+	return ""
 }
 
 // Normalise lowercases and canonicalises the codec and container names so that

@@ -291,6 +291,78 @@ func (r *SQLiteRepository) ListLibraries(ctx context.Context) ([]Library, error)
 }
 
 // DeleteLibrary removes a library together with its entities and objects.
+// PruneResult reports what a prune removed.
+type PruneResult struct {
+	ObjectsPruned  int `json:"objects_pruned"`
+	EntitiesPruned int `json:"entities_pruned"`
+}
+
+// PruneLibrary removes objects for files this pass did not see, then any entity
+// left with neither objects nor children, working upwards so an emptied season
+// is removed and then an emptied series.
+//
+// Deletion order matters now that foreign keys are enforced: objects reference
+// entities, and entities reference their parent, so the children have to go
+// before the parents.
+func (r *SQLiteRepository) PruneLibrary(ctx context.Context, libraryID string, keepPaths map[string]bool) (PruneResult, error) {
+	var result PruneResult
+
+	err := r.WithTx(ctx, func(tx Repository) error {
+		inner := tx.(*SQLiteRepository)
+
+		type row struct {
+			ID       string `db:"id"`
+			FilePath string `db:"file_path"`
+		}
+		var rows []row
+		if err := inner.exec().SelectContext(ctx, &rows,
+			`SELECT o.id, o.file_path FROM media_objects o
+			 JOIN media_entities e ON e.id = o.media_entity_id
+			 WHERE e.library_id = ?`, libraryID); err != nil {
+			return fmt.Errorf("listing objects for library %s: %w", libraryID, err)
+		}
+
+		for _, candidate := range rows {
+			if keepPaths[candidate.FilePath] {
+				continue
+			}
+			if _, err := inner.exec().ExecContext(ctx,
+				`DELETE FROM media_objects WHERE id = ?`, candidate.ID); err != nil {
+				return fmt.Errorf("pruning object %s: %w", candidate.ID, err)
+			}
+			result.ObjectsPruned++
+		}
+
+		// Childless and objectless entities, repeatedly, so removing a season
+		// can make its series prunable on the next pass.
+		for {
+			res, err := inner.exec().ExecContext(ctx, `
+				DELETE FROM media_entities
+				WHERE library_id = ?
+				  AND id NOT IN (SELECT media_entity_id FROM media_objects)
+				  AND id NOT IN (SELECT parent_id FROM media_entities WHERE parent_id IS NOT NULL)`,
+				libraryID)
+			if err != nil {
+				return fmt.Errorf("pruning entities for library %s: %w", libraryID, err)
+			}
+			affected, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("counting pruned entities: %w", err)
+			}
+			result.EntitiesPruned += int(affected)
+			if affected == 0 {
+				break
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return PruneResult{}, err
+	}
+	return result, nil
+}
+
 func (r *SQLiteRepository) DeleteLibrary(ctx context.Context, id string) error {
 	return r.WithTx(ctx, func(tx Repository) error {
 		if err := tx.(*SQLiteRepository).deleteLibraryRows(ctx, id); err != nil {

@@ -22,6 +22,8 @@ type ScanResult struct {
 	EntitiesReused  int      `json:"entities_reused"`
 	ObjectsCreated  int      `json:"objects_created"`
 	ObjectsUpdated  int      `json:"objects_updated"`
+	ObjectsPruned   int      `json:"objects_pruned"`
+	EntitiesPruned  int      `json:"entities_pruned"`
 	Warnings        []string `json:"warnings,omitempty"`
 }
 
@@ -64,6 +66,9 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 
 	// tally accumulates the distinct entities this pass touches.
 	tally := newEntityTally()
+	// seenPaths is what still exists on disk, and therefore what a prune is
+	// allowed to keep.
+	seenPaths := make(map[string]bool)
 
 	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -89,6 +94,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 		}
 
 		result.FilesSeen++
+		seenPaths[path] = true
 		if err := s.ingestFile(ctx, lib, path, root, &result, tally); err != nil {
 			return err
 		}
@@ -101,6 +107,13 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 	// Report distinct entities rather than lookups: a season shared by twenty
 	// episodes is one reused entity, not twenty.
 	tally.apply(&result)
+
+	pruned, err := s.pruneMissing(ctx, lib, seenPaths, result)
+	if err != nil {
+		return result, err
+	}
+	result.ObjectsPruned = pruned.ObjectsPruned
+	result.EntitiesPruned = pruned.EntitiesPruned
 
 	s.logger.InfoContext(ctx, "scan complete",
 		"library", lib.Name,
@@ -141,6 +154,35 @@ func (t *entityTally) markReused(id string) {
 func (t *entityTally) apply(result *ScanResult) {
 	result.EntitiesCreated = len(t.created)
 	result.EntitiesReused = len(t.reused)
+}
+
+// pruneMissing removes records for files that are no longer on disk.
+//
+// This deletes data, so it refuses to act whenever the scan's view of the disk
+// might be incomplete: a warning means a subtree could not be read, and an empty
+// result against a library that previously had media usually means the mount is
+// not up rather than that the user deleted everything. Getting this wrong
+// silently empties a library, which is far worse than leaving a ghost entry.
+func (s *Scanner) pruneMissing(ctx context.Context, lib *Library, seenPaths map[string]bool, result ScanResult) (PruneResult, error) {
+	if len(result.Warnings) > 0 {
+		s.logger.WarnContext(ctx, "skipping prune: the scan could not read every path",
+			"library", lib.Name, "warnings", len(result.Warnings))
+		return PruneResult{}, nil
+	}
+
+	if result.FilesSeen == 0 {
+		existing, err := s.repo.ListEntitiesByLibrary(ctx, lib.ID)
+		if err != nil {
+			return PruneResult{}, fmt.Errorf("checking library %s before pruning: %w", lib.ID, err)
+		}
+		if len(existing) > 0 {
+			s.logger.WarnContext(ctx, "skipping prune: no files were visible but the library is not empty",
+				"library", lib.Name)
+			return PruneResult{}, nil
+		}
+	}
+
+	return s.repo.PruneLibrary(ctx, lib.ID, seenPaths)
 }
 
 // ingestFile reconciles one media file with the database inside a transaction,

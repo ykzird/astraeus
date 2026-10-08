@@ -35,6 +35,11 @@ type Repository interface {
 	GetObjectByPath(ctx context.Context, filePath string) (*MediaObject, error)
 	GetObjectsByEntity(ctx context.Context, entityID string) ([]MediaObject, error)
 
+	// PruneLibrary removes objects whose files are not in keepPaths, and any
+	// entity left with neither objects nor children. It is how a file deleted
+	// from disk stops being a ghost entry in every listing.
+	PruneLibrary(ctx context.Context, libraryID string, keepPaths map[string]bool) (PruneResult, error)
+
 	// WithTx runs fn inside a transaction. The Repository handed to fn is bound
 	// to that transaction; returning an error rolls the whole thing back.
 	WithTx(ctx context.Context, fn func(tx Repository) error) error

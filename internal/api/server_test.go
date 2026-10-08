@@ -57,7 +57,7 @@ func withSubtitles(converter SubtitleConverter) envOption {
 func newTestEnv(t *testing.T, opts ...envOption) *testEnv {
 	t.Helper()
 
-	db, err := sqlx.Connect("sqlite", filepath.Join(t.TempDir(), "api-test.db"))
+	db, err := sqlx.Connect("sqlite", library.SQLiteDSN(filepath.Join(t.TempDir(), "api-test.db")))
 	if err != nil {
 		t.Fatalf("connecting to test database: %v", err)
 	}
@@ -77,6 +77,18 @@ func newTestEnv(t *testing.T, opts ...envOption) *testEnv {
 		Worker:     library.NewMetadataWorker(repo, library.NewMockProvider(), time.Hour, logger),
 		Metrics:    observability.New(),
 		Logger:     logger,
+		// A running server probes this at startup, so software encoders are
+		// always present where ffmpeg is. Negotiation is server-aware now: a
+		// test env that declares no encoders is correctly told a transcode
+		// cannot be delivered. Tests that care about a specific layout
+		// override this with withServerCapability.
+		Server: streaming.ServerCapability{
+			FFmpegAvailable:  true,
+			FFprobeAvailable: true,
+			VideoEncoders:    []string{"libx264", "libx265"},
+			AudioEncoders:    []string{"aac"},
+			HLS:              true,
+		},
 	}
 	for _, opt := range opts {
 		opt(&deps)

@@ -146,7 +146,7 @@ func (c *config) open() (*env, error) {
 		return nil, err
 	}
 
-	db, err := sqlx.Connect("sqlite", c.dbPath)
+	db, err := sqlx.Connect("sqlite", library.SQLiteDSN(c.dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("opening database %s: %w", c.dbPath, err)
 	}
@@ -194,6 +194,8 @@ func runServe(args []string) error {
 		"how often every library is re-scanned for new files; 0 disables periodic scanning")
 	ffmpegBin := fs.String("ffmpeg", "ffmpeg", "ffmpeg executable used for segmented streaming")
 	ffprobeBin := fs.String("ffprobe", "ffprobe", "ffprobe executable used for media inspection")
+	maxSessions := fs.Int("max-sessions", 8,
+		"maximum concurrent segmented streams; each is an ffmpeg process")
 	streamRoot := fs.String("stream-root", filepath.Join(os.TempDir(), "astraeus-streams"),
 		"directory holding HLS session output")
 	deviceDir := fs.String("device-dir", "/dev/dri",
@@ -316,6 +318,7 @@ func runServe(args []string) error {
 			FFmpegBin:      *ffmpegBin,
 			RootDir:        *streamRoot,
 			SegmentSeconds: *segmentSeconds,
+			MaxSessions:    *maxSessions,
 			Server:         deps.Server,
 			Metrics:        metrics,
 			Logger:         app.logger,

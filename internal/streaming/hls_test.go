@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -32,6 +33,11 @@ func TestNewManager_SweepsStaleSessionDirectories(t *testing.T) {
 		}
 		if err := os.WriteFile(filepath.Join(dir, "playlist.m3u8"), []byte("#EXTM3U"), 0o644); err != nil {
 			t.Fatalf("writing playlist: %v", err)
+		}
+		// Rendered by the server for every session it starts; the reaper only
+		// touches directories carrying it.
+		if err := os.WriteFile(filepath.Join(dir, sessionMarkerFile), []byte("session\n"), 0o644); err != nil {
+			t.Fatalf("writing the session marker: %v", err)
 		}
 	}
 
@@ -287,5 +293,113 @@ func TestWithoutHardware(t *testing.T) {
 	}
 	if len(cfg.Server.VideoEncoders) != 1 || cfg.Server.VideoEncoders[0] != "libx264" {
 		t.Errorf("software encoders = %v, want just libx264", cfg.Server.VideoEncoders)
+	}
+}
+
+// TestManager_SweepOnlyRemovesItsOwnDirectories is the guard on the one
+// operation in this package that can destroy data: --stream-root pointed at a
+// shared or mistyped directory must not delete what it finds there.
+func TestManager_SweepOnlyRemovesItsOwnDirectories(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+
+	// Something that is not ours, old enough to be swept on age alone.
+	foreign := filepath.Join(root, "someone-elses-data")
+	if err := os.MkdirAll(foreign, 0o755); err != nil {
+		t.Fatalf("creating the foreign directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(foreign, "important.txt"), []byte("do not delete"), 0o644); err != nil {
+		t.Fatalf("writing the foreign file: %v", err)
+	}
+
+	// One of ours, equally old.
+	ours := filepath.Join(root, "11111111-2222-3333-4444-555555555555")
+	if err := os.MkdirAll(ours, 0o755); err != nil {
+		t.Fatalf("creating the session directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ours, sessionMarkerFile), []byte("session\n"), 0o644); err != nil {
+		t.Fatalf("writing the marker: %v", err)
+	}
+
+	old := time.Now().Add(-48 * time.Hour)
+	for _, dir := range []string{foreign, ours} {
+		if err := os.Chtimes(dir, old, old); err != nil {
+			t.Fatalf("ageing %s: %v", dir, err)
+		}
+	}
+
+	if _, err := NewManager(context.Background(), ManagerConfig{
+		RootDir: root,
+		Logger:  newTestLogger(),
+	}); err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	if _, err := os.Stat(foreign); err != nil {
+		t.Error("a directory without the session marker was removed")
+	}
+	if _, err := os.Stat(ours); !os.IsNotExist(err) {
+		t.Error("a stale session directory carrying the marker was not removed")
+	}
+}
+
+// TestManager_RefusesToExceedMaxSessions covers the resource-exhaustion guard:
+// each session is an ffmpeg process, so an unbounded loop of playback requests
+// would fork the host to death.
+func TestManager_RefusesToExceedMaxSessions(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub encoder is a shell script")
+	}
+
+	dir := t.TempDir()
+	encoder := filepath.Join(dir, "ffmpeg-stub")
+	stub := `#!/bin/sh
+out=""
+for arg in "$@"; do out="$arg"; done
+mkdir -p "$(dirname "$out")"
+printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000000,\nseg00000.ts\n' > "$out"
+printf 'segment' > "$(dirname "$out")/seg00000.ts"
+exit 0
+`
+	if err := os.WriteFile(encoder, []byte(stub), 0o755); err != nil {
+		t.Fatalf("writing the stub encoder: %v", err)
+	}
+
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		FFmpegBin:   encoder,
+		RootDir:     filepath.Join(dir, "sessions"),
+		MaxSessions: 1,
+		Server:      ServerCapability{VideoEncoders: []string{"libx264"}},
+		Metrics:     observability.New(),
+		Logger:      newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	decision := Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+	}
+
+	first, err := manager.Start(context.Background(), "entity-1", "/media/a.mkv", decision)
+	if err != nil {
+		t.Fatalf("the first session should be allowed: %v", err)
+	}
+	t.Cleanup(func() { manager.Stop(first.ID) })
+
+	if _, err := manager.Start(context.Background(), "entity-2", "/media/b.mkv", decision); !errors.Is(err, ErrTooManySessions) {
+		t.Fatalf("second session error = %v, want ErrTooManySessions", err)
+	}
+
+	// Freeing one must let the next in, or the cap becomes a permanent wedge.
+	manager.Stop(first.ID)
+	if _, err := manager.Start(context.Background(), "entity-3", "/media/c.mkv", decision); err != nil {
+		t.Fatalf("a slot freed by stopping a session was not reusable: %v", err)
 	}
 }

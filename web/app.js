@@ -332,6 +332,10 @@
     loadToken: 0,
     retry: null,
     booted: false,
+    /* "Failed to load" is not "empty": these record which of the two we are in
+       so the canvas never invites a scan for a list it never received. */
+    librariesFailed: false,
+    entitiesFailed: false,
     /* Set when a route change was driven by a deliberate user gesture, so
        the canvas (not <body>) receives focus once the new view is painted. */
     focusTarget: null,
@@ -506,6 +510,11 @@
       /* Overlay chrome, kept per session so a new one starts visible. */
       controlsVisible: true,
       fullscreen: false,
+      /* True when the browser refused to autostart: the stream is attached and
+         ready, just waiting for a real gesture. */
+      blockedAutoplay: false,
+      /* Carries the viewer's subtitle choice across a re-negotiation. */
+      subtitlePreference: null,
     };
   }
 
@@ -845,7 +854,12 @@
       if (entity.status === "Incomplete") incomplete += 1;
     }
 
-    if (library) {
+    if (state.librariesFailed) {
+      dom.navSummary.textContent = "Could not load libraries";
+    } else if (library && state.entitiesFailed) {
+      /* "0 entities" would be a claim we cannot make. */
+      dom.navSummary.textContent = kindLabel(library.kind) + " · entities unavailable";
+    } else if (library) {
       dom.navSummary.textContent =
         kindLabel(library.kind) +
         " · " +
@@ -967,13 +981,30 @@
     }
 
     if (state.libraries.length === 0) {
+      /* "We could not ask" and "there are none" look identical in the data, so
+         they have to be told apart by how we got here. */
       dom.canvasContent.append(
-        canvasState({
-          title: "No libraries yet",
-          body:
-            "Astraeus has no libraries registered. Create one with POST /api/libraries, " +
-            "then reload this page to browse it.",
-        })
+        state.librariesFailed
+          ? canvasState({
+              title: "Could not load libraries",
+              body:
+                "The Astraeus API could not be reached, so the library list is unknown. " +
+                "This is a loading failure, not an empty server.",
+              actions: [
+                el("button", {
+                  type: "button",
+                  class: "btn btn-accent",
+                  "data-action": "retry-boot",
+                  text: "Retry",
+                }),
+              ],
+            })
+          : canvasState({
+              title: "No libraries yet",
+              body:
+                "Astraeus has no libraries registered. Create one with POST /api/libraries, " +
+                "then reload this page to browse it.",
+            })
       );
       return;
     }
@@ -1062,15 +1093,16 @@
         el("h1", { class: "browse-title", text: library.name || "Untitled library" }),
         el("p", {
           class: "browse-sub",
-          text:
-            (library.path || "No path recorded") +
-            " · " +
-            formatCount(state.entities.length) +
-            " " +
-            plural(state.entities.length, "entity", "entities") +
-            " · " +
-            formatCount(incomplete) +
-            " incomplete",
+          text: state.entitiesFailed
+            ? library.path || "No path recorded"
+            : (library.path || "No path recorded") +
+              " · " +
+              formatCount(state.entities.length) +
+              " " +
+              plural(state.entities.length, "entity", "entities") +
+              " · " +
+              formatCount(incomplete) +
+              " incomplete",
         }),
       ]),
     ]);
@@ -1079,6 +1111,26 @@
 
     if (state.loading && state.entities.length === 0) {
       browse.append(el("p", { class: "browse-sub", text: "Loading entities…" }));
+    } else if (state.entitiesFailed) {
+      /* The list never arrived. Saying "empty" here would tell the user their
+         media is gone and offer to re-scan a library that is perfectly fine. */
+      browse.append(
+        canvasState({
+          title: "Could not load this library's entities",
+          body:
+            "The request for the contents of “" +
+            (library.name || "this library") +
+            "” failed, so this list is unknown — not necessarily empty. The library itself is untouched.",
+          actions: [
+            el("button", {
+              type: "button",
+              class: "btn btn-accent",
+              "data-action": "retry-route",
+              text: "Retry",
+            }),
+          ],
+        })
+      );
     } else if (state.entities.length === 0) {
       browse.append(
         canvasState({
@@ -1500,8 +1552,20 @@
     const playable = isLeafType(entity.type) && hasObjects;
     const live = isCurrent && playbackIsLive(pb);
     const growing = live && isEventPlaylistPlayback();
-    const bounds = live ? seekableBounds() : { start: 0, end: 0 };
-    const duration = bounds.end > 0 ? bounds.end : mediaInfoDuration(pb);
+    /* Two clocks meet here. The element and `seekableBounds()` speak MEDIA
+       time, which restarts at zero for each session; the viewer sees SOURCE
+       time, where source = media + sessionStart. Anything shown must go
+       through these helpers, or a session resumed an hour in reports the
+       produced part as if it began at the opening titles. */
+    const sourceTotal = isCurrent ? sourceDurationOf(pb) : 0;
+    const produced = live ? producedWindow(pb) : null;
+    const producedTo = produced ? produced.to : 0;
+    const durationText =
+      growing && producedTo > 0
+        ? "produced " + formatClock(producedTo)
+        : sourceTotal > 0
+        ? formatClock(sourceTotal)
+        : "";
 
     const children = [];
 
@@ -1524,12 +1588,7 @@
                 text: pb.mediaInfo.width + "×" + pb.mediaInfo.height,
               })
             : null,
-          duration > 0
-            ? el("span", {
-                class: "chip",
-                text: (growing ? "produced " : "") + formatClock(duration),
-              })
-            : null,
+          durationText ? el("span", { class: "chip", text: durationText }) : null,
           /* What the server actually chose, when it is not the source height. */
           pb.targetHeight > 0 && pb.targetHeight !== sourceHeightOf(pb)
             ? el("span", { class: "chip", text: "playing at " + pb.targetHeight + "p" })
@@ -1538,14 +1597,16 @@
       );
     }
 
-    /* Say plainly that a segmented stream is being produced as it plays. */
-    if (growing) {
+    /* Say plainly how far ahead this session can jump without re-buffering.
+       Same source-time basis as the readout `syncTransport` maintains, so the
+       two never disagree. */
+    if (growing && producedTo > 0) {
       children.push(
         el("p", { class: "delivery-facts" }, [
           el("span", {
             class: "chip chip-live",
             id: "player-window",
-            text: "Growing · seekable to " + formatClock(bounds.end),
+            text: "Produced to " + formatClock(producedTo),
           }),
         ])
       );
@@ -1608,6 +1669,9 @@
     }
     if (status === "segmented") return segmentedMessage(pb, pb.segmentedCause);
     if (status === "ready" || status === "playing" || status === "paused") {
+      if (pb.blockedAutoplay) {
+        return "The browser would not start this stream on its own — press Play to begin. The session is ready; nothing has failed.";
+      }
       if (pb.mode === "direct_play") {
         return "Direct play: the server is sending the original file over HTTP range requests, so seeking is exact.";
       }
@@ -1883,11 +1947,15 @@
     syncTransport();
   });
   playerVideo.addEventListener("play", function () {
+    /* The sidebar note may still be explaining an autoplay block. */
+    const wasBlocked = state.playback.blockedAutoplay === true;
     state.playback.started = true;
     state.playback.status = "ready";
+    state.playback.blockedAutoplay = false;
     syncTransport();
     showPlayerControls();
     scheduleControlsHide();
+    if (wasBlocked) render();
   });
   playerVideo.addEventListener("pause", function () {
     syncTransport();
@@ -1932,6 +2000,9 @@
   /* ── hls.js: lazily loaded, single instance, always torn down ────────── */
 
   const HLS_SCRIPT_SRC = "vendor/hls.min.js";
+  /* A stalled request must not hang the player on a spinner forever; matches
+     the API client's own request budget. */
+  const HLS_SCRIPT_TIMEOUT_MS = 15000;
 
   /* One injection for the life of the page. Rejected loads reset the promise
      so a later attempt can retry rather than caching the failure forever. */
@@ -1947,30 +2018,57 @@
 
   function loadHlsLibrary() {
     if (window.Hls) return Promise.resolve(window.Hls);
+    /* One injection per page, one promise per injection. Returning the cached
+       promise is what keeps concurrent callers sharing it — the executor must
+       never decide to "wait for the one in flight", because that promise is
+       this one and nothing would ever settle it. */
     if (hlsLoaderPromise) return hlsLoaderPromise;
 
     hlsLoaderPromise = new Promise(function (resolve, reject) {
-      if (hlsScriptElement && hlsScriptElement.parentNode) {
-        /* An injection is already in flight; its own handlers will settle. */
-        return;
+      /* A script left behind by an earlier failed attempt has already had its
+         chance; keeping it would also make the old code's in-flight check
+         below misfire. Clear it before injecting a fresh one. */
+      if (hlsScriptElement) {
+        hlsScriptElement.remove();
+        hlsScriptElement = null;
       }
+
+      let settled = false;
+      const timer = setTimeout(function () {
+        fail(new Error("timed out loading " + HLS_SCRIPT_SRC));
+      }, HLS_SCRIPT_TIMEOUT_MS);
+
+      function succeed(HlsCtor) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(HlsCtor);
+      }
+
+      function fail(error) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (hlsScriptElement) {
+          hlsScriptElement.remove();
+          hlsScriptElement = null;
+        }
+        /* Drop the cache so a retry can inject again rather than awaiting a
+           promise that has already failed. */
+        hlsLoaderPromise = null;
+        reject(error);
+      }
+
       const script = document.createElement("script");
       script.src = HLS_SCRIPT_SRC;
       script.async = true;
       script.dataset.astraeusHls = "1";
       script.addEventListener("load", function () {
-        if (window.Hls) {
-          resolve(window.Hls);
-        } else {
-          hlsLoaderPromise = null;
-          reject(new Error("hls.js loaded but did not expose window.Hls"));
-        }
+        if (window.Hls) succeed(window.Hls);
+        else fail(new Error("hls.js loaded but did not expose window.Hls"));
       });
       script.addEventListener("error", function () {
-        hlsLoaderPromise = null;
-        script.remove();
-        hlsScriptElement = null;
-        reject(new Error("could not load " + HLS_SCRIPT_SRC));
+        fail(new Error("could not load " + HLS_SCRIPT_SRC));
       });
       hlsScriptElement = script;
       document.head.append(script);
@@ -2197,13 +2295,29 @@
     if (!error) return;
     /* A newer load superseded this one; not a failure worth reporting. */
     if (error.name === "AbortError") return;
-    const message =
-      error.name === "NotAllowedError"
-        ? "The browser blocked playback until you interact with the page. Press Play to start."
-        : "The browser could not start playback: " + (error.message || error.name) + ".";
+
+    if (error.name === "NotAllowedError") {
+      /* Every play() in this file runs after an await, so it sits outside the
+         user-gesture task and an autoplay block is the common case, not an
+         edge case. The stream is attached and ready — it was simply not
+         allowed to start. Leaving the status at "ready" is what makes the next
+         Play press toggle playback, instead of negotiating a second session
+         and leaving a second ffmpeg running for a stream that already exists. */
+      state.playback.status = "ready";
+      state.playback.blockedAutoplay = true;
+      const blocked =
+        "The browser blocked playback until you interact with the page. Press Play to start.";
+      setActionStatus(blocked, null);
+      toast(blocked, "warn");
+      render();
+      return;
+    }
+
+    /* A genuine media failure: this one really is an error. */
     state.playback.status = "error";
+    const message = "The browser could not start playback: " + (error.message || error.name) + ".";
     setActionStatus(message, "error");
-    toast(message, "warn");
+    toast(message, "error");
     render();
   }
 
@@ -2398,7 +2512,24 @@
       if (sub.default === true && defaultKey === null) defaultKey = key;
     }
 
-    pb.subtitleSelection = defaultKey !== null ? defaultKey : "off";
+    /* A re-negotiation rebuilds the tracks, and the server stamps its own
+       `default` disposition on the new ones. Re-applying that would silently
+       undo a deliberate choice — turning subtitles back on for someone who
+       picked Off, or moving them off their language. So a preference carried
+       across the switch wins whenever its track still exists; only a track
+       that has gone away falls back to the server's default. */
+    const preferred = pb.subtitlePreference;
+    const keys = subtitleTrackRefs.map(function (ref) {
+      return ref.key;
+    });
+    if (preferred === "off") {
+      pb.subtitleSelection = "off";
+    } else if (preferred && keys.indexOf(preferred) !== -1) {
+      pb.subtitleSelection = preferred;
+    } else {
+      pb.subtitleSelection = defaultKey !== null ? defaultKey : "off";
+    }
+    pb.subtitlePreference = null;
     applySubtitleModes();
   }
 
@@ -2500,8 +2631,11 @@
   function buildPlayerBar(pb) {
     const live = playbackIsLive(pb);
     const playing = live && !playerVideo.paused && !playerVideo.ended;
-    const bounds = live ? seekableBounds() : { start: 0, end: 0 };
-    const seekable = live && bounds.end > 0;
+    /* Source time, like syncTransport — the bar spans the whole film, not just
+       what this session has produced. */
+    const total = sourceDurationOf(pb);
+    const now = live ? currentSourceTime(pb) : 0;
+    const seekable = live && total > 0;
     const growing = live && isEventPlaylistPlayback();
 
     const toggle = el("button", {
@@ -2566,24 +2700,22 @@
       class: "seek",
       id: "player-seek",
       "data-focus-key": "seek",
-      min: String(bounds.start),
-      max: String(seekable ? bounds.end : 100),
+      min: "0",
+      max: String(seekable ? total : 100),
       step: "0.1",
-      value: String(seekable ? Math.min(Math.max(pb.currentTime, bounds.start), bounds.end) : 0),
+      value: String(seekable ? Math.min(Math.max(now, 0), total) : 0),
       disabled: !seekable,
       "aria-label": growing ? "Seek within the produced part of the stream" : "Seek position",
       "aria-describedby": "playback-note",
       "aria-valuetext": seekable
-        ? formatClock(pb.currentTime) + " of " + formatClock(bounds.end)
+        ? formatClock(now) + " of " + formatClock(total)
         : "unavailable",
     });
 
     const time = el("span", {
       class: "player-time",
       id: "player-time",
-      text: seekable
-        ? formatClock(pb.currentTime) + " / " + formatClock(bounds.end)
-        : "0:00 / 0:00",
+      text: seekable ? formatClock(now) + " / " + formatClock(total) : "0:00 / 0:00",
     });
 
     const rows = [
@@ -3153,8 +3285,15 @@
     }
     if (pb.entityId === entity.id && pb.status === "loading") return;
 
-    /* Already negotiated for this entity — the button is a play/pause toggle. */
-    if (pb.entityId === entity.id && (pb.status === "ready" || pb.status === "playing" || pb.status === "paused")) {
+    /* Already negotiated for this entity, so Play toggles the element rather
+       than negotiating again. "ready" is where a refused autoplay lands — the
+       stream is attached, only the start was refused — and it must toggle
+       here, not open a second session for a stream that already exists. */
+    if (
+      pb.entityId === entity.id &&
+      pb.url &&
+      (pb.status === "ready" || pb.status === "playing" || pb.status === "paused")
+    ) {
       togglePlayPause();
       return;
     }
@@ -3352,6 +3491,10 @@
     const wasPlaying = !playerVideo.paused && !playerVideo.ended;
     const previousMaxHeight = pb.maxHeight;
     const previousSessionId = pb.sessionId;
+    /* The tracks are about to be rebuilt from the new response, which carries
+       the server's own `default` disposition again; carry the viewer's actual
+       choice across so re-negotiating never rewrites it. */
+    pb.subtitlePreference = pb.subtitleSelection;
 
     pb.qualityBusy = true;
     pb.status = "loading";
@@ -3531,16 +3674,20 @@
       }
       state.libraryId = library.id;
       state.loading = true;
+      state.entitiesFailed = false;
       setAmbient(library);
       render();
       try {
         await refreshEntities(library.id);
         if (token !== state.loadToken) return;
+        state.entitiesFailed = false;
         clearError();
       } catch (error) {
         if (token !== state.loadToken) return;
         state.entities = [];
         state.entitiesLibraryId = null;
+        /* Distinguish "could not fetch" from "fetched, and it is empty". */
+        state.entitiesFailed = true;
         showError("Could not load entities for “" + (library.name || "library") + "”. " + error.message, function () {
           applyRoute(route);
         });
@@ -3607,12 +3754,15 @@
 
   async function boot() {
     state.booted = false;
+    state.librariesFailed = false;
     render();
     try {
       await loadLibraries();
     } catch (error) {
       state.booted = true;
       state.libraries = [];
+      /* Remember that this was a failure, not an empty server. */
+      state.librariesFailed = true;
       render();
       showError("Could not load libraries. " + error.message, function () {
         boot();
@@ -3687,6 +3837,11 @@
       toggleFullscreen();
     } else if (action === "toggle-mute") {
       toggleMute();
+    } else if (action === "retry-boot") {
+      boot();
+    } else if (action === "retry-route") {
+      /* Independent of the banner's retry, which Dismiss clears. */
+      if (state.route) applyRoute(state.route);
     } else if (action === "toggle-filter") {
       state.filterIncomplete = !state.filterIncomplete;
       render();

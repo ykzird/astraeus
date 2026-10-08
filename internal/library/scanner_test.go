@@ -443,3 +443,173 @@ func TestScanner_ScanLibrary_CountsDistinctEntities(t *testing.T) {
 		t.Errorf("entities reused = %d, want 5", third.EntitiesReused)
 	}
 }
+
+// TestScanner_PrunesFilesThatAreGone covers ghost entries: a file removed from
+// disk must stop being listed, and entities left holding nothing must go with
+// it, upwards through the hierarchy.
+func TestScanner_PrunesFilesThatAreGone(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	seasonDir := filepath.Join(root, "Astraeus Show", "Season 1")
+	first := filepath.Join(seasonDir, "S01E01 - Pilot.mkv")
+	second := filepath.Join(seasonDir, "S01E02 - Descent.mkv")
+	writeFile(t, first, "video")
+	writeFile(t, second, "video")
+
+	repo := newTestRepo(t)
+	lib := mustLibraryAt(t, repo, root, ShowsLibrary)
+	scanner := NewScanner(repo, newTestLogger())
+
+	initial, err := scanner.ScanLibrary(context.Background(), lib)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if initial.FilesSeen != 2 {
+		t.Fatalf("files seen = %d, want 2", initial.FilesSeen)
+	}
+	if initial.ObjectsPruned != 0 || initial.EntitiesPruned != 0 {
+		t.Errorf("a first scan must not prune anything: %+v", initial)
+	}
+
+	// Remove one episode and rescan.
+	if err := os.Remove(second); err != nil {
+		t.Fatalf("removing the file: %v", err)
+	}
+	after, err := scanner.ScanLibrary(context.Background(), lib)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	if after.ObjectsPruned != 1 {
+		t.Errorf("objects pruned = %d, want 1", after.ObjectsPruned)
+	}
+
+	entities, err := repo.ListEntitiesByLibrary(context.Background(), lib.ID)
+	if err != nil {
+		t.Fatalf("listing entities: %v", err)
+	}
+	for _, entity := range entities {
+		if entity.Name == "S01E02 - Descent" {
+			t.Error("the episode for a deleted file is still listed")
+		}
+	}
+	if !hasEntityNamed(entities, "Astraeus Show") {
+		t.Error("the series was pruned even though an episode remains")
+	}
+
+	// Remove the last file: the whole hierarchy should go.
+	if err := os.Remove(first); err != nil {
+		t.Fatalf("removing the last file: %v", err)
+	}
+	// The library now looks empty, and that is the ambiguous case - so a prune
+	// here is deliberately refused. Deleting the files AND an entity keeps the
+	// scan non-empty while still leaving something to prune.
+	writeFile(t, filepath.Join(root, "Astraeus Show", "Season 1", "S01E03 - New.mkv"), "video")
+	if _, err := scanner.ScanLibrary(context.Background(), lib); err != nil {
+		t.Fatalf("third scan: %v", err)
+	}
+
+	entities, err = repo.ListEntitiesByLibrary(context.Background(), lib.ID)
+	if err != nil {
+		t.Fatalf("listing entities: %v", err)
+	}
+	if hasEntityNamed(entities, "S01E01 - Pilot") {
+		t.Error("the deleted episode survived a scan that saw other files")
+	}
+	if !hasEntityNamed(entities, "S01E03 - New") {
+		t.Error("the new episode was not created")
+	}
+}
+
+// TestScanner_DoesNotPruneWhenTheScanIsBlind is the guard that matters most. An
+// unmounted drive or an unreadable tree must never be mistaken for a user
+// deleting everything: silently emptying a library is far worse than leaving a
+// ghost entry behind.
+func TestScanner_DoesNotPruneWhenTheScanIsBlind(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "Astraeus Show", "Season 1", "S01E01 - Pilot.mkv"), "video")
+
+	repo := newTestRepo(t)
+	lib := mustLibraryAt(t, repo, root, ShowsLibrary)
+	scanner := NewScanner(repo, newTestLogger())
+
+	if _, err := scanner.ScanLibrary(context.Background(), lib); err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+
+	before, err := repo.ListEntitiesByLibrary(context.Background(), lib.ID)
+	if err != nil {
+		t.Fatalf("listing entities: %v", err)
+	}
+	if len(before) == 0 {
+		t.Fatal("the first scan created nothing, so this test proves nothing")
+	}
+
+	// Every file disappears at once - the shape of an unmounted drive.
+	if err := os.RemoveAll(filepath.Join(root, "Astraeus Show")); err != nil {
+		t.Fatalf("emptying the library: %v", err)
+	}
+
+	result, err := scanner.ScanLibrary(context.Background(), lib)
+	if err != nil {
+		t.Fatalf("scan of the emptied path: %v", err)
+	}
+	if result.FilesSeen != 0 {
+		t.Fatalf("files seen = %d, want 0", result.FilesSeen)
+	}
+	if result.ObjectsPruned != 0 || result.EntitiesPruned != 0 {
+		t.Errorf("a blind scan pruned data: %+v", result)
+	}
+
+	after, err := repo.ListEntitiesByLibrary(context.Background(), lib.ID)
+	if err != nil {
+		t.Fatalf("listing entities: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Errorf("entities went from %d to %d: an empty scan must not delete a library",
+			len(before), len(after))
+	}
+}
+
+// TestDeleteLibrary_WithHierarchyAndForeignKeys covers a path that only became
+// reachable when foreign keys were switched on: objects reference entities and
+// entities reference their parent, so a deletion order that removes a parent
+// first would now fail outright.
+func TestDeleteLibrary_WithHierarchyAndForeignKeys(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	lib := mustCreateLibrary(t, repo, "Hierarchy", ShowsLibrary)
+
+	series := mustCreateEntity(t, repo, lib.ID, nil, SeriesEntity, "Show")
+	season := mustCreateEntity(t, repo, lib.ID, &series.ID, SeasonEntity, "Season 1")
+	episode := mustCreateEntity(t, repo, lib.ID, &season.ID, EpisodeEntity, "Episode 1")
+
+	if err := repo.CreateObject(ctx, &MediaObject{
+		ID:            uuid.NewString(),
+		MediaEntityID: episode.ID,
+		FilePath:      filepath.Join(t.TempDir(), "s01e01.mkv"),
+		Size:          10,
+		MimeType:      "video/x-matroska",
+		CreatedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("creating object: %v", err)
+	}
+
+	if err := repo.DeleteLibrary(ctx, lib.ID); err != nil {
+		t.Fatalf("deleting a hierarchical library: %v", err)
+	}
+}
+
+// hasEntityNamed reports whether any entity carries this name.
+func hasEntityNamed(entities []MediaEntity, name string) bool {
+	for _, entity := range entities {
+		if entity.Name == name {
+			return true
+		}
+	}
+	return false
+}
