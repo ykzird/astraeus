@@ -817,7 +817,7 @@ go test -tags=integration -run OCR ./internal/subtitles/
 ```
 
 ```sh
-node --test web/                         # the front end's pure core
+node --test web/*.test.js                         # the front end's pure core
 node --check web/app.js                  # the rest of the UI parses
 ```
 

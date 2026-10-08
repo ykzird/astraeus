@@ -33,10 +33,22 @@ jobs:
       # assert the segments that come out, so the runner needs them installed.
       # tesseract is optional to the server but not to the OCR test: without it
       # that test skips, so installing it is what makes CI cover the path.
+      #
+      # Only what is missing is installed, and the download is retried: apt on a
+      # shared runner has taken seventeen minutes for one package, and paying
+      # that when the tool is already on the image is pure waste.
       - name: Install ffmpeg and tesseract
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr
+          missing=()
+          command -v ffmpeg >/dev/null || missing+=(ffmpeg)
+          command -v tesseract >/dev/null || missing+=(tesseract-ocr)
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "ffmpeg and tesseract are already on the runner"
+            exit 0
+          fi
+          echo "installing: ${missing[*]}"
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 "${missing[@]}"
 
       # Formatting is a test here because this project has no other gate on it.
       - name: Check formatting
@@ -70,8 +82,12 @@ jobs:
 
       # The pure timeline core is unit-tested with Node's own runner, so this
       # needs no npm install and no lockfile.
+      #
+      # The files are named rather than the directory: whether `--test` accepts a
+      # directory depends on the Node version, and the runner's is not this
+      # machine's. Naming them works on every version that has `--test` at all.
       - name: Test the web core
-        run: node --test web/
+        run: node --test web/*.test.js
 
   secrets:
     name: Scan for secrets

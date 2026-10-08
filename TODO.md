@@ -136,7 +136,7 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Navigation sidebar (libraries, scan, enrich, incomplete filter)
 - [x] Glassmorphism panels + neobrutalist interaction elements
 - [x] The front end's pure timeline maths extracted to `web/core.js` and unit
-      tested with Node's own runner (`node --test web/`), so the source↔media
+      tested with Node's own runner (`node --test web/*.test.js`), so the source↔media
       time conversion, the produced window and the clock have a seam that a
       browser is not needed to test
 - [x] Served by the binary from `--web-dir`, same origin as the API
