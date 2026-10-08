@@ -104,6 +104,7 @@ const SNAPSHOT = `(() => {
   const mute = document.getElementById("player-mute");
   const volume = document.getElementById("player-volume");
   const quality = document.getElementById("player-quality");
+  const audio = document.getElementById("player-audio-track");
   const timeText = document.getElementById("player-time");
   return {
     hasVideo: !!video,
@@ -117,6 +118,11 @@ const SNAPSHOT = `(() => {
     qualityFound: !!quality,
     qualityOptions: quality ? Array.from(quality.options).map((o) => ({ value: o.value, label: o.textContent.trim() })) : [],
     qualityValue: quality ? quality.value : null,
+    audioFound: !!audio,
+    // The labels are read off the rendered options, so a stale or empty menu
+    // cannot pass on a list the harness guessed for it.
+    audioOptions: audio ? Array.from(audio.options).map((o) => ({ value: o.value, label: o.textContent.trim() })) : [],
+    audioValue: audio ? audio.value : null,
     timeText: timeText ? timeText.textContent.trim() : null,
     storedAudio: (() => { try { return localStorage.getItem("astraeus.audio"); } catch (e) { return null; } })(),
     subtitleKeys: Array.from(document.querySelectorAll('[data-action="select-subtitle"]'))
@@ -175,6 +181,52 @@ async function pressKey(cdp, key, code, keyCode, text) {
   const base = { key, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode };
   await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base, ...(text ? { text } : {}) });
   await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+}
+
+/*
+ * How many audio tracks the entity really has.
+ *
+ * The player keeps `media_info` inside its own closure, so unlike the rest of
+ * the snapshot it cannot be read out of the page. Re-negotiating with the app's
+ * own capability manifest asks the same prober the same question, so the answer
+ * is the same list the menu was built from. Any session that negotiation
+ * started is stopped again, or a missing control would leave a transcoder
+ * running for a check that may not even have failed.
+ */
+async function negotiatedAudioTrackCount() {
+  try {
+    const res = await fetch(baseUrl + "/api/entities/" + encodeURIComponent(entityId) + "/playback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // Mirrors playbackRequestBody(0, null) in web/app.js: a body replaces the
+      // server's browser defaults outright, so the whole profile has to travel.
+      body: JSON.stringify({
+        containers: ["mp4", "webm", "hls"],
+        video_codecs: ["h264", "vp9", "av1"],
+        audio_codecs: ["aac", "opus", "mp3", "vorbis"],
+        max_width: 1920,
+        max_bitrate_kbps: 120000,
+        max_bit_depth: 8,
+        max_audio_channels: 2,
+        supports_hdr: false,
+        supports_hls: true,
+        subtitles: true,
+      }),
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok || !body) return null;
+    if (body.session_id) {
+      // Best effort: the idle reaper is the backstop if this release fails.
+      await fetch(baseUrl + "/api/streams/" + encodeURIComponent(body.session_id), { method: "DELETE" }).catch(() => {});
+    }
+    const info = body.media_info;
+    // "No tracks" and "could not tell" are different answers: only the first can
+    // justify a missing menu, so a missing media_info reports null.
+    if (!info || typeof info !== "object") return null;
+    return Array.isArray(info.audio_tracks) ? info.audio_tracks.length : 0;
+  } catch (error) {
+    return null;
+  }
 }
 
 async function main() {
@@ -363,6 +415,22 @@ async function main() {
       typeof afterVolume.storedAudio === "string" && afterVolume.storedAudio.length > 0,
     "video.volume=" + afterVolume.volume + " stored=" + JSON.stringify(afterVolume.storedAudio));
 
+  /* ---- audio track menu ---- */
+  // The menu is built from the negotiated track list, so it can only be there
+  // when there is a real choice. When it is missing, the same list still has to
+  // say so, or a control that quietly disappeared would pass for a silent film.
+  let audioChoice = null;
+  if (state.audioFound) {
+    record("the audio menu offers more than one choice",
+      state.audioOptions.length >= 2,
+      "options=" + JSON.stringify(state.audioOptions.map((o) => o.label)));
+  } else {
+    const trackCount = await negotiatedAudioTrackCount();
+    record("an absent audio menu is justified by fewer than two audio tracks",
+      trackCount !== null && trackCount < 2,
+      "media_info.audio_tracks=" + (trackCount === null ? "unavailable" : trackCount));
+  }
+
   /* ---- quality control, and the resume it depends on ---- */
   if (state.qualityFound) {
     record("the quality menu offers more than one choice",
@@ -424,6 +492,47 @@ async function main() {
       note("chose subtitle track " + JSON.stringify(subtitleChoice) + " before switching quality");
     }
 
+    /* Audio mirrors quality: a different track is a re-negotiation that has to
+       keep playing and land near where the viewer was. It runs here, after the
+       seek, so the position is far enough from zero for the resume check to
+       mean anything. The choice is remembered for the quality switch below,
+       which has to carry it across. */
+    if (state.audioFound) {
+      // Read the current selection live: the seek above re-negotiated, and the
+      // menu may already show a different server default than it did at start.
+      const audioNow = await cdp.eval(SNAPSHOT);
+      const audioTarget = audioNow.audioOptions.find((o) => o.value !== audioNow.audioValue);
+      note("switching audio track to " + (audioTarget ? audioTarget.label : "(none available)"));
+      if (audioTarget) {
+        await cdp.eval(`(() => {
+          const a = document.getElementById("player-audio-track");
+          if (!a) return null;
+          a.value = ${JSON.stringify(audioTarget.value)};
+          a.dispatchEvent(new Event("change", { bubbles: true }));
+          return a.value;
+        })()`);
+        audioChoice = audioTarget.value;
+
+        // A switch re-negotiates, so allow time for the new session to start.
+        let switched = null;
+        const audioDeadline = Date.now() + 90000;
+        while (Date.now() < audioDeadline) {
+          switched = await cdp.eval(SNAPSHOT);
+          if (switched.readyState >= 2 && switched.currentTime > 0.2) break;
+          await sleep(1500);
+        }
+        record("audio switching keeps playing",
+          switched !== null && switched.readyState >= 2 && switched.currentTime > 0.2,
+          switched ? "currentTime=" + (switched.currentTime || 0).toFixed(2) +
+            " readyState=" + switched.readyState : "no state");
+
+        const afterAudio = parseClock(switched ? switched.timeText : null);
+        record("audio switching resumes near where the viewer was, not at zero",
+          before !== null && afterAudio !== null && afterAudio > 20 && Math.abs(afterAudio - before) < 120,
+          "clock " + (afterSeek ? afterSeek.timeText : "?") + " -> " + (switched ? switched.timeText : "?"));
+      }
+    }
+
     // Choose a different rendition, preferring the lowest to make the switch cheap.
     const target = state.qualityOptions
       .filter((o) => o.value && o.value !== state.qualityValue)
@@ -458,12 +567,24 @@ async function main() {
           "chose " + JSON.stringify(subtitleChoice) + " after switch " + JSON.stringify(kept.subtitleChecked));
       }
 
+      // Audio has the same property as the subtitle radios: the server's default
+      // track must not quietly win back the track the viewer chose.
+      if (audioChoice !== null) {
+        const keptAudio = await cdp.eval(SNAPSHOT);
+        record("the audio choice survives re-negotiation",
+          String(keptAudio.audioValue) === String(audioChoice),
+          "chose " + JSON.stringify(audioChoice) + " after switch " + JSON.stringify(keptAudio.audioValue));
+      }
+
       record("quality switching resumes near where the viewer was, not at zero",
         before !== null && after !== null && after > 20 && Math.abs(after - before) < 120,
         "clock " + (afterSeek ? afterSeek.timeText : "?") + " -> " + (resumed ? resumed.timeText : "?"));
     }
   } else {
     note("no quality menu found (expected only for a transcoded session)");
+    if (state.audioFound) {
+      note("skipped the audio-switch checks: they reuse the offset the seek establishes");
+    }
   }
 
   /* ---- auto-hide while playing ---- */

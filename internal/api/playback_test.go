@@ -528,3 +528,90 @@ func TestStopStream(t *testing.T) {
 		}
 	})
 }
+
+// multiTrackProber is a film with two audio tracks, the second marked default.
+func multiTrackProber() stubProber {
+	return stubProber{info: &streaming.MediaInfo{
+		Container: "matroska", VideoCodec: "h264",
+		AudioCodec: "ac3", AudioChannels: 6, AudioBitrateKbps: 448,
+		Width: 1920, Height: 1080, BitrateKbps: 8_000,
+		AudioTracks: []streaming.AudioTrack{
+			{Index: 1, Codec: "aac", Channels: 2, BitrateKbps: 128, Language: "eng"},
+			{Index: 3, Codec: "ac3", Channels: 6, BitrateKbps: 448, Language: "deu", Default: true},
+		},
+	}}
+}
+
+// TestPlayback_UnknownAudioTrackIsRejected covers the API's half of the audio
+// choice: a client that names a track the file does not have is told what it
+// does have, rather than being quietly given a different track.
+func TestPlayback_UnknownAudioTrackIsRejected(t *testing.T) {
+	t.Parallel()
+
+	env := newTestEnv(t, withProber(multiTrackProber()), withStreams(&fakeStreams{}))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "matroska bytes")
+
+	recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback",
+		`{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],"supports_hls":true,"audio_track_index":9}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"unknown_audio_track", "3 (deu ac3 6ch)", "1 (eng aac 2ch)"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the rejection should tell the client what exists, missing %q: %s", want, body)
+		}
+	}
+}
+
+// TestPlayback_ChosenAudioTrackIsDelivered covers the accepted path: the track
+// the client asks for is the one the decision names and the one a session would
+// map.
+func TestPlayback_ChosenAudioTrackIsDelivered(t *testing.T) {
+	t.Parallel()
+
+	streams := &fakeStreams{}
+	env := newTestEnv(t, withProber(multiTrackProber()), withStreams(streams))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "matroska bytes")
+
+	recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback",
+		`{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],"supports_hls":true,"audio_track_index":1}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+
+	response := decodeBody[playbackResponse](t, recorder)
+	if response.Decision.TargetAudioStreamIndex != 1 {
+		t.Errorf("target audio stream = %d, want 1", response.Decision.TargetAudioStreamIndex)
+	}
+	if response.Decision.AudioAction != streaming.ActionCopy {
+		t.Errorf("audio action = %q, want copy: track 1 is stereo AAC", response.Decision.AudioAction)
+	}
+	// The response carries the whole track list, so a player can offer the
+	// choice without probing the file itself.
+	if len(response.MediaInfo.AudioTracks) != 2 {
+		t.Errorf("media_info.audio_tracks = %+v, want both tracks", response.MediaInfo.AudioTracks)
+	}
+	if streams.started != 1 {
+		t.Errorf("sessions started = %d, want 1", streams.started)
+	}
+}
+
+// TestPlayback_NoAudioChoiceUsesTheDefaultTrack checks that saying nothing still
+// means "the track the file marks default", not "the first one".
+func TestPlayback_NoAudioChoiceUsesTheDefaultTrack(t *testing.T) {
+	t.Parallel()
+
+	env := newTestEnv(t, withProber(multiTrackProber()), withStreams(&fakeStreams{}))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "matroska bytes")
+
+	recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback",
+		`{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],"supports_hls":true}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	response := decodeBody[playbackResponse](t, recorder)
+	if response.Decision.TargetAudioStreamIndex != 3 {
+		t.Errorf("target audio stream = %d, want the default track's 3", response.Decision.TargetAudioStreamIndex)
+	}
+}

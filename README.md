@@ -25,6 +25,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | REST API | Done. Libraries, entities, scanning, enrichment, playback, artwork, subtitles |
 | Capability negotiation | Done. Direct play / remux / transcode, with reasons |
 | Segmented streaming | Done. HLS via ffmpeg, passthrough or transcode |
+| Audio tracks | Done. Every track is probed and listed; a client picks one by stream index, and the file's own default is delivered when it does not |
 | Adaptive bitrate | Done. A manifest that omits `max_height` gets a master playlist with up to three rungs, each with its own ceiling; naming a height gets one rendition |
 | HDR and Dolby Vision | Detected from the source's colour tags; **tone mapped to SDR** for clients that cannot show it, and passed through at 10 bits for those that can. Dolby Vision profile 8 keeps its HDR10 base layer; profile 5 is flagged as approximate |
 | Hardware acceleration | NVENC, QuickSync, VideoToolbox, VAAPI and AMF, each **verified by running it with the real options** at startup; rejected encoders report why; software fallback |
@@ -254,7 +255,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.5.0`).
+identifier (currently `0.6.0`).
 
 ## HTTP API
 
@@ -324,6 +325,7 @@ Errors are `{"code": "...", "message": "..."}` with a matching status code.
   "max_bit_depth": 8,
   "max_audio_channels": 2,
   "supports_hdr": false,
+  "audio_track_index": 0,
   "supports_hls": true,
   "subtitles": true
 }
@@ -382,7 +384,8 @@ video after the audio); the reasons explain why.
 The decision also carries the concrete targets it chose — `target_height` for a
 downscale, `target_audio_channels` for a downmix, `target_dynamic_range` for
 the delivered video's dynamic range, `target_bitrate_kbps` for a bitrate ceiling,
-and `renditions` for a ladder — so a client can see not just that it will be
+`target_audio_stream_index` for the audio track that was actually mapped, and
+`renditions` for a ladder — so a client can see not just that it will be
 re-encoded but what it will get. A `tone_map` flag says the picture was converted from HDR to SDR, which is a
 visible change rather than a quality trade-off.
 
@@ -419,6 +422,30 @@ source bitrate is not assumed to exceed the limit (the reasons say the limit cou
 not be checked). A limit under 100 kbps is refused as malformed, and one that
 leaves nothing for video after the audio is a `409` with the arithmetic in the
 reason.
+
+### Audio tracks
+
+A media file can carry several audio tracks, and the server lists all of them in
+`media_info.audio_tracks` — `index` (the ffmpeg stream index, which is what a
+client sends back), `codec`, `channels`, `bitrate_kbps`, `language`, `title` and
+`default`. `audio_track_index` in the request chooses one; **omitting it or
+sending 0 means the server's choice**, which is the track the file marks
+`default`, falling back to the first. That distinction matters: a file whose
+second track is the one marked default is common, and "the first stream wins"
+delivers the wrong language on a file that says which one it means.
+
+The choice is honoured in what arrives, not just in what is reported. Every
+audio decision — codec compatibility, channel count, the bitrate the audio
+reserves — is made about the *chosen* track, and a session maps it by its stream
+index. **A chosen track cannot come from direct play**, because direct play serves
+the original file and the player then picks a track itself; so choosing one
+repackages into HLS with the picture copied and no re-encoding, which is cheap.
+When the chosen track is one the client cannot decode, it is re-encoded and
+downmixed as usual.
+
+An `audio_track_index` naming a track the file does not have is a `400` listing
+the indices that do exist, because the client already had that list. A player can
+therefore offer the choice without probing anything itself.
 
 ### Adaptive bitrate
 

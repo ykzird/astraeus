@@ -78,22 +78,38 @@ func (d DynamicRange) IsHDR() bool {
 	return d == RangeHDR10 || d == RangeHLG
 }
 
+// AudioTrack describes one audio stream in a media file.
+type AudioTrack struct {
+	// Index is the ffmpeg stream index, and it is what selects the track: a
+	// session maps it by global stream index, the same way subtitle extraction
+	// does, so the number a client sends back is the number that appears here.
+	Index       int    `json:"index"`
+	Codec       string `json:"codec"`
+	Channels    int    `json:"channels,omitempty"`
+	BitrateKbps int    `json:"bitrate_kbps,omitempty"`
+	Language    string `json:"language,omitempty"`
+	Title       string `json:"title,omitempty"`
+	// Default is the stream the file itself marks as default. With no explicit
+	// selection this is the track delivered, because it is the one the file's
+	// author intended to be heard.
+	Default bool `json:"default,omitempty"`
+}
+
 // MediaInfo is the subset of technical properties the negotiation needs. It is
 // produced by probing a MediaObject on disk.
 type MediaInfo struct {
 	Container  string `json:"container"`
 	VideoCodec string `json:"video_codec"`
-	AudioCodec string `json:"audio_codec,omitempty"`
-	// AudioChannels is the channel count of the first audio stream. Chromium
-	// refuses a 5.1 AAC SourceBuffer, so this has to be negotiable.
-	AudioChannels int `json:"audio_channels,omitempty"`
-	// AudioBitrateKbps is the first audio stream's bitrate, when the container
-	// states one (Matroska usually does not). It is what makes a client's
-	// *total* bitrate limit actionable rather than approximate: the video
-	// ceiling is the limit minus what the audio will take.
-	AudioBitrateKbps int `json:"audio_bitrate_kbps,omitempty"`
-	Width            int `json:"width,omitempty"`
-	Height           int `json:"height,omitempty"`
+	// AudioCodec, AudioChannels and AudioBitrateKbps describe the track that
+	// will be delivered by default: the one marked default, or the first. They
+	// are the summary a client sees without choosing, and the negotiation
+	// re-reads the selected track from AudioTracks when a client does choose.
+	AudioCodec       string       `json:"audio_codec,omitempty"`
+	AudioChannels    int          `json:"audio_channels,omitempty"`
+	AudioBitrateKbps int          `json:"audio_bitrate_kbps,omitempty"`
+	AudioTracks      []AudioTrack `json:"audio_tracks,omitempty"`
+	Width            int          `json:"width,omitempty"`
+	Height           int          `json:"height,omitempty"`
 	// PixelFormat and BitDepth describe the decoded video. They matter because
 	// a 10-bit stream is not playable in a browser even when its codec name is
 	// one the browser claims to support.
@@ -125,6 +141,85 @@ type MediaInfo struct {
 // display it correctly.
 func (m *MediaInfo) IsHDR() bool {
 	return m != nil && m.DynamicRange.IsHDR()
+}
+
+// ChosenAudioTrack resolves the audio track a client asked for.
+//
+// requested is an ffmpeg stream index, and 0 means "the server's choice": the
+// track the file marks default, or the first. It reports the track, whether the
+// file has any audio at all, and whether an explicit request had to be ignored
+// because no stream carries that index - which the negotiation turns into a
+// reason rather than a failure, since a track that is missing is not a reason to
+// refuse the film.
+//
+// A MediaInfo built by hand rather than probed - as several tests do - has no
+// track list but may carry the summary fields. It is treated as a file with one
+// audio track, which is what those fields describe.
+func (m *MediaInfo) ChosenAudioTrack(requested int) (track AudioTrack, hasAudio bool, ignored bool) {
+	if m == nil {
+		return AudioTrack{}, false, false
+	}
+
+	if len(m.AudioTracks) == 0 {
+		if m.AudioCodec == "" {
+			return AudioTrack{}, false, false
+		}
+		return AudioTrack{
+			Codec:       m.AudioCodec,
+			Channels:    m.AudioChannels,
+			BitrateKbps: m.AudioBitrateKbps,
+		}, true, requested > 0
+	}
+
+	fallback := m.AudioTracks[0]
+	for _, candidate := range m.AudioTracks {
+		if candidate.Default {
+			fallback = candidate
+			break
+		}
+	}
+
+	if requested > 0 {
+		for _, candidate := range m.AudioTracks {
+			if candidate.Index == requested {
+				return candidate, true, false
+			}
+		}
+		return fallback, true, true
+	}
+	return fallback, true, false
+}
+
+// AudioTrackByIndex returns the track with this ffmpeg stream index.
+func (m *MediaInfo) AudioTrackByIndex(index int) (AudioTrack, bool) {
+	if m == nil {
+		return AudioTrack{}, false
+	}
+	for _, track := range m.AudioTracks {
+		if track.Index == index {
+			return track, true
+		}
+	}
+	return AudioTrack{}, false
+}
+
+// AudioTrackLabel names a track for a human, using whatever the file provides
+// and falling back to the codec, which is always there.
+func AudioTrackLabel(track AudioTrack) string {
+	label := track.Language
+	if track.Title != "" {
+		label = track.Title
+	}
+	if label == "" {
+		label = track.Codec
+	}
+	if track.Codec != "" && !strings.Contains(strings.ToLower(label), strings.ToLower(track.Codec)) {
+		label += " " + track.Codec
+	}
+	if track.Channels > 0 {
+		label += fmt.Sprintf(" %dch", track.Channels)
+	}
+	return label
 }
 
 // Prober inspects a media file.
@@ -268,10 +363,26 @@ func mediaInfoFromProbe(output ffprobeOutput, path string) (*MediaInfo, error) {
 				videoSeen = true
 			}
 		case "audio":
+			if stream.CodecName == "" {
+				continue
+			}
+			track := AudioTrack{
+				Index:       stream.Index,
+				Codec:       stream.CodecName,
+				Channels:    stream.Channels,
+				BitrateKbps: atoiSafe(stream.BitRate) / 1000,
+				Language:    stream.Tags.Language,
+				Title:       stream.Tags.Title,
+				Default:     stream.Disposition.Default == 1,
+			}
+			info.AudioTracks = append(info.AudioTracks, track)
+			// The summary describes the first track, which is what a client that
+			// does not choose gets unless the file marks another as default; the
+			// negotiation resolves that case from the list.
 			if info.AudioCodec == "" {
-				info.AudioCodec = stream.CodecName
-				info.AudioChannels = stream.Channels
-				info.AudioBitrateKbps = atoiSafe(stream.BitRate) / 1000
+				info.AudioCodec = track.Codec
+				info.AudioChannels = track.Channels
+				info.AudioBitrateKbps = track.BitrateKbps
 			}
 		case "subtitle":
 			if stream.CodecName == "" {

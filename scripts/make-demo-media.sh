@@ -23,7 +23,7 @@ done
 movies="$media_dir/movies"
 shows_root="$media_dir/shows"
 shows="$shows_root/Astraeus Show/Season 01"
-mkdir -p "$movies/Blade Runner 2049 (2017)" "$shows"
+mkdir -p "$movies/Blade Runner 2049 (2017)" "$movies/Arrival (2016)" "$shows"
 
 # clip <path> [seconds] renders a short H.264/AAC test clip.
 clip() {
@@ -61,11 +61,37 @@ SUBS
   echo "  $(basename "$path")  (with a subrip track)"
 }
 
+# dual_audio_clip <path> renders a clip with two audio tracks that differ in both
+# language and channel count, so the audio menu has something to choose between
+# and the choice is visible in what arrives: track 1 is English stereo, track 2 is
+# German mono and is the track the file marks default. Both are AAC, so a browser
+# takes either as it is.
+#
+# The picture is HEVC, which no browser here decodes, so the server transcodes
+# this clip: that is what makes the quality menu appear alongside the audio one,
+# and it is the combination the interface checks need.
+dual_audio_clip() {
+  local path="$1"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=1280x720:rate=15:duration=4" \
+    -f lavfi -i "sine=frequency=440:duration=4" \
+    -f lavfi -i "sine=frequency=880:duration=4" \
+    -map 0:v -map 1:a -map 2:a \
+    -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p -c:a aac -b:a 96k \
+    -ac:a:0 2 -ac:a:1 1 \
+    -metadata:s:a:0 language=eng -metadata:s:a:0 title="English stereo" \
+    -metadata:s:a:1 language=deu -metadata:s:a:1 title="Deutsch mono" \
+    -disposition:a:0 0 -disposition:a:1 default \
+    -shortest "$path"
+  echo "  $(basename "$path")  (HEVC, two audio tracks, second is default)"
+}
+
 echo "Generating demo media in $media_dir"
 clip "$movies/Blade Runner 2049 (2017)/Blade Runner 2049 (2017).mp4"
 clip "$shows/Astraeus Show S01E01 - Pilot.mkv"
 clip "$shows/Astraeus Show S01E02 - Descent.mp4"
 captioned_clip "$shows/Astraeus Show S01E03 - Captions.mkv"
+dual_audio_clip "$movies/Arrival (2016)/Arrival (2016).mp4"
 
 if [ ! -x "$server" ]; then
   echo

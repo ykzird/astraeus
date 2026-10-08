@@ -1,8 +1,9 @@
 # Handoff
 
 **As of the round-2 work of 2026-10-08 — HDR and Dolby Vision, packaging, the
-bitrate ceiling, and the adaptive bitrate ladder. Version 0.5.0. 90 tracked
-files.** (`git log` names the commits; the previous handoff was `b76a14f`.)
+bitrate ceiling, the adaptive bitrate ladder, and audio track selection. Version
+0.6.0. 90 tracked files.** (`git log` names the commits; the previous handoff was
+`b76a14f`.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -101,6 +102,10 @@ mise exec -- go test -tags=integration -run BitrateCeiling -v ./internal/streami
 # Builds a ladder and asserts the master playlist names every rung and that each
 # rung's produced segment really is the height it was advertised as.
 mise exec -- go test -tags=integration -run TestManager_Ladder -v ./internal/streaming/
+
+# Serves a file with two audio tracks and asserts the *delivered segment* carries
+# the chosen one, which is the check a command-line assertion would miss.
+mise exec -- go test -tags=integration -run TestManager_DeliversTheChosenAudioTrack -v ./internal/streaming/
 
 # The real thing, against the 17 GB film: a browser profile gets bt709/bt709,
 # an HDR manifest gets 10-bit bt2020/PQ. Copy real.db first; *.db is local state.
@@ -275,6 +280,19 @@ HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
 Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 10/10 subtitles. Full Go suite green with race and integration.
 
+**Audio track selection** landed as of 0.6.0. Every audio stream is probed into
+`media_info.audio_tracks` (index, codec, channels, bitrate, language, title,
+default), and `audio_track_index` chooses one; omitting it, or sending 0, means
+the track the file marks `default` — the "first stream wins" behaviour was wrong
+on any file whose second track is the one it means. Every audio decision follows
+the chosen track, and a session maps it by *global* stream index (`-map 0:3?`),
+the same way subtitle extraction already did. A chosen track forces at least a
+remux, because direct play serves the whole file and the player would then pick
+its own track. An index the file does not have is a `400` listing what exists.
+The player got a menu beside the quality control; the fixture for it is the
+dual-audio movie `scripts/make-demo-media.sh` now generates, which is HEVC so the
+clip also transcodes and both menus are present at once.
+
 The **adaptive bitrate ladder** landed as of 0.5.0. The contract is one sentence:
 a manifest that pins `max_height` is asking for one rendition, and one that omits
 it is asking to adapt. A ladder is up to three rungs (the target height, two
@@ -311,11 +329,7 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **Multi-audio-track selection** (the first stream wins today) and **image
-   subtitles** (PGS/VobSub are detected, reported, and refused). Audio selection is
-   the larger half: the probe already lists subtitle tracks, so the pattern to copy
-   is there, and the ffmpeg mapping is `-map 0:a:N` per rendition.
-2. **Resume / watch state.** The hard part already works: a session can start at
+1. **Resume / watch state.** The hard part already works: a session can start at
    an offset, so this is mostly persistence plus a report endpoint.
 3. **CSP and security headers**, **UI unit tests** (the front end is one 133 KB
    file with no seam — `web/core.js` for the pure timeline maths is the cheapest
@@ -364,6 +378,10 @@ Priority order, with the reasoning. Take it top-down.
   `hwupload` per rung on one device, which is plausible but unverified; the
   software fallback after a hardware failure rebuilds the decision for software
   encoders, so a failed ladder should still land somewhere playable.
+- **The audio menu's browser behaviour is verified against the demo library, not
+  the real films.** The 4K films in the real library each carry one audio track,
+  so the menu only appears for the generated dual-audio fixture. The mapping
+  itself is verified at the byte level by the Go integration test.
 - **Ladder cost on a weak host is unmeasured.** The development machine is a
   9700X and transcoded three rungs of 4K-to-820p without complaint. A host with a
   quarter of that CPU would feel it, and there is no rung cap by host.

@@ -684,11 +684,12 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 	args = append(args, encoderInputArgs(encoder, device)...)
 	args = append(args, "-i", inputPath)
 
+	audioMap := audioMapSpec(decision)
 	switch decision.VideoAction {
 	case ActionCopy:
 		args = append(args, "-map", "0:v:0")
 		if decision.AudioAction != ActionNone {
-			args = append(args, "-map", "0:a:0?")
+			args = append(args, "-map", audioMap)
 		}
 		args = append(args, "-c:v", "copy")
 	case ActionTranscode:
@@ -697,7 +698,7 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		for index, plan := range plans {
 			args = append(args, "-map", "0:v:0")
 			if decision.AudioAction != ActionNone {
-				args = append(args, "-map", "0:a:0?")
+				args = append(args, "-map", audioMap)
 			}
 			// The picture plan carries the colour: the tone-map chain tags its
 			// frames BT.709, and an HDR plan tags them BT.2020/PQ, which is what
@@ -763,6 +764,23 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		filepath.Join(dir, MediaPlaylistName),
 	)
 	return args, nil
+}
+
+// audioMapSpec renders the -map specifier for the audio stream this session
+// delivers.
+//
+// It maps by global stream index rather than by the audio-relative form
+// ("0:a:0"), because the track a client chose is identified by its global index
+// in the probe - the same number subtitle extraction maps by - and the two only
+// coincide when the first audio stream is also the chosen one. The trailing "?"
+// keeps a file with no audio stream from failing the session. A decision with no
+// resolved index (a hand-built one, or a source that was never probed for
+// tracks) falls back to the first audio stream, which is what it always meant.
+func audioMapSpec(decision Decision) string {
+	if decision.TargetAudioStreamIndex > 0 {
+		return "0:" + strconv.Itoa(decision.TargetAudioStreamIndex) + "?"
+	}
+	return "0:a:0?"
 }
 
 // MasterPlaylistName and MediaPlaylistName are the two playlist names a session

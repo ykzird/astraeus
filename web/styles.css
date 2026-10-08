@@ -989,7 +989,8 @@ img {
 
 /* Audio and quality, sitting to the right of the transport. */
 .player-audio,
-.player-quality {
+.player-quality,
+.player-audio-track {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1027,7 +1028,8 @@ img {
 
 /* Native select, restyled into the brutalist language — with explicit colours
    so it does not fall back to the OS palette in dark mode. */
-.quality-select {
+.quality-select,
+.audio-select {
   appearance: none;
   -webkit-appearance: none;
   padding: 5px 22px 5px 9px;
@@ -1044,19 +1046,31 @@ img {
   transition: border-color 100ms ease, box-shadow 100ms ease;
 }
 
-.quality-select:hover:not(:disabled) {
+.quality-select:hover:not(:disabled),
+.audio-select:hover:not(:disabled) {
   border-color: var(--brutal-accent);
   box-shadow: 4px 4px 0 var(--brutal-accent);
 }
 
-.quality-select:disabled {
+.quality-select:disabled,
+.audio-select:disabled {
   opacity: 0.55;
   cursor: progress;
 }
 
-.quality-select option {
+.quality-select option,
+.audio-select option {
   background: var(--brutal-surface);
   color: var(--brutal-ink);
+}
+
+/* Track titles are free text of any length; the closed control clips rather
+   than letting a long one shove the transport buttons around. */
+.audio-select {
+  max-width: 22ch;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .player-chrome-title {

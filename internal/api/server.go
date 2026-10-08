@@ -466,6 +466,16 @@ type playbackRequest struct {
 	StartSeconds float64 `json:"start_seconds"`
 }
 
+// audioTrackIndexList renders the indices a client could have meant, so a
+// rejected request tells the caller what the file actually has.
+func audioTrackIndexList(tracks []streaming.AudioTrack) string {
+	indices := make([]string, 0, len(tracks))
+	for _, track := range tracks {
+		indices = append(indices, fmt.Sprintf("%d (%s)", track.Index, streaming.AudioTrackLabel(track)))
+	}
+	return strings.Join(indices, ", ")
+}
+
 // handlePlayback negotiates how to deliver an entity to the calling client and
 // returns the URL to use. The client describes itself in the optional request
 // body; without one, the browser profile is assumed.
@@ -535,6 +545,20 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("start_seconds %.3f is at or past the end of the media (%.3f seconds)",
 				startSeconds, info.DurationSeconds))
 		return
+	}
+
+	// A named audio track that this file does not have is a malformed request,
+	// not an unsupported one: the client was told which indices exist when it
+	// read the entity, so answering 400 with the real list is more useful than
+	// silently delivering a different track. The negotiation would fall back and
+	// explain, but the client should not have to read a reason to find a typo.
+	if capability.AudioTrackIndex > 0 && len(info.AudioTracks) > 0 {
+		if _, ok := info.AudioTrackByIndex(capability.AudioTrackIndex); !ok {
+			writeError(w, http.StatusBadRequest, "unknown_audio_track",
+				fmt.Sprintf("this file has no audio track with stream index %d; available: %s",
+					capability.AudioTrackIndex, audioTrackIndexList(info.AudioTracks)))
+			return
+		}
 	}
 
 	// The pure negotiation answers what the client and the media allow. This

@@ -1614,3 +1614,158 @@ func TestBuildFFmpegArgs_Ladder(t *testing.T) {
 		}
 	}
 }
+
+// ---- audio track selection -------------------------------------------------
+
+// TestNegotiate_DeliversTheDefaultAudioTrack covers a file whose second track is
+// the one marked default: "the first stream wins" delivers the wrong language on
+// a file that says which one it means.
+func TestNegotiate_DeliversTheDefaultAudioTrack(t *testing.T) {
+	t.Parallel()
+
+	decision := Negotiate(multiTrackInfo(), BrowserCapability())
+	if decision.TargetAudioStreamIndex != 3 {
+		t.Errorf("audio stream = %d, want the default track's 3", decision.TargetAudioStreamIndex)
+	}
+	if decision.AudioAction != ActionTranscode {
+		t.Errorf("audio action = %q, want transcode: the browser cannot take AC-3 5.1",
+			decision.AudioAction)
+	}
+}
+
+// TestNegotiate_HonoursAChosenAudioTrack covers an explicit request for the
+// track that is not the default, including the checks that have to follow the
+// choice rather than the summary: this one is stereo AAC, which the browser
+// takes as it is.
+func TestNegotiate_HonoursAChosenAudioTrack(t *testing.T) {
+	t.Parallel()
+
+	capability := BrowserCapability()
+	capability.AudioTrackIndex = 1
+
+	info := multiTrackInfo()
+	// Make the file directly playable so the *only* reason to repackage is the
+	// track choice, which is the case that would otherwise be missed.
+	info.Container = "mp4"
+
+	decision := Negotiate(info, capability)
+	if decision.TargetAudioStreamIndex != 1 {
+		t.Fatalf("audio stream = %d, want the requested 1", decision.TargetAudioStreamIndex)
+	}
+	if decision.AudioAction != ActionCopy {
+		t.Errorf("audio action = %q, want copy: track 1 is stereo AAC", decision.AudioAction)
+	}
+	// Direct play serves the whole file and lets the player pick, so a chosen
+	// track has to be repackaged instead - without re-encoding anything.
+	if decision.Mode != ModeRemux {
+		t.Fatalf("mode = %q, want remux for a chosen track in an otherwise playable file", decision.Mode)
+	}
+	if decision.VideoAction != ActionCopy {
+		t.Errorf("video action = %q, want copy", decision.VideoAction)
+	}
+	reasons := strings.Join(decision.Reasons, "; ")
+	if !strings.Contains(reasons, "audio track 1") {
+		t.Errorf("the reasons should name the chosen track: %s", reasons)
+	}
+}
+
+// TestNegotiate_ChosenTrackChecksApplyToThatTrack covers the trap of validating
+// the summary instead of the choice: track 1 is stereo AAC and track 3 is AC-3
+// 5.1, so the same file needs a different audio decision depending on which was
+// asked for.
+func TestNegotiate_ChosenTrackChecksApplyToThatTrack(t *testing.T) {
+	t.Parallel()
+
+	capability := BrowserCapability()
+	capability.Containers = []string{"hls"}
+
+	// Choosing the stereo AAC track needs no audio re-encode, only repackaging.
+	stereo := capability
+	stereo.AudioTrackIndex = 1
+	if got := Negotiate(multiTrackInfo(), stereo); got.AudioAction != ActionCopy {
+		t.Errorf("track 1 audio action = %q, want copy", got.AudioAction)
+	}
+
+	// Choosing the 5.1 AC-3 track needs a re-encode and a downmix, because that
+	// is what the chosen track is.
+	surround := capability
+	surround.AudioTrackIndex = 3
+	decision := Negotiate(multiTrackInfo(), surround)
+	if decision.AudioAction != ActionTranscode {
+		t.Errorf("track 3 audio action = %q, want transcode", decision.AudioAction)
+	}
+	if decision.TargetAudioChannels != 2 {
+		t.Errorf("target audio channels = %d, want a downmix to 2", decision.TargetAudioChannels)
+	}
+}
+
+// TestNegotiate_MissingAudioTrackFallsBackAndSaysSo covers the defensive path:
+// the API refuses an unknown index with a 400, but a direct caller of Negotiate
+// gets the default track and a reason rather than silence or a failure.
+func TestNegotiate_MissingAudioTrackFallsBackAndSaysSo(t *testing.T) {
+	t.Parallel()
+
+	capability := BrowserCapability()
+	capability.AudioTrackIndex = 9
+
+	decision := Negotiate(multiTrackInfo(), capability)
+	if !decision.Deliverable {
+		t.Fatalf("a missing track is not a reason to refuse the film: %s", strings.Join(decision.Reasons, "; "))
+	}
+	if decision.TargetAudioStreamIndex != 3 {
+		t.Errorf("audio stream = %d, want the default track's 3", decision.TargetAudioStreamIndex)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "no audio track with stream index 9") {
+		t.Errorf("the reasons should say the request was ignored: %s", strings.Join(decision.Reasons, "; "))
+	}
+}
+
+// TestBuildFFmpegArgs_MapsTheChosenAudioStream pins the mapping, which is the
+// step that decides whether the chosen track is the one that arrives.
+func TestBuildFFmpegArgs_MapsTheChosenAudioStream(t *testing.T) {
+	t.Parallel()
+
+	cfg := ManagerConfig{
+		SegmentSeconds: 4,
+		Server:         ServerCapability{VideoEncoders: []string{"libx264"}},
+	}
+
+	chosen, err := BuildFFmpegArgs("/tmp/session", "/media/movie.mkv", Decision{
+		Mode: ModeTranscode, Deliverable: true, Container: "hls",
+		VideoAction: ActionTranscode, AudioAction: ActionCopy, TargetVideoCodec: "h264",
+		TargetAudioStreamIndex: 3,
+	}, cfg)
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgs: %v", err)
+	}
+	if joined := strings.Join(chosen, " "); !strings.Contains(joined, "-map 0:3?") {
+		t.Errorf("chosen track is not mapped by its stream index:\n%s", joined)
+	}
+
+	// With no resolved index the mapping falls back to the first audio stream,
+	// which is what a hand-built decision means.
+	fallback, err := BuildFFmpegArgs("/tmp/session", "/media/movie.mkv", Decision{
+		Mode: ModeTranscode, Deliverable: true, Container: "hls",
+		VideoAction: ActionTranscode, AudioAction: ActionCopy, TargetVideoCodec: "h264",
+	}, cfg)
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgs: %v", err)
+	}
+	if joined := strings.Join(fallback, " "); !strings.Contains(joined, "-map 0:a:0?") {
+		t.Errorf("the default mapping should be the first audio stream:\n%s", joined)
+	}
+
+	// And a ladder maps the chosen track for every rung, not just the first.
+	ladder, err := BuildFFmpegArgs("/tmp/session", "/media/movie.mkv", Decision{
+		Mode: ModeTranscode, Deliverable: true, Container: "hls",
+		VideoAction: ActionTranscode, AudioAction: ActionCopy, TargetVideoCodec: "h264",
+		TargetAudioStreamIndex: 3,
+		Renditions:             []Rendition{{Height: 720, BitrateKbps: 2500}, {Height: 360, BitrateKbps: 700}},
+	}, cfg)
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgs: %v", err)
+	}
+	if got := strings.Count(strings.Join(ladder, " "), "-map 0:3?"); got != 2 {
+		t.Errorf("chosen track mapped %d times, want once per rung:\n%s", got, strings.Join(ladder, " "))
+	}
+}

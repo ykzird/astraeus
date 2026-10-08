@@ -287,9 +287,15 @@ segmented streams — each is an ffmpeg process — and a refusal is a `429
 too_many_sessions`, while `DELETE /api/streams/{id}` stops one immediately
 rather than waiting for the idle reaper.
 
-Not yet implemented: multiple audio track selection, and an adaptive bitrate
-ladder. Subtitle tracks are probed, and text-based tracks are extracted to
-WebVTT on demand (§9.5).
+Audio tracks are probed as a list and selected by stream index. Every audio
+decision follows the chosen track rather than the first one, and a file's own
+`default` disposition decides what a client that does not choose receives. A
+chosen track forces at least a remux, because direct play hands the player the
+whole file and the player would pick its own track; the picture is copied, so the
+cost is repackaging rather than re-encoding.
+
+Not yet implemented: image-based subtitles. Subtitle tracks are probed, and
+text-based tracks are extracted to WebVTT on demand (§9.5).
 
 ### 9.4 Interface
 

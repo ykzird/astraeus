@@ -49,6 +49,10 @@ type Decision struct {
 	// TargetAudioChannels is set when the source carries more channels than the
 	// client accepts and the audio is being re-encoded anyway.
 	TargetAudioChannels int `json:"target_audio_channels,omitempty"`
+	// TargetAudioStreamIndex is the ffmpeg stream index of the audio track this
+	// session delivers, so a client can confirm which one it got. Zero when the
+	// entity has no audio.
+	TargetAudioStreamIndex int `json:"target_audio_stream_index,omitempty"`
 	// TargetBitrateKbps is the ceiling the delivered video is held to, set when
 	// the client declared a total bitrate limit. It is the client's limit minus
 	// the audio allowance, so the whole stream fits rather than the video alone.
@@ -92,16 +96,34 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		return decision
 	}
 
+	// Which audio track this session delivers. Resolved first, because every
+	// audio decision below - codec, channel count, bitrate share - is about the
+	// track that was asked for, not about whichever one happens to be first.
+	audioTrack, hasAudio, trackRequestIgnored := info.ChosenAudioTrack(capability.AudioTrackIndex)
+	if hasAudio {
+		decision.TargetAudioStreamIndex = audioTrack.Index
+		switch {
+		case trackRequestIgnored:
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("this file has no audio track with stream index %d, so the default track (%s) is being delivered",
+					capability.AudioTrackIndex, AudioTrackLabel(audioTrack)))
+		case capability.AudioTrackIndex > 0:
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("the client asked for audio track %d (%s)",
+					audioTrack.Index, AudioTrackLabel(audioTrack)))
+		}
+	}
+
 	videoCompatible := clientSupportsVideo(capability, info.VideoCodec)
 	if !videoCompatible {
 		decision.Reasons = append(decision.Reasons,
 			fmt.Sprintf("client cannot decode video codec %q", info.VideoCodec))
 	}
 
-	audioCompatible := info.AudioCodec == "" || capability.SupportsAudio(info.AudioCodec)
+	audioCompatible := !hasAudio || capability.SupportsAudio(audioTrack.Codec)
 	if !audioCompatible {
 		decision.Reasons = append(decision.Reasons,
-			fmt.Sprintf("client cannot decode audio codec %q", info.AudioCodec))
+			fmt.Sprintf("client cannot decode audio codec %q", audioTrack.Codec))
 	}
 
 	containerCompatible := capability.SupportsContainer(info.Container)
@@ -118,11 +140,11 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	}
 
 	channelsTooMany := capability.MaxAudioChannels > 0 &&
-		info.AudioChannels > capability.MaxAudioChannels
+		hasAudio && audioTrack.Channels > capability.MaxAudioChannels
 	if channelsTooMany {
 		decision.Reasons = append(decision.Reasons,
-			fmt.Sprintf("source audio has %d channels but the client accepts at most %d",
-				info.AudioChannels, capability.MaxAudioChannels))
+			fmt.Sprintf("audio track %d has %d channels but the client accepts at most %d",
+				audioTrack.Index, audioTrack.Channels, capability.MaxAudioChannels))
 	}
 
 	// A codec name the client accepts does not mean it can decode this stream:
@@ -166,9 +188,18 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		}
 	}
 
+	// A chosen track cannot come from direct play. Direct play serves the
+	// original file, and the player then picks a track itself - usually the
+	// file's default, which is precisely the one the client said it did not
+	// want. Repackaging delivers the chosen stream without re-encoding
+	// anything, so that is what happens instead.
+	trackChosen := hasAudio && capability.AudioTrackIndex > 0 && !trackRequestIgnored
+
 	switch {
 	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany || hdrMismatch || bitrateTooHigh:
 		decision.Mode = ModeTranscode
+	case trackChosen:
+		decision.Mode = ModeRemux
 	case containerCompatible:
 		decision.Mode = ModeDirectPlay
 	default:
@@ -220,7 +251,7 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	}
 
 	// Audio action.
-	if info.AudioCodec == "" {
+	if !hasAudio {
 		decision.AudioAction = ActionNone
 	} else if !audioCompatible || channelsTooMany {
 		decision.AudioAction = ActionTranscode
@@ -238,7 +269,7 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	// keeps its share - either the source's own rate, because it is being
 	// copied, or the rate this server encodes it at - so that what the client
 	// receives fits the limit rather than the video alone fitting it.
-	audio := audioAllowanceKbps(info, decision.AudioAction)
+	audio := audioAllowanceKbps(audioTrack, hasAudio, decision.AudioAction)
 	budget := 0
 	if capability.MaxBitrateKbps > 0 {
 		budget = capability.MaxBitrateKbps - audio
@@ -303,8 +334,15 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	}
 
 	if decision.Mode == ModeRemux {
-		decision.Reasons = append(decision.Reasons,
-			"remux: the streams are compatible but the container is not, so they are copied into HLS unchanged")
+		switch {
+		case trackChosen && containerCompatible:
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("remux: the client asked for audio track %d, which direct play cannot isolate, so the streams are copied into HLS unchanged",
+					audioTrack.Index))
+		default:
+			decision.Reasons = append(decision.Reasons,
+				"remux: the streams are compatible but the container is not, so they are copied into HLS unchanged")
+		}
 	} else {
 		decision.Reasons = append(decision.Reasons,
 			"transcode: at least one stream is incompatible with the client")
@@ -477,16 +515,18 @@ const minVideoBitrateKbps = 100
 // to ffmpeg for a re-encoded track; if that changes, this should change with it.
 const defaultAudioAllowanceKbps = 192
 
-// audioAllowanceKbps is how much of the client's bitrate limit the audio track
-// will use: the source's own rate when it is copied and the container states it,
-// nothing when there is no audio, and the encode target otherwise.
-func audioAllowanceKbps(info *MediaInfo, audioAction Action) int {
-	switch audioAction {
-	case ActionNone:
+// audioAllowanceKbps is how much of the client's bitrate limit the delivered
+// audio will use: the source's own rate when it is copied and the container
+// states it, nothing when there is no audio, and the encode target otherwise.
+// It is the *chosen* track's rate that counts, because that is the one being
+// copied.
+func audioAllowanceKbps(track AudioTrack, hasAudio bool, audioAction Action) int {
+	switch {
+	case !hasAudio || audioAction == ActionNone:
 		return 0
-	case ActionCopy:
-		if info.AudioBitrateKbps > 0 {
-			return info.AudioBitrateKbps
+	case audioAction == ActionCopy:
+		if track.BitrateKbps > 0 {
+			return track.BitrateKbps
 		}
 		return defaultAudioAllowanceKbps
 	default:

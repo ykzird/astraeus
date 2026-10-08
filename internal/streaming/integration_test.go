@@ -839,3 +839,120 @@ func TestManager_LadderProducesAMasterPlaylistAndItsRungs(t *testing.T) {
 		}
 	}
 }
+
+// generateTwoAudioClip renders an MP4 whose two audio tracks differ in a way that
+// survives being copied: track 1 is stereo, track 2 is mono and is marked the
+// file's default. Both are AAC, so a browser takes either one as it is and what
+// arrives says which was chosen.
+func generateTwoAudioClip(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=640x360:rate=15:duration=3",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+		"-f", "lavfi", "-i", "sine=frequency=880:duration=3",
+		"-map", "0:v", "-map", "1:a", "-map", "2:a",
+		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+		"-c:a", "aac", "-b:a", "96k",
+		"-ac:a:0", "2", "-ac:a:1", "1",
+		"-disposition:a:0", "0", "-disposition:a:1", "default",
+		path,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("this ffmpeg cannot produce a two-track fixture: %v\n%s", err, output)
+	}
+	return path
+}
+
+// TestManager_DeliversTheChosenAudioTrack is the end-to-end check that the audio
+// choice reaches the delivered bytes. The fixture's tracks differ in channel
+// count, so probing the produced segment says which one was mapped - a test that
+// only asserted the decision would pass even if the mapping were wrong.
+func TestManager_DeliversTheChosenAudioTrack(t *testing.T) {
+	requireFFmpeg(t)
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	source := generateTwoAudioClip(t, dir, "two-audio.mp4")
+
+	prober := NewFFProbe("ffprobe")
+	info, err := prober.Probe(ctx, source)
+	if err != nil {
+		t.Fatalf("probing the fixture: %v", err)
+	}
+	if len(info.AudioTracks) != 2 {
+		t.Fatalf("the fixture has %d audio tracks, want two: %+v", len(info.AudioTracks), info.AudioTracks)
+	}
+	stereo, mono := info.AudioTracks[0], info.AudioTracks[1]
+	if stereo.Channels != 2 || mono.Channels != 1 {
+		t.Fatalf("fixture track channels = %d, %d; want 2 then 1", stereo.Channels, mono.Channels)
+	}
+	if !mono.Default {
+		t.Fatalf("the second track should be the fixture's default: %+v", info.AudioTracks)
+	}
+
+	server := DetectServerCapability(ctx, "ffmpeg", "ffprobe", "")
+	base := ClientCapability{
+		Containers:       []string{"mp4", "hls"},
+		VideoCodecs:      []string{"h264"},
+		AudioCodecs:      []string{"aac"},
+		MaxBitDepth:      8,
+		MaxAudioChannels: 2,
+		SupportsHLS:      true,
+	}
+
+	// Saying nothing delivers the track the file marks default, and an otherwise
+	// playable file is still played directly.
+	automatic := NegotiateForServer(info, base, server)
+	if automatic.Mode != ModeDirectPlay {
+		t.Fatalf("mode = %q, want direct play: %s", automatic.Mode, strings.Join(automatic.Reasons, "; "))
+	}
+	if automatic.TargetAudioStreamIndex != mono.Index {
+		t.Errorf("automatic audio stream = %d, want the default track's %d",
+			automatic.TargetAudioStreamIndex, mono.Index)
+	}
+
+	// Choosing a track repackages the file - direct play cannot isolate one -
+	// and the segment has to carry the chosen track's channel count.
+	for _, want := range []AudioTrack{stereo, mono} {
+		capability := base
+		capability.AudioTrackIndex = want.Index
+
+		decision := NegotiateForServer(info, capability, server)
+		if decision.TargetAudioStreamIndex != want.Index {
+			t.Fatalf("target audio stream = %d, want %d", decision.TargetAudioStreamIndex, want.Index)
+		}
+		if decision.Mode != ModeRemux {
+			t.Fatalf("mode = %q, want remux for a chosen track: %s",
+				decision.Mode, strings.Join(decision.Reasons, "; "))
+		}
+		if decision.VideoAction != ActionCopy {
+			t.Errorf("video action = %q, want copy: choosing audio must not re-encode the picture",
+				decision.VideoAction)
+		}
+
+		manager, session, _ := startSession(t, dir, source, decision)
+		segment := waitForSegment(t, session.Dir, 60*time.Second)
+		if segment == "" {
+			manager.Stop(session.ID)
+			t.Fatalf("track %d produced no segment", want.Index)
+		}
+
+		// Probe before stopping: Stop removes the session directory, and the
+		// segment with it.
+		produced, err := prober.Probe(ctx, filepath.Join(session.Dir, segment))
+		manager.Stop(session.ID)
+		if err != nil {
+			t.Fatalf("probing the segment for track %d: %v", want.Index, err)
+		}
+		if produced.AudioChannels != want.Channels {
+			t.Errorf("chose track %d (%dch) but the delivered segment has %dch: the wrong stream was mapped",
+				want.Index, want.Channels, produced.AudioChannels)
+		}
+		if produced.VideoCodec != "h264" {
+			t.Errorf("video codec = %q, want h264 copied from the source", produced.VideoCodec)
+		}
+	}
+}

@@ -37,6 +37,12 @@ type ClientCapability struct {
 	// HDR output is 10-bit by definition, so declaring this together with
 	// MaxBitDepth < 10 is a contradiction and Validate rejects it.
 	SupportsHDR bool `json:"supports_hdr"`
+	// AudioTrackIndex selects which audio stream to deliver, as the ffmpeg
+	// stream index reported in a probe's audio_tracks. Zero means the server's
+	// choice: the track the file marks default, or its first. A track that does
+	// not exist is not an error - the default is delivered and the reasons say
+	// so - because a missing track is not a reason to refuse the film.
+	AudioTrackIndex int `json:"audio_track_index"`
 	// MaxAudioChannels is the most channels the client can decode. Chromium's
 	// media pipeline refuses a 5.1 AAC SourceBuffer, and browsers output stereo
 	// in practice, so this defaults to 2 for browser clients. Zero means
@@ -91,7 +97,7 @@ func (c ClientCapability) Validate() error {
 		return fmt.Errorf("capability must list at least one audio codec")
 	}
 	if c.MaxWidth < 0 || c.MaxHeight < 0 || c.MaxBitrateKbps < 0 ||
-		c.MaxBitDepth < 0 || c.MaxAudioChannels < 0 {
+		c.MaxBitDepth < 0 || c.MaxAudioChannels < 0 || c.AudioTrackIndex < 0 {
 		return fmt.Errorf("capability limits must not be negative")
 	}
 	// A client that can render HDR can decode 10-bit: PQ and HLG are stored at
@@ -142,6 +148,7 @@ func (c ClientCapability) Normalise() ClientCapability {
 		MaxHeight:        c.MaxHeight,
 		MaxBitrateKbps:   c.MaxBitrateKbps,
 		MaxBitDepth:      c.MaxBitDepth,
+		AudioTrackIndex:  c.AudioTrackIndex,
 		MaxAudioChannels: c.MaxAudioChannels,
 		SupportsHDR:      c.SupportsHDR,
 		SupportsHLS:      c.SupportsHLS,

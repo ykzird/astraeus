@@ -227,3 +227,149 @@ func TestMediaInfoIsHDR(t *testing.T) {
 		}
 	}
 }
+
+// multiTrackInfo is a film with two audio tracks where the *second* is marked
+// default - the case that makes "the first stream wins" wrong even when nobody
+// asks for anything.
+func multiTrackInfo() *MediaInfo {
+	return &MediaInfo{
+		Container: "matroska", VideoCodec: "h264",
+		AudioCodec: "ac3", AudioChannels: 6, AudioBitrateKbps: 448,
+		Width: 1920, Height: 1080, BitDepth: 8, BitrateKbps: 8_000,
+		AudioTracks: []AudioTrack{
+			{Index: 1, Codec: "aac", Channels: 2, BitrateKbps: 128},
+			{Index: 3, Codec: "ac3", Channels: 6, BitrateKbps: 448, Language: "eng", Default: true},
+		},
+	}
+}
+
+func TestMediaInfoFromProbe_ReadsEveryAudioTrack(t *testing.T) {
+	t.Parallel()
+
+	output := hdrProbeOutput()
+	second := ffprobeStream{CodecName: "ac3", CodecType: "audio", Channels: 6, BitRate: "448000"}
+	second.Index = 3
+	second.Disposition.Default = 1
+	second.Tags.Language = "eng"
+	output.Streams = append(output.Streams, second)
+
+	info, err := mediaInfoFromProbe(output, "/media/film.mkv")
+	if err != nil {
+		t.Fatalf("mediaInfoFromProbe: %v", err)
+	}
+	if len(info.AudioTracks) != 2 {
+		t.Fatalf("audio tracks = %+v, want two", info.AudioTracks)
+	}
+	if info.AudioTracks[0].Codec != "eac3" || info.AudioTracks[1].Codec != "ac3" {
+		t.Errorf("track codecs = %q, %q, want eac3 then ac3",
+			info.AudioTracks[0].Codec, info.AudioTracks[1].Codec)
+	}
+	if info.AudioTracks[1].Index != 3 || info.AudioTracks[1].Language != "eng" || !info.AudioTracks[1].Default {
+		t.Errorf("second track = %+v, want index 3, eng, default", info.AudioTracks[1])
+	}
+	// The summary still describes the first track: it is what a client that does
+	// not choose sees, and the negotiation is what applies the default.
+	if info.AudioCodec != "eac3" || info.AudioBitrateKbps != 448 {
+		t.Errorf("summary = %q/%d, want the first track eac3/448", info.AudioCodec, info.AudioBitrateKbps)
+	}
+}
+
+func TestChosenAudioTrack(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		info        *MediaInfo
+		requested   int
+		wantIndex   int
+		wantCodec   string
+		wantHas     bool
+		wantIgnored bool
+	}{
+		{
+			name:      "no selection takes the track the file marks default",
+			info:      multiTrackInfo(),
+			wantIndex: 3, wantCodec: "ac3", wantHas: true,
+		},
+		{
+			name:      "an explicit index is honoured even when it is not the default",
+			info:      multiTrackInfo(),
+			requested: 1,
+			wantIndex: 1, wantCodec: "aac", wantHas: true,
+		},
+		{
+			name:      "an index the file does not have falls back to the default and says so",
+			info:      multiTrackInfo(),
+			requested: 9,
+			wantIndex: 3, wantCodec: "ac3", wantHas: true, wantIgnored: true,
+		},
+		{
+			name:      "a file with no default marked uses the first track",
+			info:      &MediaInfo{AudioCodec: "aac", AudioChannels: 2, AudioTracks: []AudioTrack{{Index: 1, Codec: "aac"}}},
+			wantIndex: 1, wantCodec: "aac", wantHas: true,
+		},
+		{
+			name:    "a file with no audio has none to choose",
+			info:    &MediaInfo{Container: "mp4", VideoCodec: "h264", AudioTracks: []AudioTrack{}},
+			wantHas: false,
+		},
+		{
+			name:      "a hand-built MediaInfo with only the summary is one track",
+			info:      &MediaInfo{AudioCodec: "aac", AudioChannels: 2, AudioBitrateKbps: 128},
+			wantCodec: "aac", wantHas: true,
+		},
+		{
+			name:        "a hand-built MediaInfo cannot satisfy an explicit request",
+			info:        &MediaInfo{AudioCodec: "aac", AudioChannels: 2},
+			requested:   3,
+			wantCodec:   "aac",
+			wantHas:     true,
+			wantIgnored: true,
+		},
+		{
+			name:    "nil media has no audio",
+			info:    nil,
+			wantHas: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			track, has, ignored := tt.info.ChosenAudioTrack(tt.requested)
+			if has != tt.wantHas {
+				t.Fatalf("hasAudio = %v, want %v", has, tt.wantHas)
+			}
+			if ignored != tt.wantIgnored {
+				t.Errorf("ignored = %v, want %v", ignored, tt.wantIgnored)
+			}
+			if !tt.wantHas {
+				return
+			}
+			if track.Index != tt.wantIndex || track.Codec != tt.wantCodec {
+				t.Errorf("track = %+v, want index %d codec %q", track, tt.wantIndex, tt.wantCodec)
+			}
+		})
+	}
+}
+
+func TestAudioTrackLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		track AudioTrack
+		want  string
+	}{
+		{track: AudioTrack{Codec: "ac3", Channels: 6, Language: "eng"}, want: "eng ac3 6ch"},
+		{track: AudioTrack{Codec: "aac", Channels: 2, Title: "Commentary"}, want: "Commentary aac 2ch"},
+		{track: AudioTrack{Codec: "aac", Language: "English (aac)"}, want: "English (aac)"},
+		{track: AudioTrack{Codec: "opus"}, want: "opus"},
+	}
+
+	for _, tt := range tests {
+		if got := AudioTrackLabel(tt.track); got != tt.want {
+			t.Errorf("AudioTrackLabel(%+v) = %q, want %q", tt.track, got, tt.want)
+		}
+	}
+}

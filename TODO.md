@@ -47,7 +47,10 @@ Status as of the current build. Evidence for each claim is the test suite
       cannot show HDR, and passed through at 10 bits for those that can
 - [x] 10-bit HDR encoder support verified by a second startup probe per encoder,
       separate from the 8-bit one because an encoder that works at 8 may refuse 10
-- [ ] Multi-audio-track selection
+- [x] Multi-audio-track selection: every track probed and listed, chosen by
+      stream index, the file's `default` track delivered when the client does not
+      choose, and every audio decision (codec, channels, bitrate share) made about
+      the chosen track. A chosen track repackages rather than direct-plays
 - [ ] Serving image-based subtitles (PGS/VobSub) — needs OCR or bitmap overlay
 - [x] `max_bitrate_kbps` acted on rather than echoed: the audio's share is
       reserved and the video held to the remainder as a VBV ceiling, uniformly
@@ -171,7 +174,6 @@ Status as of the current build. Evidence for each claim is the test suite
     encoders are: the 10-bit probe runs on whatever host starts the server, but
     no NVIDIA, Intel or AMD GPU is reachable here. On this machine the probe
     verified five software encoders at 10-bit.
-- Multi-audio-track selection is not implemented; the first audio stream wins.
 - Image-based subtitles (PGS, VobSub) are detected and reported but not
   delivered — that needs OCR or bitmap overlay support.
 - Browser clients are capped at 1080p, 8-bit and stereo by default, and do not

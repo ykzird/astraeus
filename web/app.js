@@ -444,8 +444,11 @@
    * `maxHeight` is omitted for Auto, leaving the browser's real horizontal
    * ceiling (1920) as the only limit — the server derives the height from the
    * source's aspect ratio.
+   *
+   * `audioTrackIndex` is omitted for Auto as well: the contract reserves both
+   * a missing field and 0 for "the server's choice", so neither is ever sent.
    */
-  function playbackRequestBody(startSeconds, maxHeight) {
+  function playbackRequestBody(startSeconds, maxHeight, audioTrackIndex) {
     const body = {
       containers: ["mp4", "webm", "hls"],
       video_codecs: ["h264", "vp9", "av1"],
@@ -462,6 +465,9 @@
       subtitles: true,
     };
     if (typeof maxHeight === "number" && maxHeight > 0) body.max_height = maxHeight;
+    if (typeof audioTrackIndex === "number" && isFinite(audioTrackIndex) && audioTrackIndex > 0) {
+      body.audio_track_index = audioTrackIndex;
+    }
     if (typeof startSeconds === "number" && isFinite(startSeconds) && startSeconds > 0) {
       body.start_seconds = startSeconds;
     }
@@ -504,6 +510,10 @@
       /* Requested height cap (null = Auto) and what the server actually chose. */
       maxHeight: null,
       targetHeight: 0,
+      /* Requested audio stream index (null = Auto) and the index the server
+         actually chose for this session; the menu reports the latter. */
+      audioTrackIndex: null,
+      targetAudioStreamIndex: 0,
       /* True while a quality change or an out-of-range seek is re-negotiating. */
       qualityBusy: false,
       /* Subtitle tracks as the server described them. Only an entry carrying a
@@ -2436,6 +2446,7 @@
     }
     applyAudioPreference();
     syncQualityControl();
+    syncAudioTrackControl();
     /* Fullscreen can be left with Esc or a swipe, so the button is driven from
        the document state rather than from what we last asked for. */
     const fullscreen = document.getElementById("player-fullscreen");
@@ -2731,6 +2742,7 @@
         stop,
         el("span", { class: "player-spacer" }),
         buildPlayerQualityControl(pb, live),
+        buildPlayerAudioControl(pb, live),
         buildPlayerVolumeControls(pb, live),
         fullscreen,
       ]),
@@ -2771,6 +2783,96 @@
     return el("span", { class: "player-quality" }, [
       select,
       /* A switch means a short re-buffer; say so instead of looking broken. */
+      busy ? el("span", { class: "player-quality-note", text: "Switching…" }) : null,
+    ]);
+  }
+
+  /* Channel counts a viewer knows, written the way a layout is named. */
+  const CHANNEL_LAYOUT_NAMES = { 1: "mono", 2: "stereo", 6: "5.1", 8: "7.1" };
+
+  /* ffprobe's codec names, spelled the way the format is written. */
+  const AUDIO_CODEC_NAMES = {
+    aac: "AAC",
+    ac3: "AC-3",
+    eac3: "E-AC-3",
+    dts: "DTS",
+    truehd: "TrueHD",
+    flac: "FLAC",
+    opus: "Opus",
+    mp3: "MP3",
+    vorbis: "Vorbis",
+  };
+
+  /** Only a track with a usable numeric index can be asked for. */
+  function audioTracksOf(pb) {
+    const info = pb && pb.mediaInfo;
+    const tracks = info && Array.isArray(info.audio_tracks) ? info.audio_tracks : [];
+    return tracks.filter(function (track) {
+      return !!track && typeof track.index === "number" && isFinite(track.index);
+    });
+  }
+
+  function channelLayoutName(channels) {
+    const count = Number(channels);
+    if (!isFinite(count) || count <= 0) return "";
+    return CHANNEL_LAYOUT_NAMES[count] || String(count) + "ch";
+  }
+
+  function audioCodecName(codec) {
+    if (!codec) return "";
+    const raw = String(codec);
+    return AUDIO_CODEC_NAMES[raw.toLowerCase()] || raw.toUpperCase();
+  }
+
+  /**
+   * Free-text titles and languages are untrusted and may be long; the name is
+   * the part worth reading, so it comes first and the technical detail follows.
+   */
+  function audioTrackLabel(track, position) {
+    const title = track.title ? String(track.title) : "";
+    const language = track.language ? String(track.language) : "";
+    const name = title || language || "Track " + (position + 1);
+    const codec = audioCodecName(track.codec);
+    const layout = channelLayoutName(track.channels);
+    const detail = codec && layout ? codec + " " + layout : codec || layout;
+    return detail ? name + " · " + detail : name;
+  }
+
+  /**
+   * Audio-track menu. One track is what the session would deliver anyway, so
+   * the control only appears when there is a real choice. Direct play still
+   * offers it: picking a non-default track makes the server re-negotiate into
+   * a remux, so the menu is not a promise the session cannot keep.
+   */
+  function buildPlayerAudioControl(pb, live) {
+    const tracks = audioTracksOf(pb);
+    if (tracks.length < 2) return null;
+
+    const busy = pb.qualityBusy === true;
+    const select = el("select", {
+      class: "audio-select",
+      id: "player-audio-track",
+      "data-focus-key": "audio-track",
+      "aria-label": "Audio track",
+      "aria-busy": busy ? "true" : "false",
+      disabled: !live || busy,
+      title: busy ? "Switching audio track…" : "Audio track",
+    });
+    for (let i = 0; i < tracks.length; i += 1) {
+      const track = tracks[i];
+      select.append(el("option", { value: String(track.index), text: audioTrackLabel(track, i) }));
+    }
+    /* The server's choice is the truth, not what was asked for: an Auto
+       request resolves to a concrete track and the menu names it. */
+    const wanted = String(pb.targetAudioStreamIndex);
+    const has = Array.prototype.some.call(select.options, function (option) {
+      return option.value === wanted;
+    });
+    if (has) select.value = wanted;
+
+    return el("span", { class: "player-audio-track" }, [
+      select,
+      /* The re-negotiation is a short re-buffer; say so rather than look stuck. */
       busy ? el("span", { class: "player-quality-note", text: "Switching…" }) : null,
     ]);
   }
@@ -2822,6 +2924,24 @@
     select.setAttribute("aria-busy", busy ? "true" : "false");
     select.title = busy ? "Switching quality…" : "Playback quality";
     const wanted = pb.maxHeight ? String(pb.maxHeight) : "auto";
+    if (select.value !== wanted) {
+      const has = Array.prototype.some.call(select.options, function (option) {
+        return option.value === wanted;
+      });
+      if (has) select.value = wanted;
+    }
+  }
+
+  /** Keep the audio menu in step with the session without rebuilding it. */
+  function syncAudioTrackControl() {
+    const pb = state.playback;
+    const select = document.getElementById("player-audio-track");
+    if (!select) return;
+    const busy = pb.qualityBusy === true;
+    select.disabled = busy || !playbackIsLive(pb);
+    select.setAttribute("aria-busy", busy ? "true" : "false");
+    select.title = busy ? "Switching audio track…" : "Audio track";
+    const wanted = String(pb.targetAudioStreamIndex);
     if (select.value !== wanted) {
       const has = Array.prototype.some.call(select.options, function (option) {
         return option.value === wanted;
@@ -3443,6 +3563,12 @@
     pb.sourceDuration = mediaInfoDuration(pb);
     pb.targetHeight = decision && Number(decision.target_height) > 0 ? Number(decision.target_height) : 0;
     pb.maxHeight = requested && "maxHeight" in requested ? requested.maxHeight : null;
+    /* What the server actually selected this session, which is what the audio
+       menu reports; absent or 0 means the entity has no audio track. */
+    const targetAudio = decision ? Number(decision.target_audio_stream_index) : NaN;
+    pb.targetAudioStreamIndex = isFinite(targetAudio) && targetAudio > 0 ? targetAudio : 0;
+    pb.audioTrackIndex =
+      requested && "audioTrackIndex" in requested ? requested.audioTrackIndex : null;
     pb.currentTime = 0;
     pb.duration = 0;
     return pb;
@@ -3491,8 +3617,12 @@
         ? Math.max(0, opts.startSeconds)
         : currentSourceTime(pb);
     const maxHeight = "maxHeight" in opts ? opts.maxHeight : pb.maxHeight;
+    /* Height and audio are chosen independently, so swapping one carries the
+       other across the re-negotiation unless the caller asked otherwise. */
+    const audioTrackIndex = "audioTrackIndex" in opts ? opts.audioTrackIndex : pb.audioTrackIndex;
     const wasPlaying = !playerVideo.paused && !playerVideo.ended;
     const previousMaxHeight = pb.maxHeight;
+    const previousAudioTrackIndex = pb.audioTrackIndex;
     const previousSessionId = pb.sessionId;
     /* The tracks are about to be rebuilt from the new response, which carries
        the server's own `default` disposition again; carry the viewer's actual
@@ -3514,10 +3644,17 @@
     render();
 
     try {
-      const result = await api.playback(entity.id, playbackRequestBody(startSeconds, maxHeight));
+      const result = await api.playback(
+        entity.id,
+        playbackRequestBody(startSeconds, maxHeight, audioTrackIndex)
+      );
       /* Navigation or Stop may have replaced the session meanwhile. */
       if (state.playback !== pb) return;
-      applyPlaybackResult(pb, result, entity, { startSeconds: startSeconds, maxHeight: maxHeight });
+      applyPlaybackResult(pb, result, entity, {
+        startSeconds: startSeconds,
+        maxHeight: maxHeight,
+        audioTrackIndex: audioTrackIndex,
+      });
       pb.qualityBusy = false;
       startSessionMedia(pb, entity, wasPlaying);
       toast(
@@ -3530,6 +3667,7 @@
       /* A failed switch is not fatal: say so and keep the session selectable. */
       pb.qualityBusy = false;
       pb.maxHeight = previousMaxHeight;
+      pb.audioTrackIndex = previousAudioTrackIndex;
       pb.status = "error";
       pb.error = playbackErrorMessage(entity, error);
       setActionStatus(pb.error, "error");
@@ -3548,7 +3686,27 @@
     const maxHeight = value === "auto" ? null : Number(value);
     if (maxHeight !== null && !(maxHeight > 0)) return;
     if (maxHeight === pb.maxHeight) return;
-    resumeSession({ startSeconds: currentSourceTime(pb), maxHeight: maxHeight });
+    resumeSession({
+      startSeconds: currentSourceTime(pb),
+      maxHeight: maxHeight,
+      /* Only the height is changing; keep the track the viewer picked. */
+      audioTrackIndex: pb.audioTrackIndex,
+    });
+  }
+
+  function startAudioSwitch(value) {
+    const pb = state.playback;
+    if (!pb.url || pb.qualityBusy) return;
+    const index = Number(value);
+    if (!isFinite(index) || index < 0) return;
+    /* The menu shows what the server chose, so that is what "already
+       selected" means; re-asking for it would re-buffer for nothing. */
+    if (index === pb.targetAudioStreamIndex) return;
+    resumeSession({
+      startSeconds: currentSourceTime(pb),
+      maxHeight: pb.maxHeight,
+      audioTrackIndex: index,
+    });
   }
 
   /* ── 10. Data loading ────────────────────────────────────────────────── */
@@ -3884,6 +4042,10 @@
     }
     if (target.id === "player-quality") {
       startQualitySwitch(target.value);
+      return;
+    }
+    if (target.id === "player-audio-track") {
+      startAudioSwitch(target.value);
       return;
     }
     /* Covers mouse selection and arrow-key traversal of the radio group. */
