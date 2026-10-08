@@ -122,6 +122,13 @@ jobs:
               status=1
             fi
           done
+          # And every relative link a shipped page makes has to resolve inside the
+          # archive. docs/ no longer carries the working documents, so a page that
+          # reaches for one has to point at the repository by URL instead.
+          extract="$(mktemp -d)"
+          tar xzf "$archive" -C "$extract"
+          python3 scripts/check-doc-links.py \
+            "$extract/astraeus-server_0.0.0-layout-check_linux_amd64" || status=1
           exit "$status"
 
   secrets:

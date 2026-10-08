@@ -27,4 +27,4 @@ running, or are about to.
 
 | Document | What it covers |
 | --- | --- |
-| [handoff.md](handoff.md) | Where the project is, written for whoever picks it up next — person or agent: working agreements, environment traps, how to verify each claim, and what is known to be unverified |
+| [handoff.md](https://github.com/ykzird/astraeus/blob/main/docs/handoff.md) | Where the project is, written for whoever picks it up next — person or agent: working agreements, environment traps, how to verify each claim, and what is known to be unverified. Repository only, so that a release archive stays free of the project's own working documents |

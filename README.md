@@ -70,7 +70,7 @@ docker exec astraeus astraeus-server scan --db /data/astraeus.db \
   --path /media/movies --kind movies --name Movies
 ```
 
-The image includes ffmpeg and tesseract. Releases are tagged (`:0.17.0`) and
+The image includes ffmpeg and tesseract. Releases are tagged (`:0.18.0`) and
 published on the [releases page](https://github.com/ykzird/astraeus/releases);
 `:latest` follows them. Building the image yourself, running it as a service and
 putting TLS in front of it are all in [deployment](deploy/README.md).
@@ -86,7 +86,7 @@ putting TLS in front of it are all in [deployment](deploy/README.md).
 | [Development](docs/development.md) | Tests, browser harnesses, and the layout |
 | [SPECIFICATION.md](SPECIFICATION.md) | The design, and the reasoning behind it |
 | [TODO.md](TODO.md) | What is missing, honestly |
-| [docs/handoff.md](docs/handoff.md) | State for whoever picks this up next |
+| [docs/handoff.md](https://github.com/ykzird/astraeus/blob/main/docs/handoff.md) | State for whoever picks this up next (repository only — not in a release archive) |
 
 ## Contributing
 

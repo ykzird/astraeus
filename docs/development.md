@@ -33,10 +33,13 @@ Node's own runner. No npm install and no lockfile are involved. The DOM-heavy
 remainder of `web/app.js` is covered by the browser harnesses below.
 
 Playback and subtitle behaviour in a browser is covered separately by the CDP
-harnesses in [`scripts/ui-verify/`](../scripts/ui-verify/), which assert what the
-`<video>` element actually does rather than what the server intended. Both the
-repackaged (`remux`) and re-encoded (`transcode`) HLS paths have been observed
-playing in Chromium through those harnesses.
+harnesses in
+[`scripts/ui-verify/`](https://github.com/ykzird/astraeus/tree/main/scripts/ui-verify),
+which assert what the `<video>` element actually does rather than what the server
+intended. They live in the repository and not in a release archive, which ships
+the server and the pages you are reading but none of the development tooling.
+Both the repackaged (`remux`) and re-encoded (`transcode`) HLS paths have been
+observed playing in Chromium through those harnesses.
 
 ## Layout
 
