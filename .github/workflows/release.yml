@@ -41,8 +41,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      # A tag is a promise that this revision passed; the full integration
-      # suite runs in ci.yml, which a tag push also triggers.
+      # A tag is a promise that this revision passed. The full suite does not
+      # run here or on the tag: ci.yml's push trigger is filtered to main, so
+      # GitHub runs it when the commit lands on main and not again when the tag
+      # is pushed. Cut tags from main, which is the revision that passed.
       - name: Vet and test
         run: |
           go vet ./...
