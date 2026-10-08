@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jok/astraeus-media/internal/library"
-	"github.com/jok/astraeus-media/internal/streaming"
+	"github.com/ykzird/astraeus/internal/library"
+	"github.com/ykzird/astraeus/internal/streaming"
 )
 
 // stubProber returns a fixed MediaInfo so negotiation can be exercised without

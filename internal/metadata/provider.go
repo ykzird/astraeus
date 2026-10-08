@@ -12,7 +12,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jok/astraeus-media/internal/library"
+	"github.com/ykzird/astraeus/internal/library"
 )
 
 // Provider defines the interface for external metadata services.

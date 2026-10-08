@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jok/astraeus-media/internal/library"
+	"github.com/ykzird/astraeus/internal/library"
 )
 
 // newTestRepo returns a migrated repository on a fresh database file. Each test

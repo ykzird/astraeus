@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jok/astraeus-media/internal/observability"
+	"github.com/ykzird/astraeus/internal/observability"
 )
 
 // discardLogger keeps ffmpeg session logs out of the test output.

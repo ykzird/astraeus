@@ -12,8 +12,8 @@ import (
 	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite"
 
-	"github.com/jok/astraeus-media/internal/library"
-	"github.com/jok/astraeus-media/internal/library/naming"
+	"github.com/ykzird/astraeus/internal/library"
+	"github.com/ykzird/astraeus/internal/library/naming"
 )
 
 // sqlxExecutor is satisfied by both *sqlx.DB and *sqlx.Tx, which lets the same

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jok/astraeus-media/internal/streaming"
-	"github.com/jok/astraeus-media/internal/subtitles"
+	"github.com/ykzird/astraeus/internal/streaming"
+	"github.com/ykzird/astraeus/internal/subtitles"
 )
 
 // fakeConverter writes a canned WebVTT file instead of running ffmpeg. It

@@ -17,8 +17,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/jok/astraeus-media/internal/observability"
-	"github.com/jok/astraeus-media/internal/tracing"
+	"github.com/ykzird/astraeus/internal/observability"
+	"github.com/ykzird/astraeus/internal/tracing"
 )
 
 const (

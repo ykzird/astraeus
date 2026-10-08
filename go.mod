@@ -1,4 +1,4 @@
-module github.com/jok/astraeus-media
+module github.com/ykzird/astraeus
 
 go 1.26.3
 

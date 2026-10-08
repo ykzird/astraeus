@@ -226,10 +226,12 @@ mise exec -- scripts/build-release.sh 0.17.0 linux/amd64 linux/arm64 darwin/arm6
 arm64, the checksums verified with `sha256sum -c`, the amd64 binary run (printing
 its injected version) and the arm64 one confirmed as an AArch64 ELF; the image
 was built with the version and OCI labels and run. The workflow YAML passes
-`actionlint`. What has *not* happened is GitHub running any of it: the repository
-had no remote, so `ci.yml` and `release.yml` have both only ever been executed as
-their individual commands, and no tag has been pushed. Treat the first tagged
-release as the first real test of the wiring.
+`actionlint`, and CI scans every push for secrets with trufflehog while
+Dependabot keeps the Go modules, the workflow action pins and the container base
+images current. What has *not* happened is GitHub running any of it: the
+repository had no remote, so `ci.yml` and `release.yml` have both only ever been
+executed as their individual commands, and no tag has been pushed. Treat the first
+tagged release as the first real test of the wiring.
 
 ---
 

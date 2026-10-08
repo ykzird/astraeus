@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jok/astraeus-media/internal/observability"
+	"github.com/ykzird/astraeus/internal/observability"
 )
 
 func testLogger() *slog.Logger {
@@ -131,16 +131,16 @@ func TestProxyMode(t *testing.T) {
 		{
 			name:       "trusted proxy with a tailscale identity",
 			remote:     "127.0.0.1:5000",
-			headers:    map[string]string{"Tailscale-User-Login": "jok@example.com"},
+			headers:    map[string]string{"Tailscale-User-Login": "viewer@example.com"},
 			wantStatus: http.StatusOK,
-			wantCodes:  "identity=jok@example.com",
+			wantCodes:  "identity=viewer@example.com",
 		},
 		{
 			name:       "trusted proxy with a cloudflare identity",
 			remote:     "100.101.102.103:5000",
-			headers:    map[string]string{"Cf-Access-Authenticated-User-Email": "jok@example.com"},
+			headers:    map[string]string{"Cf-Access-Authenticated-User-Email": "viewer@example.com"},
 			wantStatus: http.StatusOK,
-			wantCodes:  "identity=jok@example.com",
+			wantCodes:  "identity=viewer@example.com",
 		},
 		{
 			name:       "trusted proxy with no identity",
@@ -171,14 +171,14 @@ func TestProxyMode(t *testing.T) {
 		{
 			name:       "ipv6 loopback is trusted when configured",
 			remote:     "[::1]:5000",
-			headers:    map[string]string{"Tailscale-User-Login": "jok@example.com"},
+			headers:    map[string]string{"Tailscale-User-Login": "viewer@example.com"},
 			wantStatus: http.StatusOK,
-			wantCodes:  "identity=jok@example.com",
+			wantCodes:  "identity=viewer@example.com",
 		},
 		{
 			name:       "unparseable remote address is refused",
 			remote:     "not-an-address",
-			headers:    map[string]string{"Tailscale-User-Login": "jok@example.com"},
+			headers:    map[string]string{"Tailscale-User-Login": "viewer@example.com"},
 			wantStatus: http.StatusForbidden,
 		},
 	}
@@ -381,7 +381,7 @@ func TestSuccessIsCounted(t *testing.T) {
 	}
 
 	req := request(http.MethodGet, "/api/libraries", "127.0.0.1:1")
-	req.Header.Set("Tailscale-User-Login", "jok@example.com")
+	req.Header.Set("Tailscale-User-Login", "viewer@example.com")
 	recorder := httptest.NewRecorder()
 	gate.Middleware(okHandler()).ServeHTTP(recorder, req)
 

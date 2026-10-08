@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jok/astraeus-media/internal/library"
+	"github.com/ykzird/astraeus/internal/library"
 )
 
 // memoryStore is a Store in memory. The worker only needs to list entities and

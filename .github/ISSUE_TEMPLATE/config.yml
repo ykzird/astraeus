@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/ykzird/astraeus/security/advisories/new
+    about: Report a vulnerability privately, never in a public issue.
+  - name: Deployment and TLS
+    url: https://github.com/ykzird/astraeus/blob/main/deploy/README.md
+    about: Running it as a service, in a container, or behind a reverse proxy.

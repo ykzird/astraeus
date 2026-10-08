@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jok/astraeus-media/internal/streaming"
+	"github.com/ykzird/astraeus/internal/streaming"
 )
 
 // TestPlaybackProgress_RoundTrip covers the report-and-resume loop: a client

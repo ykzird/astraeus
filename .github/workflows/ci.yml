@@ -1,13 +1,17 @@
 name: CI
 
-# NOTE: the repository has no remote yet, so this workflow has never run on
-# GitHub. Every step below is a command that has been run by hand on the
-# development host; see deploy/README.md, which records what was verified and
-# what was not.
+# Build, vet, test and scan on every push and pull request. The image job builds
+# the container and starts it, because building is not the same as running.
+#
+# The weekly schedule repeats all of it against a clean machine, which is what
+# catches a dependency or a runner image that has drifted since the last push
+# rather than at the moment someone opens a pull request.
 
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
 
 permissions:
   contents: read
@@ -68,6 +72,25 @@ jobs:
       # needs no npm install and no lockfile.
       - name: Test the web core
         run: node --test web/
+
+  secrets:
+    name: Scan for secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The scanner diffs a branch against its base, so it needs the history
+          # rather than the default single commit.
+          fetch-depth: 0
+
+      # Pinned to a commit, not a tag: this job reads the whole repository, and
+      # a tag can be moved under it. Dependabot keeps the pin current.
+      # `--results=verified,unknown` reports credentials it could prove are live
+      # and ones it could not check, which is the honest pair; `unverified` is
+      # left out because it is mostly entropy false positives.
+      - uses: trufflesecurity/trufflehog@e76dff8a7e57d6df0c60ad8cbf5d5cba505a8fc9 # v3.99.2
+        with:
+          extra_args: --results=verified,unknown --no-update
 
   image:
     name: Build the container image

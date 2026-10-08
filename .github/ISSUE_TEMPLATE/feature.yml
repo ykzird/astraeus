@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest something the server should do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `TODO.md` lists what is known to be missing, and the handoff's open-work
+        section explains the order and the reasoning. It is worth a look first —
+        the answer may be "planned, here is why it is not done yet".
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the server makes hard or impossible?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: A rough shape is fine. If it changes the API, say what a client would send.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead today
+      description: A workaround, another tool, or nothing.
+    validations:
+      required: false

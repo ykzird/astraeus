@@ -1,0 +1,57 @@
+name: Bug report
+description: Something does not work the way it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please **do not** file security problems here —
+        see [SECURITY.md](https://github.com/ykzird/astraeus/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How to reproduce
+      description: |
+        The exact commands or clicks, from a known starting point. If media is
+        involved, `ffprobe` output for the file's streams is the single most
+        useful thing you can include.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: |
+        Log lines (`--log-format json` is easiest to search), the negotiation
+        `reasons`, a `GET /api/system/capabilities` dump, or the relevant
+        response. Please redact hostnames, addresses and tokens.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `astraeus-server version`, or the release tag.
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and architecture, `ffmpeg -version`'s first line, and how the server is run (binary, container, systemd unit).
+    validations:
+      required: true

@@ -2,7 +2,7 @@ package library_test
 
 import (
 	"context"
-	"github.com/jok/astraeus-media/internal/library"
+	"github.com/ykzird/astraeus/internal/library"
 	"os"
 	"path/filepath"
 	"testing"

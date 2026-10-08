@@ -109,7 +109,7 @@ sha256sum -c ../checksums.txt     # from the same release
 ./astraeus-server serve --db astraeus.db
 
 # Or the image, which includes ffmpeg and tesseract.
-docker pull ghcr.io/jok/astraeus-media:0.17.0
+docker pull ghcr.io/ykzird/astraeus:0.17.0
 ```
 
 A release is cut by pushing a tag; `scripts/build-release.sh` is the whole build

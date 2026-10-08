@@ -16,3 +16,22 @@
 /.gocache/
 /.tmp/
 /.streams/
+
+# Environment files. Nothing here reads one today - every secret arrives as a
+# flag or an environment variable - but a .env that is never meant to be
+# committed is exactly the file that gets committed by accident.
+.env
+.env.*
+*.env
+
+# What `gh auth login` leaves behind when it is run from inside the tree.
+gha-creds-*.json
+
+# Editor and OS noise.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

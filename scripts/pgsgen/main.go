@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/jok/astraeus-media/internal/testfixtures/pgs"
+	"github.com/ykzird/astraeus/internal/testfixtures/pgs"
 )
 
 func main() {

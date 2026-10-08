@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/jok/astraeus-media/internal/library"
+	"github.com/ykzird/astraeus/internal/library"
 )
 
 func TestTMDB_FetchMetadata_Movie(t *testing.T) {

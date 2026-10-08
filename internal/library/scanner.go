@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jok/astraeus-media/internal/library/naming"
+	"github.com/ykzird/astraeus/internal/library/naming"
 )
 
 // ScanResult summarises what a scan actually did. It is returned to callers

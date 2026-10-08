@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jok/astraeus-media/internal/library"
+	"github.com/ykzird/astraeus/internal/library"
 )
 
 // TMDBBaseURL is the public TMDB API endpoint. It is a field on the provider so

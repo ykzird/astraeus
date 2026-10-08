@@ -44,7 +44,7 @@ FROM debian:bookworm-slim
 # VERSION and REVISION; an untagged build gets defaults that say so.
 ARG VERSION=dev
 ARG REVISION=unknown
-ARG SOURCE=https://github.com/jok/astraeus-media
+ARG SOURCE=https://github.com/ykzird/astraeus
 LABEL org.opencontainers.image.title="Astraeus Media" \
       org.opencontainers.image.description="A single-binary media server with an embedded web UI" \
       org.opencontainers.image.source="${SOURCE}" \

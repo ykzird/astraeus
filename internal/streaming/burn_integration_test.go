@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jok/astraeus-media/internal/testfixtures/pgs"
+	"github.com/ykzird/astraeus/internal/testfixtures/pgs"
 )
 
 // writePGSFixture writes a .sup holding one white rectangle shown from 0.5s to

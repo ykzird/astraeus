@@ -1,0 +1,37 @@
+# Dependabot keeps the things this project does not vendor up to date: the Go
+# modules, the actions the workflows run (including the commit pins, which carry
+# their version as a comment for exactly this), and the two base images the
+# container is built on.
+#
+# One grouped pull request per ecosystem per week rather than one per
+# dependency: `main` requires a pull request and a green CI run, so the useful
+# signal is which group fails, not how many branches are open.
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-modules:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # golang:1.26-bookworm and debian:bookworm-slim; most of the image's attack
+  # surface is in these two.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      base-images:
+        patterns: ["*"]

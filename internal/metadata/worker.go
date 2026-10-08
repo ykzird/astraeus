@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/jok/astraeus-media/internal/library"
-	"github.com/jok/astraeus-media/internal/observability"
+	"github.com/ykzird/astraeus/internal/library"
+	"github.com/ykzird/astraeus/internal/observability"
 )
 
 // Store is the persistence this package needs, and nothing more: read the

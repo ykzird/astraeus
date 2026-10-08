@@ -8,8 +8,8 @@ import (
 	"net/netip"
 	"testing"
 
-	"github.com/jok/astraeus-media/internal/access"
-	"github.com/jok/astraeus-media/internal/observability"
+	"github.com/ykzird/astraeus/internal/access"
+	"github.com/ykzird/astraeus/internal/observability"
 )
 
 // progressList is the shape GET /api/progress answers with.

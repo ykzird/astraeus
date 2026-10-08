@@ -24,7 +24,7 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/jok/astraeus-media/internal/observability"
+	"github.com/ykzird/astraeus/internal/observability"
 )
 
 // Mode selects how the gate establishes identity.

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jok/astraeus-media/internal/library"
+	"github.com/ykzird/astraeus/internal/library"
 )
 
 // stubProvider is a Provider test double shared by the provider and

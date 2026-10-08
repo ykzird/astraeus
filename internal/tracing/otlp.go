@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jok/astraeus-media/internal/observability"
+	"github.com/ykzird/astraeus/internal/observability"
 )
 
 // exporter batches finished spans and posts them to an OTLP/HTTP endpoint.

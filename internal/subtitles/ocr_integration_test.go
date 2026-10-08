@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jok/astraeus-media/internal/testfixtures/pgs"
+	"github.com/ykzird/astraeus/internal/testfixtures/pgs"
 )
 
 // muxPGSFixture writes a .sup and muxes it into a Matroska file, the way a

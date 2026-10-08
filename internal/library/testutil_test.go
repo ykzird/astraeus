@@ -2,7 +2,7 @@ package library_test
 
 import (
 	"context"
-	"github.com/jok/astraeus-media/internal/library"
+	"github.com/ykzird/astraeus/internal/library"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jok/astraeus-media/internal/library/sqlite"
+	"github.com/ykzird/astraeus/internal/library/sqlite"
 )
 
 // Test helpers shared by the library package tests.

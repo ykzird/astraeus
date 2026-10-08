@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jok/astraeus-media/internal/observability"
+	"github.com/ykzird/astraeus/internal/observability"
 )
 
 // newTestLogger keeps manager logging out of the test output.

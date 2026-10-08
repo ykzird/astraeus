@@ -1,0 +1,23 @@
+# Reviewers for paths that deserve a second look.
+#
+# One maintainer means this is a note to the future rather than a routing table:
+# these are the security boundary, the release path, and the deployment shapes,
+# and they are the places a change should be read twice.
+
+* @ykzird
+
+# The access gate, and the API that trusts it.
+/internal/access/   @ykzird
+/internal/api/      @ykzird
+
+# The artwork proxy is the nearest thing here to an SSRF surface.
+/internal/images/   @ykzird
+
+# Anything that ends up running ffmpeg.
+/internal/streaming/ @ykzird
+/internal/subtitles/ @ykzird
+
+# How it is built, published and deployed.
+/.github/workflows/ @ykzird
+/deploy/            @ykzird
+/Dockerfile         @ykzird

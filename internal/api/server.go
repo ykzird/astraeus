@@ -18,14 +18,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jok/astraeus-media/internal/access"
-	"github.com/jok/astraeus-media/internal/images"
-	"github.com/jok/astraeus-media/internal/library"
-	"github.com/jok/astraeus-media/internal/metadata"
-	"github.com/jok/astraeus-media/internal/observability"
-	"github.com/jok/astraeus-media/internal/streaming"
-	"github.com/jok/astraeus-media/internal/subtitles"
-	"github.com/jok/astraeus-media/internal/tracing"
+	"github.com/ykzird/astraeus/internal/access"
+	"github.com/ykzird/astraeus/internal/images"
+	"github.com/ykzird/astraeus/internal/library"
+	"github.com/ykzird/astraeus/internal/metadata"
+	"github.com/ykzird/astraeus/internal/observability"
+	"github.com/ykzird/astraeus/internal/streaming"
+	"github.com/ykzird/astraeus/internal/subtitles"
+	"github.com/ykzird/astraeus/internal/tracing"
 )
 
 // maxRequestBody bounds request bodies so a malformed client cannot exhaust

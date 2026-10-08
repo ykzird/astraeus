@@ -1,14 +1,15 @@
 # Handoff
 
-**As of the round-10 work of 2026-10-08 — release automation. 117 tracked
-files; the in-tree version is `dev` and a release takes its number from its tag
-(the next tag would be v0.17.0).** (`git log` names the commits; the previous
-handoff was `e2a434e`, which made a quality choice cap a ladder. Round 9 was that
-ladder cap, round 8 OCR for PGS image subtitles, round 7 front-end unit tests,
-round 6 trace export, round 5 API rate limiting, round 4 image subtitles by
-burn-in, round 3 per-viewer progress, and round 2 HDR/Dolby Vision, packaging,
-the bitrate ceiling, the adaptive ladder, audio track selection, resumable
-playback, the continue-watching list and response hardening.)
+**As of the round-10 work of 2026-10-08 — release automation, and the repository
+going public. 126 tracked files; the in-tree version is `dev` and a release takes
+its number from its tag (the next tag would be v0.17.0).** (`git log` names the
+commits; the previous handoff was `e2a434e`, which made a quality choice cap a
+ladder. Round 9 was that ladder cap, round 8 OCR for PGS image subtitles, round 7
+front-end unit tests, round 6 trace export, round 5 API rate limiting, round 4
+image subtitles by burn-in, round 3 per-viewer progress, and round 2 HDR/Dolby
+Vision, packaging, the bitrate ceiling, the adaptive ladder, audio track
+selection, resumable playback, the continue-watching list and response
+hardening.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -39,15 +40,15 @@ end lives in `docs/adversarial-review.md`, with the two raw reports in
 The development host is an **AMD Ryzen 7 9700X, no Intel or NVIDIA GPU, and
 `/dev/dri` is not visible from the sandbox** — so no hardware encoding path can
 be exercised here. Real media for testing lives at
-`/home/jok/jellyfin/media/movies/` (a 17 GB 4K HEVC HDR film and a second film).
-`real.db` points at it. **Never modify anything under `/home/jok/jellyfin`**, and
+`$HOME/jellyfin/media/movies/` (a 17 GB 4K HEVC HDR film and a second film).
+`real.db` points at it. **Never modify anything under `$HOME/jellyfin`**, and
 remember `*.db` is gitignored, so the library database is local state.
 
 Traps that have cost time:
 
 | Trap | What to do |
 | --- | --- |
-| `/tmp` is a per-invocation tmpfs | `export GOCACHE=/home/jok/Work/deepseek-harness/.gocache TMPDIR=/home/jok/Work/deepseek-harness/.tmp` before any Go command |
+| `/tmp` is a per-invocation tmpfs | `export GOCACHE=$HOME/Work/deepseek-harness/.gocache TMPDIR=$HOME/Work/deepseek-harness/.tmp` before any Go command |
 | Go needs `mise exec --` | `mise exec -- go test ./...` |
 | `pgrep -f` / `pkill -f` match the wrapper's **own** command line | never `pkill -f` a pattern that appears in the command you are running; it kills your own shell (this happened twice) |
 | `go build ./...` does **not** refresh `./astraeus-server` | `mise exec -- go build -o ./astraeus-server ./cmd/astraeus-server` |
@@ -57,7 +58,7 @@ Traps that have cost time:
 | Stream and cache dirs default to temp | pass `--stream-root` / `--subtitle-cache` / `--image-cache` inside the workspace when testing |
 | `web/vendor/hls.min.js` is 620 KB on one line | exclude `web/vendor` (or `*.min.js`) from any search across `web/`, or one grep flushes the result |
 | The session transcript echoes each provider response in a `stream` field | a char count over it says ~3x the truth. Take the prompt size from the `usage` block of the last `assistant/message`: `inputTokens + cacheReadTokens` |
-| The Go module cache (`/home/jok/go/pkg/mod`) is **read-only** under the sandbox | builds and tests work, but adding or bumping a module fails with `read-only file system`. The network is reachable, so the fix is to point `GOMODCACHE` (and `GOPATH` if needed) inside the workspace; the alternative is to avoid the new dependency, which is why the Prometheus exposition and the OTLP exporter are hand-rolled |
+| The Go module cache (`$(go env GOMODCACHE)`) is **read-only** under the sandbox | builds and tests work, but adding or bumping a module fails with `read-only file system`. The network is reachable, so the fix is to point `GOMODCACHE` (and `GOPATH` if needed) inside the workspace; the alternative is to avoid the new dependency, which is why the Prometheus exposition and the OTLP exporter are hand-rolled |
 | `docker` wants its state inside the workspace | export `DOCKER_CONFIG=$PWD/../.tmp/docker-config BUILDX_CONFIG=$PWD/../.tmp/buildx`. The registry is reachable (`docker pull jaegertracing/all-in-one` was used to verify trace export) |
 
 ---
@@ -273,6 +274,20 @@ docker run --rm astraeus-media:0.17.0 version
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/repo -w /repo rhysd/actionlint:latest
 ```
 
+The repository is public, so secrets are scanned in two places: CI runs trufflehog
+on every push and pull request, and GitHub's own secret scanning and push
+protection are enabled. The same scan is worth running before pushing something
+you suspect:
+
+```sh
+# Verified and unknown-result credentials, over the full history.
+docker run --rm -v "$PWD":/repo trufflesecurity/trufflehog:latest \
+  git file:///repo --results=verified,unknown --no-update
+# A second opinion from a different rule set.
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/repo zricethezav/gitleaks:latest \
+  detect --source=/repo --redact -v
+```
+
 
 ---
 
@@ -434,6 +449,31 @@ Verified in a real browser against real 4K content in the round-2 work: 28/28
 chrome, 13/13 player, 10/10 subtitles. Full Go suite green with race and
 integration. Those numbers belong to that content: the bundled demo clips score
 lower on the auto-hide checks for fixture reasons (§8).
+
+**The repository went public** in round 10, which changes the project's surface
+rather than its behaviour. The module path was `github.com/jok/astraeus-media`
+while the remote is `github.com/ykzird/astraeus`, so `go install` and pkg.go.dev
+would both have failed on a mismatch the compiler never sees — nothing in the
+tree resolves the module by its public path. Every import, the `go.mod` module
+line, the Dockerfile's `SOURCE` default and the README's registry example now say
+`github.com/ykzird/astraeus`. Personal absolute paths came out of the handoff, the
+licence holder matches the public identity, and `.gitignore` gained the files an
+accident reaches for: `.env*`, editor noise, and what `gh auth login` writes when
+it runs inside the tree.
+
+Before the first push, all 35 commits were scanned: gitleaks found nothing across
+2.26 MB, trufflehog found no verified or unknown credentials across 1183 chunks,
+no credential-shaped file, database or media file had ever been committed, and the
+largest blob in history was 606 KB (`web/vendor/hls.min.js`). That scan is now
+continuous rather than a moment — CI runs trufflehog on every push and pull
+request (pinned to a commit, because a tag can move under a job that reads the
+whole repository), GitHub's secret scanning and push protection are on, and
+Dependabot watches the Go modules, the workflow actions including those commit
+pins, and the two container base images. The files a public repository is expected
+to have came with it — CONTRIBUTING (the verification rules this project actually
+follows), SECURITY, a pull-request template that asks for evidence, issue
+templates, a code of conduct and CODEOWNERS — and `main` is protected: a pull
+request, green CI, linear history.
 
 **Release automation** landed as of round 10 (untagged; the next tag is
 v0.17.0). Pushing a `v*` tag runs `.github/workflows/release.yml`, which gates on

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jok/astraeus-media/internal/streaming"
+	"github.com/ykzird/astraeus/internal/streaming"
 )
 
 const sampleSRT = `1

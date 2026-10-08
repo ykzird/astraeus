@@ -3,7 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
-	"github.com/jok/astraeus-media/internal/library"
+	"github.com/ykzird/astraeus/internal/library"
 	"path/filepath"
 	"testing"
 	"time"

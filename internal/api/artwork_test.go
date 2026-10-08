@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/jok/astraeus-media/internal/images"
-	"github.com/jok/astraeus-media/internal/library"
+	"github.com/ykzird/astraeus/internal/images"
+	"github.com/ykzird/astraeus/internal/library"
 )
 
 // artworkOrigin stands in for the remote image CDN.
