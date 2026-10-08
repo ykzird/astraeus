@@ -75,6 +75,25 @@ for platform in "${platforms[@]}"; do
 	cp -R web "$stage/web"
 	cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
 
+	# deploy/README.md's systemd runbook is written to be followed from an
+	# extracted archive: it installs the unit out of deploy/ and copies the
+	# project's documents into /usr/local/share/doc/astraeus. Every path it
+	# names therefore has to be in here, or the runbook fails on a host that
+	# has nothing but the release.
+	cp README.md SPECIFICATION.md TODO.md CONTEXT.md CONTRIBUTING.md SECURITY.md "$stage/"
+	cp -R docs deploy "$stage/"
+
+	# That runbook is this layout's acceptance test, so run it here. A missing
+	# file is a broken release, and this is the last point at which the build
+	# can say so rather than a user on a clean machine.
+	for f in astraeus-server web README.md SPECIFICATION.md TODO.md CONTEXT.md \
+		CONTRIBUTING.md SECURITY.md LICENSE THIRD_PARTY_NOTICES.md docs deploy; do
+		[[ -e "$stage/$f" ]] || {
+			echo "build-release: $f is missing from $name, so the systemd runbook in deploy/README.md cannot be followed from this archive" >&2
+			exit 1
+		}
+	done
+
 	tar -C "$dist" -czf "$dist/$name.tar.gz" "$name"
 	rm -rf "$stage"
 done

@@ -118,7 +118,9 @@ tesseract 5.5.3.
 
 ## systemd
 
-Assumes a Linux host with `ffmpeg` installed from the distribution.
+Assumes a Linux host with `ffmpeg` installed from the distribution, and an
+extracted release archive to run these steps from: every file they name is
+inside one (`astraeus-server`, `web/`, `deploy/` and the project documents).
 
 ```sh
 # 1. An account with no shell, and the three directories the unit names.
@@ -204,7 +206,10 @@ it without spending a tag.
 **What a release contains.** One `astraeus-server_<version>_<os>_<arch>.tar.gz`
 per platform — `linux/amd64` and `linux/arm64` by default — each holding the
 binary, the `web` directory it serves (a server without a UI is half a server),
-`LICENSE` and `THIRD_PARTY_NOTICES.md`, plus a `checksums.txt` covering them:
+the `deploy` directory with the systemd unit, the project's documentation,
+`LICENSE` and `THIRD_PARTY_NOTICES.md`, plus a `checksums.txt` covering them.
+The archive is self-sufficient: the systemd runbook above is meant to be
+followed from an extracted one, and every path it names is in there:
 
 ```sh
 sha256sum -c checksums.txt          # from inside the extracted release dir
