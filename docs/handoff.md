@@ -1,16 +1,18 @@
 # Handoff
 
-**As of the round-11 work of 2026-10-08 — the documentation restructure. 130
-tracked files; the in-tree version is `dev` and a release takes its number from
-its tag (the next tag would be v0.17.0).** (`git log` names the commits; the
-previous handoff was `442bbc1`, and a refresh on top of it added §10 — a QEMU VM
+**As of the round-12 work of 2026-10-09 — the first real release run and the first
+real systemd start. 130 tracked files; `v0.17.0` is released, so the in-tree
+version is `dev` and the next tag would be `v0.17.1`.** (`git log` names the
+commits. Round 11 was the documentation restructure, which added §10 — a QEMU VM
 for the systemd unit and the release run — and moved those two untested claims to
-the top of §7. Round 10 was release automation and going public,
-which found a ladder defect the development host's ffmpeg had been hiding; round
-9 made a quality choice cap a ladder; round 8 was OCR for PGS image subtitles;
-round 7 front-end unit tests; round 6 trace export; round 5 API rate limiting;
-round 4 image subtitles by burn-in; round 3 per-viewer progress; earlier rounds
-are in `git log`.)
+the top of §7. Round 12 went and did them: the release workflow ran for real on a
+tag and found two defects in itself, both now fixed (§6), and the unit was then
+started on a clean VM and made to transcode under its own syscall filter. Round 10
+was release automation and going public, which found a ladder defect the
+development host's ffmpeg had been hiding; round 9 made a quality choice cap a
+ladder; round 8 was OCR for PGS image subtitles; round 7 front-end unit tests;
+round 6 trace export; round 5 API rate limiting; round 4 image subtitles by
+burn-in; round 3 per-viewer progress; earlier rounds are in `git log`.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -300,9 +302,24 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/repo zricethezav/gitleaks:
   detect --source=/repo --redact -v
 ```
 
-Two claims cannot be checked on this host at all — the systemd unit, because there
-is no reachable systemd manager, and the release workflow, because nothing has
-been tagged. **§10** is a QEMU VM that covers both.
+Two claims could not be checked on this host at all — the systemd unit, because
+there is no reachable systemd manager, and the release workflow, because nothing
+had been tagged. Both have now been checked on the QEMU VM in **§10**, which is a
+recipe that has been run rather than a plan: it installs the *published* `v0.17.0`
+release archive and then follows `deploy/README.md` verbatim.
+
+A published release is checked against its artefacts, not its YAML:
+
+```sh
+gh release view v0.17.0                       # the assets, the notes, not a draft
+gh release download v0.17.0 -D /tmp/rel
+(cd /tmp/rel && sha256sum -c checksums.txt)   # both archives, against the checksums
+docker pull ghcr.io/ykzird/astraeus:0.17.0
+# Both platform manifests, and an attestation manifest per platform.
+docker buildx imagetools inspect ghcr.io/ykzird/astraeus:0.17.0
+# The version is baked in at build time, so this reads it back from the image.
+docker run --rm --entrypoint astraeus-server ghcr.io/ykzird/astraeus:0.17.0 version
+```
 
 ---
 
@@ -530,16 +547,15 @@ templates and CODEOWNERS — and `main` is protected: a pull request, green CI,
 linear history. There is deliberately no code of conduct: nobody asked for one and
 it would be a document nobody reads.
 
-**Release automation** landed as of round 10 (untagged; the next tag is
-v0.17.0). Pushing a `v*` tag runs `.github/workflows/release.yml`, which gates on
-the unit tests, builds one archive per platform with
-`scripts/build-release.sh`, publishes a GitHub Release with a checksums file and
-generated notes, and pushes a multi-arch image — `linux/amd64` and `linux/arm64`
-in one manifest — to GHCR with build provenance and an SBOM attested alongside
-it. The workflow is thin on purpose: all of the work is in the script, which runs
-by hand, and that is how it was verified. CI has since run on GitHub — and found
-the ladder defect described above — but the release workflow still has not,
-because no tag has been pushed.
+**Release automation** landed as of round 10, and `v0.17.0` is the first release
+it produced (round 12; §6 has what the run found). Pushing a `v*` tag runs
+`.github/workflows/release.yml`, which gates on the unit tests, builds one archive
+per platform with `scripts/build-release.sh`, publishes a GitHub Release with a
+checksums file and generated notes, and pushes a multi-arch image — `linux/amd64`
+and `linux/arm64` in one manifest — to GHCR with build provenance and an SBOM
+attested alongside it. The workflow is thin on purpose: all of the work is in the
+script, which runs by hand, and which is how the artifacts were verified before
+the first tag existed.
 
 Two decisions shaped it. **The version had to stop being a constant.** It is now
 a variable set from the tag with `-ldflags "-X main.version=..."`, so `go build`
@@ -559,8 +575,52 @@ labels, `docker inspect` read all eight labels back with the right revision, and
 the container served `/api/health`. The multi-arch build was run for real
 (emulated arm64 only for the runtime layer's `apt-get`, because the builder stage
 runs on `$BUILDPLATFORM` and cross-compiles) and its OCI index carries both
-platforms. `actionlint` accepts both workflows. What has *not* happened is GitHub
-running any of it.
+platforms. `actionlint` accepts both workflows.
+
+**The release workflow has now run, and the first tagged release found two
+defects — which is exactly what running it was for.** Round 12.
+
+The dry run (`gh workflow run release.yml -f dry_run=true`) was green on all four
+jobs and published nothing: `Publish the GitHub Release` came back `skipped`, the
+version resolved to `0.0.0-dryrun` rather than to a release number, and both
+uploaded archives passed `sha256sum -c` against the uploaded checksums file.
+
+The first real tag then failed, in the one job the dry run cannot exercise. The
+publish job had no `actions/checkout`, so `gh` had no git remote to infer the
+repository from:
+
+```
+failed to run git: fatal: not a git repository (or any of the parent directories): .git
+```
+
+Everything else in that run succeeded — the gate, the archives, and the
+multi-arch image (`linux/amd64`, `linux/arm64` and one attestation manifest per
+platform) reached GHCR. The fix is a checkout in that job; PR #9.
+
+A second defect was found before the tag was spent, and it was older. The archive
+held only the binary, `web/`, `LICENSE` and `THIRD_PARTY_NOTICES.md`, while
+`deploy/README.md`'s systemd runbook copies `deploy/` and the project documents
+into `/usr/local/share/doc/astraeus` and installs `deploy/astraeus.service` from
+there. Eight of the ten paths that runbook names did not exist in a release, so
+anyone with nothing but the archive could not install the unit at all — observed
+on the clean VM as `cp: cannot stat 'README.md'` through `cp: cannot stat
+'deploy'`. `scripts/build-release.sh` now stages them and fails the build if a
+path the runbook names is missing, and CI asserts the same layout on every pull
+request; PR #8.
+
+`v0.17.0` was then re-cut onto the fixed commit and the whole workflow is green.
+The GitHub Release exists with both archives and `checksums.txt` and generated
+notes; a fresh download passes `sha256sum -c`; `docker pull
+ghcr.io/ykzird/astraeus:0.17.0` succeeds anonymously and
+`docker buildx imagetools inspect` shows the two platform manifests plus their
+attestation manifests. The OCI labels carry `version=0.17.0` and
+`revision=eead1e8`.
+
+**Re-cutting the tag was a deliberate one-off**, not a habit: the release page
+never existed, so nothing outside GHCR had been published under that number. A
+tag runs the workflow *as it stood at that tag's commit*, so a fix to the
+workflow cannot reach an already-pushed tag — the choice was to move it or to
+release the number again as `v0.17.1`.
 
 **A quality choice that caps a ladder** landed as of 0.16.0, which fixes a
 negotiation model that was thinner than its field name. Until now
@@ -844,8 +904,39 @@ HDR tone map and an HDR remux *and* an HDR re-encode using the image's own
 **ffmpeg 5.1.9** (the host has 9.0, so this was a real second data point for the
 filter chain). Round 8 added **tesseract** to the image and verified OCR there
 with its own **tesseract 5.3.0**: a mounted PGS fixture served WebVTT carrying
-the fixture's caption. The unit passes `systemd-analyze verify` and scores 1.6
-(OK) on `systemd-analyze security`. See §8 for what that does *not* cover.
+the fixture's caption.
+
+**The systemd unit has now been started and exercised, on a clean Debian 12 VM**
+(QEMU under TCG, §10), installing the `v0.17.0` release archive and following
+`deploy/README.md` verbatim. `systemd-analyze verify` was clean, the service came
+up and stayed up, and `/api/health` answered
+`{"service":"astraeus","status":"ok"}`. `systemd-analyze security astraeus`, run
+*inside* the guest rather than with `--offline=yes`, scores **1.6 (OK)** — the
+number `deploy/README.md` quotes, now observed rather than predicted. The unit
+declares no `StateDirectory` or `CacheDirectory`: the runbook's `install -d`
+creates the two writable trees, and the service created
+`/var/lib/astraeus/streams` (0700) and `astraeus.db` (0600) itself under
+`UMask=0077`.
+
+The hardening was tested the way this list asked for it — by making the service
+run ffmpeg, not by watching it start. Negotiating `max_height: 360` against a
+1280x720 source returned `"mode":"transcode"`, and the server's own ffmpeg child
+was caught alive and read back its own sandbox:
+
+```
+cgroup:       0::/system.slice/astraeus.service
+Name:         ffmpeg
+Seccomp:      2          (28 filters)
+CapEff:       0000000000000000
+CapBnd:       0000000000000000
+NoNewPrivs:   1
+```
+
+The syscall filter is therefore installed on ffmpeg itself, not merely on the
+server that forks it, and the encode finished with no `EPERM` in the journal: the
+produced segment ffprobes as H.264 `854x480` from a 1920x1080 source, which is
+something a copied stream could not be. §8 records what this still does not
+cover.
 
 ---
 
@@ -853,48 +944,25 @@ the fixture's caption. The unit passes `systemd-analyze verify` and scores 1.6
 
 Priority order, with the reasoning. Take it top-down.
 
-The first two are the claims the documentation currently marks *untested*, and
-both need something this development host does not have: a pushed tag, and a
-systemd manager. Both are cheap on a QEMU VM — see §10, which is a plan rather
-than a recipe that has been run.
+The two claims that used to head this list — the release run and the systemd unit
+— are done, and observed rather than reasoned about. §6 records what running them
+found, including the two defects that only a real run could surface. What is
+left:
 
-1. **Run the release workflow, for real.** `.github/workflows/release.yml` has
-   never executed: every step was run by hand, CI proves the same commit builds,
-   but no tag has been pushed, so the GitHub Release and the GHCR push are
-   unverified. Two passes, cheapest first:
-   `gh workflow run release.yml -f dry_run=true` builds the archives and the
-   multi-arch image and publishes nothing; check all three jobs and the uploaded
-   artifacts. Then a real tag (`git tag -a v0.17.0 && git push origin v0.17.0`)
-   and check the release page, `sha256sum -c checksums.txt` on a downloaded
-   archive, `docker pull ghcr.io/ykzird/astraeus:0.17.0`, and the provenance and
-   SBOM attestations (`docker buildx imagetools inspect`). One trap to know
-   before tagging: **a tag push does not run `ci.yml`**, because its `push`
-   trigger is filtered to `main` (GitHub runs a filtered event only for the refs
-   it names). The release gate is `vet` plus the unit tests; the tagged commit is
-   a `main` commit that already passed the full suite, so cut tags from `main`
-   and nowhere else.
-2. **Test the systemd unit.** `systemctl` has never been reachable from this
-   host, so `ProtectSystem=strict`, `ReadWritePaths`, `StateDirectory` and
-   `SystemCallFilter=@system-service` are reasoned about rather than observed.
-   The syscall filter is the one line that can break playback, so "it starts" is
-   not the test: it has to start **and then serve a request that runs ffmpeg**.
-   §10 has the VM. Two results are worth capturing: `systemd-analyze security`
-   run *inside* the guest (the number `deploy/README.md` quotes today comes from
-   `--offline=yes`), and the service surviving a transcode.
-3. **A TLS example.** Release automation landed in round 10 (see §6), so a tag
+1. **A TLS example.** Release automation landed in round 10 (see §6), so a tag
    now builds and publishes the archives and the image; what is still missing is
    the reverse-proxy configuration beside the unit, and the runbook for the
    access-gate interaction a proxy creates.
-4. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
+2. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
    VobSub (or DVB) track keeps its refusal and its burn because it lives in a
    different container with a different palette, and no such sample exists here.
    This is the natural continuation of round 8 and is smaller than it was: the
    pipeline, the routing and the fixture font all exist, so the work is one more
    decoder plus a fixture. See the OCR bullet in §8 for what is unverified.
-5. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
+3. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
    the gate remains instance-wide: it admits a request, it does not decide what
    the request may see, so every admitted viewer sees the whole library.
-6. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
+4. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
@@ -1073,32 +1141,34 @@ than a recipe that has been run.
   `main` and not again when a tag is pushed (a filtered event runs only for the
   refs it names). The release workflow's gate re-runs `vet` and the unit tests, so
   a tag cut anywhere but `main` would publish with less coverage than a merge.
-  Tag from `main`; see §7 item 1.
-- **The QEMU VM in §10 is a plan, not a recipe that has been run.** The tooling
-  exists on this host and the cloud image is reachable, but nothing in §10 has
-  been executed, so its commands should be corrected from what the first run
-  teaches rather than trusted.
-- **Packaging is verified unevenly, and the gaps are known.** The container was
-  built, started and exercised. The systemd unit was checked with
-  `systemd-analyze verify` and `security`, but never *started*: the development
-  host has no reachable systemd manager, so the hardening directives
-  (`ProtectSystem=strict`, `ReadWritePaths`, the syscall filter) are reasoned
-  about rather than observed. **CI runs on GitHub; the release workflow does
-  not yet.** Every step of both was run by hand here before the repository was
-  public, and CI has since proved itself by failing on the runner's ffmpeg where
-  this host passed (see the ladder defect above). No tag has been pushed, so the
-  GitHub Release and the GHCR push remain untested. The release build was run end
-  to end (archives, checksums, the injected
-  version, the labels, a real multi-arch build). The arm64 image needed QEMU for
-  the runtime layer's `apt-get`; `tonistiigi/binfmt --install arm64` registered it
-  on this host, which is a kernel-level change this repository did not make and
-  does not document, because CI's `docker/setup-qemu-action` does the same thing
-  from scratch. `deploy/README.md` states all of this in place, so a reader of the
-  deployment docs does not have to find this handoff to learn it.
-- **The unit's `SystemCallFilter=@system-service` is the one hardening line that
-  could break playback** on a host where an encoder needs a call outside the
-  list. It is the standard set for a service of this kind, but no encoder here
-  exercises every path through it.
+  Tag from `main`. Both `v0.17.0` tags were cut that way, and the second one only
+  after its commit had passed CI on `main`.
+- **The VM recipe in §10 has been run once on this host, and its corrections are
+  recorded there.** What it still does not cover: KVM (there is none here, so
+  every timing in §10 is TCG and worth nothing as a benchmark) and any hardware
+  encoder. The guest was Debian 12.15 with the distribution's **ffmpeg 5.1.9** —
+  a third data point beside the host's 9.0 and the container's 5.1.9.
+- **What packaging still does not cover is hardware, not the packaging.** The
+  container and now the systemd unit have both been run for real — the unit on a
+  clean VM (§6, §10) — and the release workflow has run end to end, so the GitHub
+  Release and the GHCR push are observed rather than assumed. What is still
+  reasoned about is VAAPI, NVENC, AMF and VideoToolbox inside either shape. The
+  guest has no GPU and no render node, so it rejected all six hardware encoders at
+  startup and transcoded on the CPU: that is a statement about the guest, not
+  about the unit. The arm64 image needed QEMU for the runtime layer's `apt-get`;
+  `tonistiigi/binfmt --install arm64` registered it on this host, which is a
+  kernel-level change this repository did not make and does not document, because
+  CI's `docker/setup-qemu-action` does the same thing from scratch.
+  `deploy/README.md` states all of this in place, so a reader of the deployment
+  docs does not have to find this handoff to learn it.
+- **The unit's `SystemCallFilter=@system-service` is exercised, but not
+  exhaustively.** A `libx264` transcode ran to completion under it inside the
+  guest, with the filter attached to the ffmpeg process itself (§6) — that is the
+  encoder the bundled fixtures and any CPU-only install will use. The set also
+  admits `@resources` (`sched_setaffinity`, `mbind`, `set_mempolicy`), so x264's
+  thread and NUMA probing is not the risk it might look like from the unit's
+  comments. What remains unexercised is every *hardware* encoder path, for the
+  reason above: no render node on this host or in the guest.
 - The visual design of a narrow player, and Firefox/Safari rendering generally,
   have not been looked at by eye.
 
@@ -1168,65 +1238,110 @@ documentation without hardware to check them against.
 
 ---
 
-## 10. A QEMU VM for the two things this host cannot do
+## 10. A QEMU VM: the systemd unit and the release run
 
-§7's first two items both need an environment the development host does not have:
-a systemd manager, and a released artifact to install. A small cloud-image VM
-gives both, and the tooling is already installed here — `qemu-system-x86_64`,
-`qemu-img`, `cloud-localds`, `virt-install`, `genisoimage`, `xorriso`.
+**This has been run once (round 12), and the corrections below are what that run
+taught.** The two claims §7 used to head with — a released artifact to install,
+and a systemd manager to install it under — need an environment this development
+host does not have. A small cloud-image VM gives both, and the tooling is
+already here: `qemu-system-x86_64`, `qemu-img`, `cloud-localds`.
 
-The host has **no `/dev/kvm`**, so a guest runs under TCG (software emulation).
+The host has **no `/dev/kvm`**, so the guest runs under TCG (software emulation).
 That is fine for "did the service start, answer, and survive an ffmpeg run" and
-useless as a benchmark: keep fixtures tiny (a generated three-second clip is
-plenty — the point is that ffmpeg *executes* inside the unit's sandbox, not what
-it produces).
+useless as a benchmark. It is also less painful than it sounds: this guest booted
+to ssh in **19 seconds** and installed ffmpeg under cloud-init while doing so. Do
+keep fixtures small — but note the tension: a 5-second 720p clip transcodes in
+about a second, which is *too fast to catch the ffmpeg child alive*. Use a 1080p
+clip of 30–40 seconds when the point is to observe the process rather than the
+artefact.
 
-**This is a plan, not a recipe that has been run.** The next session should treat
-it as a starting point and correct it from what it learns; the sketch below is
-what the environment supports, not something observed.
+### Corrections to the original sketch
+
+- **Do not name the cloud-init user `astraeus`.** The runbook's step 1 is
+  `useradd --system ... astraeus`, so a cloud-init user of that name makes the
+  runbook's *first* command fail with "user already exists". The run below uses
+  `ops`, which leaves the runbook runnable verbatim — which is the point of
+  following it rather than paraphrasing it.
+- **`-nographic` writes the console to the job's stdout and gives no way back
+  in.** `-display none -serial file:console.log` plus the `hostfwd` below is
+  easier to watch from a background job.
+- **The `curl /api/health` in runbook step 4 can fail even though the service
+  started.** The server binds its port only after the startup capability probe,
+  which forks ffmpeg once per encoder family; on this guest that took ~9 seconds
+  and the next line of the runbook raced it. Wait for the port, or retry —
+  `deploy/README.md` now says so.
+- **This host's ssh refuses its own system config** (`Bad owner or permissions
+  on /etc/ssh/ssh_config.d/20-omarchy-keepalive.conf`), so every ssh and scp
+  below needs `-F /dev/null`. That is a quirk of this desk, not of the guest.
 
 ```sh
 # A Debian cloud image, and a copy-on-write disk so the base image stays clean.
 curl -LO https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
 qemu-img create -f qcow2 -F qcow2 -b debian-12-genericcloud-amd64.qcow2 test.qcow2 20G
 
-# cloud-init: one user, a key, and ffmpeg. Anything else is installed later so
-# that what the runbook says is what actually happens.
-cat > user-data <<'YAML'
+# cloud-init: one user (NOT named astraeus), a key, and ffmpeg. Anything else is
+# installed later so that what the runbook says is what actually happens.
+ssh-keygen -t ed25519 -N '' -f id_vm
+cat > user-data <<YAML
 #cloud-config
 users:
-  - name: astraeus
+  - name: ops
     sudo: ALL=(ALL) NOPASSWD:ALL
-    ssh_authorized_keys: [ "ssh-ed25519 AAAA... you" ]
+    lock_passwd: true
+    ssh_authorized_keys: [ "$(cat id_vm.pub)" ]
 packages: [ffmpeg, curl, sqlite3]
+package_update: true
 YAML
-printf 'instance-id: astraeus-test\n' > meta-data
+printf 'instance-id: astraeus-test\nlocal-hostname: astraeus-test\n' > meta-data
 cloud-localds seed.iso user-data meta-data
 
-qemu-system-x86_64 -m 4096 -smp 4 -nographic \
+qemu-system-x86_64 -m 4096 -smp 4 -accel tcg,thread=multi -cpu max \
+  -display none -serial file:console.log \
   -drive file=test.qcow2,if=virtio -drive file=seed.iso,if=virtio,format=raw \
-  -netdev user,id=n0,hostfwd=tcp::2222-:22 -device virtio-net-pci,netdev=n0
+  -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n0
+
+ssh -F /dev/null -i id_vm -o StrictHostKeyChecking=no -p 2222 ops@127.0.0.1
 ```
 
-Then, inside the guest, follow `deploy/README.md`'s systemd runbook and nothing
-else — that is the second half of the point, because the runbook is what a user
-follows:
+### Inside the guest
 
-- install the **release archive** from §7 item 1, not a local build: the binary,
-  `web/`, `docs/`, the unit, the env file, `systemd-analyze verify`, `start`;
-- `curl -s localhost:8642/api/health`, then `systemd-analyze security astraeus`
-  for the *real* score (the 1.6 in `deploy/README.md` comes from
-  `--offline=yes`, which is a static best-effort, not this);
-- generate a clip, scan it, and play it, so the server forks ffmpeg **inside**
-  `SystemCallFilter=@system-service`. A direct play proves nothing about the
-  filter; a transcode is what exercises it. If a session dies with `EPERM`, the
-  filter (or `ProtectSystem`/`ReadWritePaths`) is the first suspect and the
-  ffmpeg log line is the evidence;
-- note what the unit's `StateDirectory`/`CacheDirectory` (or the explicit paths)
-  actually create, and whether `/data` is writable as the `astraeus` user.
+Follow `deploy/README.md`'s systemd runbook and nothing else — that is the second
+half of the point, because the runbook is what a user follows. Install the
+**release archive**, not a local build:
 
-Worth the time, in order: the unit starts and answers; ffmpeg runs under the
-sandbox; `systemd-analyze security` inside the guest; only then a longer
-transcode. Report the numbers and paste the failing log lines if it does not
-start — a unit that cannot start on a clean VM is exactly the defect this is
-looking for, and it is worth finding before someone else does.
+- it comes from
+  `https://github.com/ykzird/astraeus/releases/download/v0.17.0/`; the guest was
+  Debian 12.15 with the distribution's **ffmpeg 5.1.9**, a third data point for
+  the filter chain beside the host's 9.0 and the image's 5.1.9;
+- `sha256sum -c checksums.txt` before extracting — and the archive must carry
+  `deploy/` and the documents, or the runbook cannot be followed at all (that was
+  a real defect; see §6);
+- `systemd-analyze verify` (clean), then start it;
+- `curl -s localhost:8642/api/health`, **after** the port opens;
+- `systemd-analyze security astraeus` for the real score — **1.6 (OK)**, matching
+  the number `deploy/README.md` quotes from `--offline=yes`;
+- the unit declares no `StateDirectory`/`CacheDirectory`. The runbook's
+  `install -d` creates the two writable trees, and the service creates
+  `streams/` (0700) and the database (0600) itself under `UMask=0077`;
+- generate a clip, register the library through the API using the token in
+  `/etc/astraeus/astraeus.env` (the unit runs `--auth-mode token`, so every call
+  except `/api/health` needs `Authorization: Bearer`), scan it, and negotiate a
+  `max_height` **below the source height** — that is what produces
+  `"mode":"transcode"` and therefore what makes the server fork ffmpeg inside the
+  sandbox. A direct play proves nothing about the filter.
+
+To see the sandbox rather than infer it from the output, catch the child while it
+runs and read its own account of itself:
+
+```sh
+PID=$(pgrep -f '[f]fmpeg' | head -1)
+cat /proc/$PID/cgroup                     # 0::/system.slice/astraeus.service
+grep -E '^(Name|Seccomp|Seccomp_filters|NoNewPrivs|CapEff|CapBnd):' /proc/$PID/status
+```
+
+`Seccomp: 2` with a non-zero filter count, `CapEff`/`CapBnd` at zero and
+`NoNewPrivs: 1` is the hardening applied to ffmpeg *itself*, not merely to the
+server that forked it. A segment that ffprobes at the height that was asked for,
+rather than the source's, is the artefact proving the encode really ran. An
+`EPERM` in the journal would name the filter (or `ProtectSystem`/`ReadWritePaths`)
+as the cause; the round-12 run produced none.

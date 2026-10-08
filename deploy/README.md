@@ -152,7 +152,11 @@ sudo install -m 0644 deploy/astraeus.service /etc/systemd/system/astraeus.servic
 sudo systemd-analyze verify /etc/systemd/system/astraeus.service
 sudo systemctl daemon-reload && sudo systemctl enable --now astraeus
 systemctl status astraeus
-curl -s localhost:8642/api/health
+
+# The port opens only after the startup probe has run ffmpeg once per encoder
+# family, which takes seconds on a slow or emulated host - so wait for it rather
+# than treating the line above as proof that it is already serving.
+for i in $(seq 1 30); do curl -sf localhost:8642/api/health && break; sleep 1; done
 ```
 
 The unit binds **127.0.0.1:8642** and enables `--auth-mode token`, so nothing is
@@ -160,7 +164,7 @@ reachable from off-host until you put a TLS-terminating reverse proxy in front o
 it. `TMDB_API_KEY` goes in the same environment file if you want real metadata
 instead of the synthetic fallback.
 
-### What the unit hardens, and what is untested
+### What the unit hardens, and what has been observed
 
 `ProtectSystem=strict` with `ReadWritePaths` limits writes to the two state
 directories; `CapabilityBoundingSet=` is empty; `ProtectHome`, `ProtectProc`,
@@ -176,15 +180,42 @@ Two deliberate choices are worth knowing:
   ffmpeg.** A syscall outside the list fails with `EPERM` and kills the
   transcode. If a session fails that way, the ffmpeg diagnostics in the session
   error name it, and the fix is to relax that single line. The filter is the
-  standard one for a service of this kind, but it has not been possible to
-  exercise every encoder on every host.
+  standard one for a service of this kind, and it is now known to admit a
+  `libx264` re-encode on a CPU-only host — the case most installs will hit.
+  Hardware encoders are the part that remains unexercised.
 
-The unit was checked with `systemd-analyze verify` (clean) and
-`systemd-analyze security`. It has **not** been started as a service on the
-development host — there is no systemd manager reachable in that environment —
-so the runtime behaviour of the hardening directives is reasoned about, not
-observed. If you install it, `systemctl status` and the first playback are the
-things to watch.
+**This unit has been started, and made to transcode, on a clean Debian 12 VM**
+(QEMU, with no KVM). Following the runbook above verbatim, installing the
+published `v0.17.0` release archive: `systemd-analyze verify` was clean, the
+service came up and stayed up, and `/api/health` answered
+`{"service":"astraeus","status":"ok"}`. `systemd-analyze security astraeus`, run
+*inside* that guest rather than with `--offline=yes`, scores the same
+**1.6 (OK)**.
+
+The syscall filter was tested the way it matters — by making the service run
+ffmpeg, which a direct play would not do. Asking for a target height below the
+source's produced `"mode":"transcode"`, and the ffmpeg child was caught alive and
+read back its own sandbox:
+
+```
+cgroup:       0::/system.slice/astraeus.service
+Seccomp:      2          (28 filters)
+CapEff:       0000000000000000
+CapBnd:       0000000000000000
+NoNewPrivs:   1
+```
+
+The filter is therefore applied to ffmpeg itself, not only to the server that
+forks it, and the encode finished with no `EPERM` in the journal — the produced
+segment ffprobed as H.264 at exactly the height that was requested. What this
+does *not* cover is any hardware encoder: that guest had no render node, so it
+rejected all six hardware encoders at startup and transcoded on the CPU. On a
+host with a GPU, the first hardware transcode is still the test.
+
+One thing worth knowing if you go looking for it: the unit declares **no
+`StateDirectory` or `CacheDirectory`**. Step 1's `install -d` creates the two
+writable trees, and the service creates `streams/` (0700) and the database (0600)
+itself, under `UMask=0077`.
 
 ---
 
@@ -243,8 +274,14 @@ images current. CI now runs on GitHub for every push to `main` and every pull
 request, and it earned its keep immediately: the first run failed the ladder
 integration test against the runner's ffmpeg and the failure reproduced against
 the container's own 5.1.9, showing that a ladder had been serving two rungs of
-three. The **release** workflow has still never run, because no tag has been
-pushed; treat the first tagged release as the first real test of that half.
+three. **The release workflow has now run**, on `v0.17.0`, and it found two
+defects that only a real run could surface: the archive did not carry the `deploy`
+directory or the documents this runbook installs, and the job that creates the
+GitHub Release had no repository context for `gh`, so it died with `fatal: not a
+git repository`. Both are fixed, and the release now publishes the two archives,
+the checksums file, generated notes and the multi-arch image. The workflow's
+`dry_run` option was green before the tag was spent — but it skips the publish job
+by design, which is exactly where the second defect was hiding.
 
 ---
 
@@ -280,8 +317,7 @@ identity that wrote them was never recorded.
 - **Kubernetes manifests, Windows or macOS packaging.** Release archives are
   built for Linux, and the image is Linux-only; `scripts/build-release.sh` takes
   extra `goos/goarch` arguments if that changes.
-- **The release workflow has never run.** CI has, on every push and pull
-  request, and it has already caught a defect this host could not see; but
-  publishing needs a tag, and no tag has been pushed. Every step was run by hand,
-  and the build, the checksums, the labels and a real multi-arch build were all
-  exercised, but the GitHub Release and the GHCR push are untested.
+- **Hardware encoders have never run.** VAAPI, NVENC, AMF and VideoToolbox are
+  implemented and unit-tested, and the startup probe is what validates them on
+  the machine that starts the server — but no host with a GPU has been available,
+  so the CPU path is the only one observed end to end.

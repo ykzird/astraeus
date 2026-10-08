@@ -165,7 +165,7 @@ Status as of the current build. Evidence for each claim is the test suite
       viewer starts over or finishes, and the navigation lists what is worth
       continuing
 
-## Phase 5: Packaging — the pieces exist, nothing is released
+## Phase 5: Packaging — released as v0.17.0
 
 - [x] Multi-stage `Dockerfile`: static binary, ffmpeg and ffprobe in the runtime
       image, fixed non-root uid, one writable volume, health check
@@ -181,7 +181,15 @@ Status as of the current build. Evidence for each claim is the test suite
       upgrades, GPU passthrough and what is deliberately not hardened
 - [x] CI workflow (`.github/workflows/ci.yml`): format, vet, build, unit tests,
       integration tests, `node --check`, image build and a health wait
-- [ ] Release automation: nothing is tagged, versioned or published anywhere
+- [x] The unit started for real on a clean Debian 12 VM and made to run ffmpeg:
+      `/api/health` answers, the real `systemd-analyze security` score is 1.6 (OK),
+      and the ffmpeg child carries the filter itself — `Seccomp: 2`, empty
+      capabilities, no `EPERM` — while producing a correct downscaled segment
+- [x] Release automation run for real: `v0.17.0` tagged, a GitHub Release published
+      with both archives and `checksums.txt`, and a multi-arch image on GHCR with
+      provenance and SBOM attestations. The run found and fixed two defects that
+      only a real run could: the archive was missing `deploy/` and the documents
+      the runbook installs, and the publish job had no repository context for `gh`
 - [ ] A TLS reverse-proxy example (Caddy or nginx) beside the systemd unit
 - [ ] Package the VAAPI userspace drivers into the image, so GPU transcoding
       works in a container without extra packages
@@ -287,14 +295,15 @@ Status as of the current build. Evidence for each claim is the test suite
 - The hls.js fatal-error recovery path and the native-HLS (Safari) branch are
   implemented but have not been observed firing — no Safari was available, and a
   stream failure could not be forced on a live server.
-- Packaging exists but nothing has been released. CI now runs on GitHub and has
-  already caught a defect the development host's ffmpeg hid, but the release
-  workflow has never run because no tag has been pushed; and the systemd unit has
-  been checked with `systemd-analyze`
-  but never started, because the development host has no reachable systemd
-  manager. The `SystemCallFilter` in that unit is the one setting that could stop
-  ffmpeg on a host where an encoder needs a call outside the list; the runbook
-  says how to diagnose and relax it.
+- Packaging is released, and both shapes have now been run: the container by
+  running it, and the systemd unit on a clean Debian 12 VM, where it started,
+  answered `/api/health` and transcoded under its own syscall filter. What remains
+  unobserved there is hardware — the guest had no render node, so VAAPI, NVENC, AMF
+  and VideoToolbox are still only unit-tested and probe-validated. The
+  `SystemCallFilter` in that unit is the one setting that could stop ffmpeg on a
+  host where an encoder needs a call outside the list; a `libx264` encode is now
+  known to pass it, and the runbook says how to diagnose and relax it when another
+  encoder does not.
 - The container image ships ffmpeg's VAAPI support but not the vendor userspace
   drivers, so GPU transcoding in a container needs extra packages. NVENC needs
   the NVIDIA container runtime.
