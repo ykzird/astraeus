@@ -31,9 +31,10 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | HDR and Dolby Vision | Detected from the source's colour tags; **tone mapped to SDR** for clients that cannot show it, and passed through at 10 bits for those that can. Dolby Vision profile 8 keeps its HDR10 base layer; profile 5 is flagged as approximate |
 | Hardware acceleration | NVENC, QuickSync, VideoToolbox, VAAPI and AMF, each **verified by running it with the real options** at startup; rejected encoders report why; software fallback |
 | Subtitles | Done. Text tracks extracted to WebVTT, cached and served; image tracks (PGS, VobSub) burned into the picture on request |
-| Observability | Done. The KPI registry is exposed in Prometheus format at `/metrics` |
+| Observability | Done. The KPI registry is exposed in Prometheus format at `/metrics`, and traces can be exported over OTLP/HTTP (`--otel-endpoint`, opt-in) with `trace_id` on the request log line |
 | Web UI | Three-column spatial layout, served by the binary; HLS via a vendored hls.js; player controls overlaid on the video (transport, seek, subtitles, volume, quality, fullscreen) |
 | Authentication | Optional gate: trusted-proxy identity (Tailscale / Cloudflare Access) or a bearer token |
+| Rate limiting | Optional token bucket per client in front of `/api/`, off by default (`--rate-limit`); keyed by the gate's identity when there is one, otherwise the peer address |
 | Security headers | A content security policy with no `unsafe-inline` and no `unsafe-eval`, plus nosniff, a referrer policy, frame denial and a permissions policy. Verified in a browser: a third-party image and an inline script are both refused |
 | Packaging | A multi-stage `Dockerfile` (ffmpeg included, non-root, health check) and a hardened systemd unit, both verified as far as this host allows — see [`deploy/README.md`](deploy/README.md) |
 
@@ -258,6 +259,24 @@ Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
 identifier (currently `0.14.0`).
+
+`serve` flags that are easy to miss because they are named in the sections below
+rather than here:
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--addr` | `127.0.0.1:8642` | Listen address |
+| `--web-dir` | `web` | Static UI directory |
+| `--ffmpeg`, `--ffprobe` | `ffmpeg`, `ffprobe` | Binaries to run (both are hard dependencies) |
+| `--stream-root` | temp | HLS session directories |
+| `--segment-seconds` | 6 | HLS target segment duration |
+| `--max-sessions` | 8 | Concurrent segmented streams |
+| `--image-cache`, `--subtitle-cache` | temp | Artwork and WebVTT caches |
+| `--tmdb-image-base` | TMDB's own root | Upstream artwork root |
+| `--enrich-interval`, `--scan-interval` | — | Background passes; `0` disables |
+| `--auth-mode`, `--auth-header`, `--trusted-proxy`, `--auth-token`, `--auth-exempt` | see [Access gate](#access-gate) | Gate configuration |
+| `--rate-limit`, `--rate-limit-burst` | `0` (off) | API limit |
+| `--otel-endpoint`, `--otel-service-name` | off | Trace export |
 
 ## HTTP API
 

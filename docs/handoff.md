@@ -54,6 +54,8 @@ Traps that have cost time:
 | Stream and cache dirs default to temp | pass `--stream-root` / `--subtitle-cache` / `--image-cache` inside the workspace when testing |
 | `web/vendor/hls.min.js` is 620 KB on one line | exclude `web/vendor` (or `*.min.js`) from any search across `web/`, or one grep flushes the result |
 | The session transcript echoes each provider response in a `stream` field | a char count over it says ~3x the truth. Take the prompt size from the `usage` block of the last `assistant/message`: `inputTokens + cacheReadTokens` |
+| The Go module cache (`/home/jok/go/pkg/mod`) is **read-only** under the sandbox | builds and tests work, but adding or bumping a module fails with `read-only file system`. The network is reachable, so the fix is to point `GOMODCACHE` (and `GOPATH` if needed) inside the workspace; the alternative is to avoid the new dependency, which is why the Prometheus exposition and the OTLP exporter are hand-rolled |
+| `docker` wants its state inside the workspace | export `DOCKER_CONFIG=$PWD/../.tmp/docker-config BUILDX_CONFIG=$PWD/../.tmp/buildx`. The registry is reachable (`docker pull jaegertracing/all-in-one` was used to verify trace export) |
 
 ---
 
@@ -85,10 +87,14 @@ CDP_PORT=9410 node subtitle-verify.mjs      http://127.0.0.1:8910 <captionedEpis
 CDP_PORT=9410 node real-media-verify.mjs    http://127.0.0.1:8910 <realFilmId> 180
 ```
 
-`player-chrome-verify.mjs` is the broadest single check: 28 assertions covering
-the overlay, icons, fullscreen, audio, quality switching, subtitle persistence
-and auto-hide, against real 4K content. Last run: **28/28**, and it ran against
-the 17 GB film, not the demo clips.
+`player-chrome-verify.mjs` is the broadest single check: up to 32 assertions
+covering the overlay, icons, fullscreen, audio, quality switching, subtitle
+persistence and auto-hide. **Its score depends on the content**, so compare a run
+against the same fixture: it was **28/28** against the 17 GB film in the round-2
+verification, and it is **20/22** on the bundled three-second demo clips, where
+the two auto-hide checks fail because playback ends during the wait. 20/22 is also
+what the pre-change build scores there, so it is that fixture's baseline rather
+than a regression (§8).
 
 Dynamic range has its own checks, and they are worth re-running after any change
 to negotiation or to the ffmpeg argument builder:
@@ -246,11 +252,15 @@ Conventions that matter more than they look:
   codebase explain a decision that would otherwise look arbitrary.
 - **The front end never injects HTML.** There is no `innerHTML` anywhere in
   `web/`; DOM is built with `createElement`/`createElementNS` and literal
-  attribute keys. A CSP does not exist yet, so this discipline is currently the
-  only XSS defence — keep it.
-- **Docs are part of the change.** `README`, `SPECIFICATION`, `TODO` and the
-  package READMEs have all been kept in sync; `TODO.md` marks gaps honestly
-  rather than aspirationally.
+  attribute keys. Since 0.9.0 the content security policy (`script-src 'self'`,
+  no `unsafe-inline`, no `unsafe-eval`) is the enforced boundary, but this
+  discipline is what keeps the policy strict: an inline script or an
+  HTML-injection sink would mean weakening the policy or handing a filename on
+  disk a way into the DOM, not just a code smell.
+- **Docs are part of the change.** `README`, `SPECIFICATION`, `TODO`, and the two
+  READMEs beside the code they describe (`web/README.md`, `deploy/README.md`)
+  have all been kept in sync; `TODO.md` marks gaps honestly rather than
+  aspirationally.
 
 ---
 
@@ -285,7 +295,8 @@ multi-step increment. Rather than discover that halfway through a change, watch
 the budget and hand over deliberately.
 
 ```sh
-# Measures the real prompt size from the provider's own usage block.
+# Measures the real prompt size from the provider's own usage block, and prints
+# the wrap line and the point at which the harness compacts.
 mkdir -p .tmp && cat > .tmp/ctx-check.sh <<'EOF'
 FILE=$(find "${DSH_HOME:-$HOME/.dsh}/sessions" -type d -name "${DSH_SESSION_ID:?}" | head -1)/session.v4.jsonl.zstd
 zstd -dc "$FILE" | python3 -c '
@@ -298,19 +309,40 @@ for line in sys.stdin:
     if e.get("type") == "assistant/message" and e["data"].get("usage"):
         u = e["data"]["usage"]
         used, at = u.get("inputTokens",0)+u.get("cacheReadTokens",0), (e["data"].get("turn"), e["data"].get("step"))
-print(f"{used:,} of {WINDOW:,} tokens ({100*used/WINDOW:.1f}% used), last measured at {at}")'
+print(f"{used:,} of {WINDOW:,} tokens ({100*used/WINDOW:.1f}% used), last measured at {at}")
+print(f"wrap at {int(WINDOW*0.70):,} | compacts at {int(WINDOW*0.80):,}")'
 EOF
 bash .tmp/ctx-check.sh
 ```
 
-The window is **1,000,000 tokens** for `deepseek-flash`, so the two thresholds
-below leave room to finish properly. They are deliberately far below the
-harness's own compaction point, because the point is to end by choice:
+The window is **1,000,000 tokens** for `deepseek-flash`. The harness's own
+compaction triggers at **80%** — `DEFAULT_THRESHOLD_RATIO = .8` in
+`dsh-compaction-basic`, with no override in the `web` profile — and a compaction
+retains only about **16%** (`DEFAULT_RETAIN_RATIO`) and summarises the rest, so a
+compaction is a lossy restart and not a pause. The thresholds below therefore do
+*not* sit far below compaction: 80% **is** the compaction point. Treat 70% as the
+working limit and 80% as the wall.
 
 | Used | Do |
 | --- | --- |
 | **70%** (700k) | Wrap up: finish the increment in hand, no new work |
-| **80%** (800k) | Stop picking up work entirely. Sync `README`, `SPECIFICATION`, `TODO` and this handoff with the state you reached, commit it, and hand over a short summary a fresh session can start from |
+| **80%** (800k) | The harness compacts here. Do not be working on anything at this point: sync `README`, `SPECIFICATION`, `TODO` and this handoff with the state you reached, commit it, and hand over a short summary a fresh session can start from |
+
+Budget an increment before starting it, from the session's own usage deltas.
+Measured over rounds 3–7 on this project, with the provider's `usage` block as the
+source of truth, an increment of this size costs roughly:
+
+| Increment | Cost |
+| --- | --- |
+| A small, self-contained change plus docs (UI unit tests in `web/core.js`) | ~3 points |
+| A new middleware/package with tests (rate limiting, trace export) | ~7 points |
+| A domain change touching storage, API and tests (per-viewer progress) | ~13 points |
+| A feature with new fixture infrastructure and pipeline work (image subtitles) | ~19 points |
+
+So with 18 points of headroom under 70%, the 19-point class of increment does not
+fit: it lands on the wrap line with no margin for a fixture or filter that needs a
+second attempt. When the headroom is smaller than the work, hand over instead —
+that is the whole point of this rule.
 
 The handover must say what is done and verified, what is half-done, the exact
 command that reproduces each claim, and the next priority from §7 — §7 is
@@ -341,8 +373,10 @@ that works at 8 bits may refuse 10. Verified against the 17 GB film: 1920x820
 H.264 tagged `bt709`/`bt709`/`bt709` for the browser profile, 2528x1080 10-bit
 HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
 
-Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
-10/10 subtitles. Full Go suite green with race and integration.
+Verified in a real browser against real 4K content in the round-2 work: 28/28
+chrome, 13/13 player, 10/10 subtitles. Full Go suite green with race and
+integration. Those numbers belong to that content: the bundled demo clips score
+lower on the auto-hide checks for fixture reasons (§8).
 
 **Front-end unit tests** landed as of 0.14.0, which closes the largest remaining
 untested surface. The player's timeline arithmetic — the source↔media time
