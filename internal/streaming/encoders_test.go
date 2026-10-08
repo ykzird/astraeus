@@ -73,7 +73,7 @@ func TestEncoderOutputArgs_PerFamily(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			joined := strings.Join(encoderOutputArgs(tt.encoder, videoPlan{}, encoderDevice{}), " ")
+			joined := strings.Join(encoderOutputArgs(tt.encoder, videoPlan{}, encoderDevice{}, 1, 0), " ")
 			for _, want := range tt.contains {
 				if !strings.Contains(joined, want) {
 					t.Errorf("missing %q:\n%s", want, joined)
@@ -94,12 +94,12 @@ func TestEncoderOutputArgs_PerFamily(t *testing.T) {
 func TestEncoderOutputArgs_ScalesForTheFamily(t *testing.T) {
 	t.Parallel()
 
-	vaapi := strings.Join(encoderOutputArgs("h264_vaapi", videoPlan{Height: 720}, encoderDevice{RenderNode: "/dev/dri/renderD128"}), " ")
+	vaapi := strings.Join(encoderOutputArgs("h264_vaapi", videoPlan{Height: 720}, encoderDevice{RenderNode: "/dev/dri/renderD128"}, 1, 0), " ")
 	if !strings.Contains(vaapi, "hwupload,scale_vaapi=w=-2:h=720") {
 		t.Errorf("VAAPI should scale on the device after the upload:\n%s", vaapi)
 	}
 
-	qsv := strings.Join(encoderOutputArgs("h264_qsv", videoPlan{Height: 720}, encoderDevice{}), " ")
+	qsv := strings.Join(encoderOutputArgs("h264_qsv", videoPlan{Height: 720}, encoderDevice{}, 1, 0), " ")
 	if !strings.Contains(qsv, "-vf scale=-2:720") {
 		t.Errorf("QuickSync should scale in software before the encoder:\n%s", qsv)
 	}
@@ -785,7 +785,7 @@ func TestEncoderOutputArgs_BitrateCeiling(t *testing.T) {
 		t.Run(encoder, func(t *testing.T) {
 			t.Parallel()
 
-			joined := strings.Join(encoderOutputArgs(encoder, videoPlan{BitrateKbps: 5_000}, encoderDevice{}), " ")
+			joined := strings.Join(encoderOutputArgs(encoder, videoPlan{BitrateKbps: 5_000}, encoderDevice{}, 1, 0), " ")
 			for _, want := range []string{"-maxrate 5000k", "-bufsize 10000k"} {
 				if !strings.Contains(joined, want) {
 					t.Errorf("%s is missing %q:\n%s", encoder, want, joined)
@@ -804,7 +804,7 @@ func TestEncoderOutputArgs_BitrateCeiling(t *testing.T) {
 func TestEncoderOutputArgs_NoCeilingMeansNoConstraint(t *testing.T) {
 	t.Parallel()
 
-	joined := strings.Join(encoderOutputArgs("libx264", videoPlan{Height: 720}, encoderDevice{}), " ")
+	joined := strings.Join(encoderOutputArgs("libx264", videoPlan{Height: 720}, encoderDevice{}, 1, 0), " ")
 	if strings.Contains(joined, "-maxrate") || strings.Contains(joined, "-bufsize") {
 		t.Errorf("an unlimited session must not gain rate-control flags:\n%s", joined)
 	}

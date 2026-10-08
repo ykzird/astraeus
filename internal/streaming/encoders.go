@@ -191,28 +191,55 @@ func (p videoPlan) HDR() bool { return p.HDRPixelFormat != "" }
 // encoder the ordinary preference order picks - a host whose QuickSync cannot
 // do 10-bit still has libx265 that can.
 func videoEncoderFor(decision Decision, server ServerCapability) (string, videoPlan, error) {
-	plan := videoPlan{
-		Height:      decision.TargetHeight,
-		ToneMap:     decision.ToneMap,
-		TargetRange: decision.TargetDynamicRange,
-		BitrateKbps: decision.TargetBitrateKbps,
+	plans, encoder, err := videoPlansFor(decision, server)
+	if err != nil {
+		return "", videoPlan{}, err
+	}
+	return encoder, plans[0], nil
+}
+
+// videoPlansFor returns the encoder and one plan per rendition. A session with
+// no ladder has exactly one plan, so the single-rendition path and the ladder
+// path share every decision about colour, scaling and rate control.
+func videoPlansFor(decision Decision, server ServerCapability) ([]videoPlan, string, error) {
+	renditions := decision.Renditions
+	if len(renditions) == 0 {
+		renditions = []Rendition{{Height: decision.TargetHeight, BitrateKbps: decision.TargetBitrateKbps}}
+	}
+
+	planFor := func(rendition Rendition) videoPlan {
+		return videoPlan{
+			Height:      rendition.Height,
+			ToneMap:     decision.ToneMap,
+			TargetRange: decision.TargetDynamicRange,
+			BitrateKbps: rendition.BitrateKbps,
+		}
 	}
 
 	codec := decision.TargetVideoCodec
 	if decision.TargetDynamicRange.IsHDR() {
 		support, ok := EncoderForHDR(codec, server)
 		if !ok {
-			return "", plan, fmt.Errorf("no verified 10-bit HDR encoder for video codec %q", codec)
+			return nil, "", fmt.Errorf("no verified 10-bit HDR encoder for video codec %q", codec)
 		}
-		plan.HDRPixelFormat = support.PixelFormat
-		return support.Encoder, plan, nil
+		plans := make([]videoPlan, 0, len(renditions))
+		for _, rendition := range renditions {
+			plan := planFor(rendition)
+			plan.HDRPixelFormat = support.PixelFormat
+			plans = append(plans, plan)
+		}
+		return plans, support.Encoder, nil
 	}
 
 	encoder := EncoderFor(codec, server)
 	if encoder == "" {
-		return "", plan, fmt.Errorf("no ffmpeg encoder available for video codec %q", codec)
+		return nil, "", fmt.Errorf("no ffmpeg encoder available for video codec %q", codec)
 	}
-	return encoder, plan, nil
+	plans := make([]videoPlan, 0, len(renditions))
+	for _, rendition := range renditions {
+		plans = append(plans, planFor(rendition))
+	}
+	return plans, encoder, nil
 }
 
 // encoderInputArgs returns the options that must precede the input.
@@ -330,39 +357,87 @@ func videoFilters(encoder string, plan videoPlan) []string {
 //     quality, which it infers from the presence of -qp_*.
 //   - VideoToolbox is quality-driven through -q:v. -allow_sw stays off, so a
 //     machine without the hardware says so instead of quietly using its CPU.
-func encoderOutputArgs(encoder string, plan videoPlan, dev encoderDevice) []string {
+//
+// videoStreamSuffix renders the stream specifier that makes an option apply to
+// one rendition of a ladder.
+//
+// A single-rendition session is left unsuffixed so its command line stays the
+// readable thing it always was, and because ffmpeg's "applies to every stream of
+// this type" default is exactly right when there is only one. A ladder has to be
+// explicit: without a specifier every option would land on the first video
+// stream and both rungs would come out the same size and rate, which is a ladder
+// in name only. (Verified while building this: two rungs without specifiers both
+// came out 640x360.)
+func videoStreamSuffix(streams, index int) string {
+	if streams <= 1 {
+		return ""
+	}
+	return fmt.Sprintf(":%d", index)
+}
+
+// encoderOutputArgs returns the encoder options for one rendition of a session.
+//
+// streams is how many renditions this session has, and index which one these
+// options describe; they only change the argument spelling, never the settings,
+// so a single-rendition session is byte-for-byte what it was before ladders
+// existed.
+//
+// Each family has its own vocabulary for the same intent - "good quality, let
+// the bitrate follow" - and they are not interchangeable:
+//
+//   - NVENC takes a preset from p1..p7 and constant quality through
+//     "-rc vbr -cq N". No -b:v, so quality decides the bitrate.
+//   - QSV uses -global_quality.
+//   - VAAPI has no quality knob at all; it takes a hardware surface through the
+//     upload filter and encodes it.
+//   - AMF uses -quality for the speed/quality preset and QP values for constant
+//     quality, which it infers from the presence of -qp_*.
+//   - VideoToolbox is quality-driven through -q:v. -allow_sw stays off, so a
+//     machine without the hardware says so instead of quietly using its CPU.
+func encoderOutputArgs(encoder string, plan videoPlan, dev encoderDevice, streams, index int) []string {
+	suffix := videoStreamSuffix(streams, index)
+	option := func(name string) string { return name + suffix }
+
 	filters := videoFilters(encoder, plan)
 	var args []string
 	switch {
 	case strings.HasSuffix(encoder, "_nvenc"):
-		args = []string{"-c:v", encoder, "-preset", nvencPreset, "-tune", "hq", "-rc", "vbr", "-cq", "22"}
+		args = []string{option("-c:v"), encoder, option("-preset"), nvencPreset,
+			option("-tune"), "hq", option("-rc"), "vbr", option("-cq"), "22"}
 	case strings.HasSuffix(encoder, "_qsv"):
-		args = []string{"-c:v", encoder, "-preset", "veryfast", "-global_quality", "22"}
+		args = []string{option("-c:v"), encoder, option("-preset"), "veryfast", option("-global_quality"), "22"}
 	case strings.HasSuffix(encoder, "_vaapi"):
-		args = []string{"-c:v", encoder}
+		args = []string{option("-c:v"), encoder}
 	case strings.HasSuffix(encoder, "_amf"):
-		args = []string{"-c:v", encoder, "-quality", "balanced",
-			"-rc", "cqp", "-qp_i", "22", "-qp_p", "22", "-qp_b", "22"}
+		args = []string{option("-c:v"), encoder, option("-quality"), "balanced",
+			option("-rc"), "cqp", option("-qp_i"), "22", option("-qp_p"), "22", option("-qp_b"), "22"}
 	case strings.HasSuffix(encoder, "_videotoolbox"):
-		args = []string{"-c:v", encoder, "-q:v", "60"}
+		args = []string{option("-c:v"), encoder, option("-q:v"), "60"}
 	case encoder == "libx264" || encoder == "libx265":
-		args = []string{"-c:v", encoder, "-preset", "veryfast", "-crf", "21"}
+		args = []string{option("-c:v"), encoder, option("-preset"), "veryfast", option("-crf"), "21"}
 	case encoder == "libvpx-vp9":
-		args = []string{"-c:v", encoder, "-crf", "31", "-b:v", "0"}
+		args = []string{option("-c:v"), encoder, option("-crf"), "31", option("-b:v"), "0"}
 	case encoder == "libsvtav1" || encoder == "libaom-av1":
-		args = []string{"-c:v", encoder, "-crf", "30"}
+		args = []string{option("-c:v"), encoder, option("-crf"), "30"}
 	default:
-		args = []string{"-c:v", encoder}
+		args = []string{option("-c:v"), encoder}
 	}
 
 	if len(filters) > 0 {
-		args = append(args, "-vf", strings.Join(filters, ","))
+		// -vf for a single rendition, where it has always been used, and the
+		// specifier form only where a specifier is needed: -vf:0 is easy to get
+		// wrong, and -filter:v:N is the spelling that was verified.
+		filterFlag := "-vf"
+		if suffix != "" {
+			filterFlag = "-filter:v" + suffix
+		}
+		args = append(args, filterFlag, strings.Join(filters, ","))
 	}
-	if cap := bitrateCapArgs(plan); len(cap) > 0 {
+	if cap := bitrateCapArgs(plan, suffix); len(cap) > 0 {
 		args = append(args, cap...)
 	}
 	if format := outputPixelFormat(encoder, plan); format != "" {
-		args = append(args, "-pix_fmt", format)
+		args = append(args, option("-pix_fmt"), format)
 	}
 	return args
 }
@@ -379,13 +454,13 @@ func encoderOutputArgs(encoder string, plan videoPlan, dev encoderDevice) []stri
 // out at 605 kbps with a 500 kbps ceiling, muxing overhead included. The bufsize
 // is twice the ceiling, which is the usual compromise - smaller makes the rate
 // snap to the limit and the picture visibly pump, larger lets a burst overshoot.
-func bitrateCapArgs(plan videoPlan) []string {
+func bitrateCapArgs(plan videoPlan, suffix string) []string {
 	if plan.BitrateKbps <= 0 {
 		return nil
 	}
 	return []string{
-		"-maxrate", fmt.Sprintf("%dk", plan.BitrateKbps),
-		"-bufsize", fmt.Sprintf("%dk", plan.BitrateKbps*2),
+		"-maxrate" + suffix, fmt.Sprintf("%dk", plan.BitrateKbps),
+		"-bufsize" + suffix, fmt.Sprintf("%dk", plan.BitrateKbps*2),
 	}
 }
 
@@ -488,7 +563,7 @@ func probeEncoder(ctx context.Context, ffmpegBin, encoder string, dev encoderDev
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	args = append(args, encoderInputArgs(encoder, dev)...)
 	args = append(args, "-f", "lavfi", "-i", "testsrc=size=320x240:rate=5:duration=0.2")
-	args = append(args, encoderOutputArgs(encoder, plan, dev)...)
+	args = append(args, encoderOutputArgs(encoder, plan, dev, 1, 0)...)
 	args = append(args, "-f", "null", "-")
 
 	stderr := &boundedBuffer{limit: probeStderrLimit}

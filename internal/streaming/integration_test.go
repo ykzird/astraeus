@@ -7,6 +7,7 @@ package streaming
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -733,4 +734,108 @@ func TestManager_BitrateCeilingHoldsEndToEnd(t *testing.T) {
 	}
 	t.Logf("bitrate: unlimited %d kbps, capped %d kbps (ceiling %d, video target %d)",
 		unlimitedKbps, cappedKbps, ceiling, capped.TargetBitrateKbps)
+}
+
+// generateTallClip renders a 720p HEVC/AAC clip: tall enough to have rungs below
+// it, and in a codec a browser profile does not accept, so the session has to
+// re-encode and a ladder is what it builds.
+func generateTallClip(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=15:duration=4",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+		"-c:v", "libx265", "-preset", "ultrafast", "-crf", "30",
+		"-c:a", "aac", "-shortest",
+		path,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("this ffmpeg cannot produce the fixture: %v\n%s", err, output)
+	}
+	return path
+}
+
+// TestManager_LadderProducesAMasterPlaylistAndItsRungs is the end-to-end check
+// for adaptive delivery: one ffmpeg process, several rungs, a master playlist
+// that names them, and segments that really are the sizes the decision claimed.
+func TestManager_LadderProducesAMasterPlaylistAndItsRungs(t *testing.T) {
+	requireFFmpeg(t)
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	source := generateTallClip(t, dir, "tall.mkv")
+
+	prober := NewFFProbe("ffprobe")
+	info, err := prober.Probe(ctx, source)
+	if err != nil {
+		t.Fatalf("probing the fixture: %v", err)
+	}
+	if info.Height < 720 {
+		t.Fatalf("the fixture is %dx%d, too short to have rungs", info.Width, info.Height)
+	}
+
+	// No height limit, so the client is asking to adapt, and a codec the source
+	// does not use, so a re-encode is unavoidable.
+	capability := ClientCapability{
+		Containers:       []string{"hls"},
+		VideoCodecs:      []string{"h264"},
+		AudioCodecs:      []string{"aac"},
+		MaxBitDepth:      8,
+		MaxAudioChannels: 6,
+		SupportsHLS:      true,
+	}
+
+	server := DetectServerCapability(ctx, "ffmpeg", "ffprobe", "")
+	decision := NegotiateForServer(info, capability, server)
+	if len(decision.Renditions) < 2 {
+		t.Fatalf("expected a ladder, got %+v (mode %q, reasons: %s)",
+			decision.Renditions, decision.Mode, strings.Join(decision.Reasons, "; "))
+	}
+
+	manager, session, _ := startSession(t, dir, source, decision)
+	defer manager.Stop(session.ID)
+
+	if got := session.PlaylistFile(); got != MasterPlaylistName {
+		t.Fatalf("the client was pointed at %q, want %q", got, MasterPlaylistName)
+	}
+
+	segment := waitForSegment(t, session.Dir, 90*time.Second)
+	if segment == "" {
+		t.Fatal("no segment was produced")
+	}
+
+	// The master playlist has to name every rung, and the decision's rungs are
+	// what it must agree with.
+	master, err := os.ReadFile(session.PlaylistPath())
+	if err != nil {
+		t.Fatalf("reading the master playlist: %v", err)
+	}
+	text := string(master)
+	if got := strings.Count(text, "#EXT-X-STREAM-INF"); got != len(decision.Renditions) {
+		t.Errorf("master playlist lists %d rungs, want %d:\n%s", got, len(decision.Renditions), text)
+	}
+	for index := range decision.Renditions {
+		if !strings.Contains(text, fmt.Sprintf("playlist_%d.m3u8", index)) {
+			t.Errorf("master playlist does not reference rung %d:\n%s", index, text)
+		}
+	}
+
+	// And each rung has to be the size it was advertised as, which is the part a
+	// missing stream specifier would quietly get wrong.
+	for index, rung := range decision.Renditions {
+		segmentPath := filepath.Join(session.Dir, fmt.Sprintf("seg%d_00000.ts", index))
+		if _, err := os.Stat(segmentPath); err != nil {
+			t.Errorf("rung %d produced no segment: %v", index, err)
+			continue
+		}
+		produced, err := prober.Probe(ctx, segmentPath)
+		if err != nil {
+			t.Fatalf("probing rung %d: %v", index, err)
+		}
+		if produced.Height != rung.Height {
+			t.Errorf("rung %d is %dx%d, want height %d", index, produced.Width, produced.Height, rung.Height)
+		}
+	}
 }

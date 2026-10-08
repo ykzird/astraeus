@@ -1,8 +1,8 @@
 # Handoff
 
-**As of the round-2 work of 2026-10-08 — HDR and Dolby Vision, packaging, and the
-bitrate ceiling. Version 0.4.0. 90 tracked files.** (`git log` names the commits;
-the previous handoff was `b76a14f`.)
+**As of the round-2 work of 2026-10-08 — HDR and Dolby Vision, packaging, the
+bitrate ceiling, and the adaptive bitrate ladder. Version 0.5.0. 90 tracked
+files.** (`git log` names the commits; the previous handoff was `b76a14f`.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -97,6 +97,10 @@ mise exec -- go test -tags=integration -run 'ToneMapsHDR|KeepsHDR' -v ./internal
 # ceiling - and compares the measured bitrates, because a flag in an argument
 # list is not evidence that the rate was bounded.
 mise exec -- go test -tags=integration -run BitrateCeiling -v ./internal/streaming/
+
+# Builds a ladder and asserts the master playlist names every rung and that each
+# rung's produced segment really is the height it was advertised as.
+mise exec -- go test -tags=integration -run TestManager_Ladder -v ./internal/streaming/
 
 # The real thing, against the 17 GB film: a browser profile gets bt709/bt709,
 # an HDR manifest gets 10-bit bt2020/PQ. Copy real.db first; *.db is local state.
@@ -271,6 +275,20 @@ HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
 Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 10/10 subtitles. Full Go suite green with race and integration.
 
+The **adaptive bitrate ladder** landed as of 0.5.0. The contract is one sentence:
+a manifest that pins `max_height` is asking for one rendition, and one that omits
+it is asking to adapt. A ladder is up to three rungs (the target height, two
+thirds, half) encoded by one ffmpeg process, each with its own VBV ceiling from a
+conventional table scaled by the client's limit, and the client is handed
+`master.m3u8`. Per-rung settings need stream specifiers (`-c:v:0`, `-filter:v:0`,
+`-pix_fmt:0`, `-force_key_frames:0`); without them every option lands on the first
+rung and the "ladder" is two copies of one stream — which is exactly what the
+first experiment produced, and why the integration test asserts each rung's
+*measured* height rather than the argument list. Verified on the real 17 GB film:
+a 3-rung ladder at 1920x820 / 1278x546 / 960x410, delivered through the allowlist,
+with the browser harness still at **28/28** — including the quality menu, which
+pins a height and so exercises the single-rendition path beside it.
+
 The bitrate axis landed too, as of 0.4.0: a client's `max_bitrate_kbps` reserves
 the audio's share and holds the video to the remainder as a VBV ceiling, applied
 uniformly to every encoder family so quality-driven encodes stay quality-driven.
@@ -293,21 +311,20 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **A real ABR ladder.** One rendition per request today. The bitrate limit is
-   honoured as a ceiling on that rendition, but there is no master playlist and no
-   way to switch quality mid-stream, so a client on a flaky link has one choice:
-   the target the server picked. This is the most valuable *engine* work left, and
-   it touches the player: the front end's quality menu re-negotiates a height
-   server-side, which is a different mechanism from hls.js level switching, so
-   both the API and `web/app.js` change together.
-2. **Multi-audio-track selection** (the first stream wins today) and **image
-   subtitles** (PGS/VobSub are detected, reported, and refused).
-3. **Resume / watch state.** The hard part already works: a session can start at
+1. **Multi-audio-track selection** (the first stream wins today) and **image
+   subtitles** (PGS/VobSub are detected, reported, and refused). Audio selection is
+   the larger half: the probe already lists subtitle tracks, so the pattern to copy
+   is there, and the ffmpeg mapping is `-map 0:a:N` per rendition.
+2. **Resume / watch state.** The hard part already works: a session can start at
    an offset, so this is mostly persistence plus a report endpoint.
-4. **CSP and security headers**, **UI unit tests** (the front end is one 133 KB
+3. **CSP and security headers**, **UI unit tests** (the front end is one 133 KB
    file with no seam — `web/core.js` for the pure timeline maths is the cheapest
    first cut), **artwork IP leak** (metadata-supplied absolute URLs are fetched by
    the browser directly), rate limiting, OpenTelemetry.
+4. **A ladder a client can pin the top of.** Today pinning a height means one
+   rendition, so the quality menu caps quality rather than expressing a preference
+   within a ladder. Multi-audio selection and this are the two places the
+   negotiation model is thinner than it looks.
 5. **Release automation and a TLS example.** Packaging landed (see §6), but
    nothing is tagged or published, the CI workflow has never run, and there is no
    reverse-proxy configuration beside the unit.
@@ -342,6 +359,14 @@ Priority order, with the reasoning. Take it top-down.
   at.
 - **Firefox is not installed**, so the hls.js path has only been verified in
   Chromium, and the native-HLS (Safari) branch has never been observed firing.
+- **The ladder has only been exercised with software encoders.** Every rung of
+  every ladder tested here was libx264 or libx265. A hardware ladder means one
+  `hwupload` per rung on one device, which is plausible but unverified; the
+  software fallback after a hardware failure rebuilds the decision for software
+  encoders, so a failed ladder should still land somewhere playable.
+- **Ladder cost on a weak host is unmeasured.** The development machine is a
+  9700X and transcoded three rungs of 4K-to-820p without complaint. A host with a
+  quarter of that CPU would feel it, and there is no rung cap by host.
 - **No browser has been asked to play an HDR stream.** The HDR path is verified
   down to the produced segment (10-bit, `bt2020nc`/`smpte2084`/`bt2020`), not to
   a compositor showing it correctly — which is why the client has to declare

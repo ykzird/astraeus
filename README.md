@@ -25,6 +25,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | REST API | Done. Libraries, entities, scanning, enrichment, playback, artwork, subtitles |
 | Capability negotiation | Done. Direct play / remux / transcode, with reasons |
 | Segmented streaming | Done. HLS via ffmpeg, passthrough or transcode |
+| Adaptive bitrate | Done. A manifest that omits `max_height` gets a master playlist with up to three rungs, each with its own ceiling; naming a height gets one rendition |
 | HDR and Dolby Vision | Detected from the source's colour tags; **tone mapped to SDR** for clients that cannot show it, and passed through at 10 bits for those that can. Dolby Vision profile 8 keeps its HDR10 base layer; profile 5 is flagged as approximate |
 | Hardware acceleration | NVENC, QuickSync, VideoToolbox, VAAPI and AMF, each **verified by running it with the real options** at startup; rejected encoders report why; software fallback |
 | Subtitles | Done. Text tracks extracted to WebVTT, cached and served |
@@ -253,7 +254,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.4.0`).
+identifier (currently `0.5.0`).
 
 ## HTTP API
 
@@ -380,9 +381,9 @@ video after the audio); the reasons explain why.
 
 The decision also carries the concrete targets it chose — `target_height` for a
 downscale, `target_audio_channels` for a downmix, `target_dynamic_range` for
-the delivered video's dynamic range, and `target_bitrate_kbps` for a bitrate
-ceiling — so a client can see not just that it will be re-encoded but what it will
-get. A `tone_map` flag says the picture was converted from HDR to SDR, which is a
+the delivered video's dynamic range, `target_bitrate_kbps` for a bitrate ceiling,
+and `renditions` for a ladder — so a client can see not just that it will be
+re-encoded but what it will get. A `tone_map` flag says the picture was converted from HDR to SDR, which is a
 visible change rather than a quality trade-off.
 
 A manifest naming a codec that does not exist is refused with `400` before it
@@ -418,6 +419,29 @@ source bitrate is not assumed to exceed the limit (the reasons say the limit cou
 not be checked). A limit under 100 kbps is refused as malformed, and one that
 leaves nothing for video after the audio is a `409` with the arithmetic in the
 reason.
+
+### Adaptive bitrate
+
+**Pinning a height asks for one rendition; omitting it asks to adapt.** That is
+the whole contract, and it is what makes the quality menu and a ladder coexist: a
+manifest with no `max_height` gets a **ladder**, and one that names a height gets
+exactly that height, which is what the player's quality menu sends when a viewer
+picks a setting.
+
+A ladder has up to three rungs — the target height, two thirds of it, and half —
+each with its own encoder settings, its own VBV ceiling from a conventional
+bitrate table scaled by the client's own limit, and its own forced segment
+boundaries. One ffmpeg process produces all of them, and the client is handed
+`master.m3u8`; a player that understands HLS then switches rungs on its own. The
+decision reports the rungs as `renditions`, and `target_height` and
+`target_bitrate_kbps` describe the top one, so a client that reads only those
+still sees a coherent answer.
+
+Rungs that would be too small to encode or too close to the rung above to be a
+real choice are dropped, and a source with no room below it gets no ladder at
+all rather than two renditions nobody can tell apart. Each rung is a separate
+encode of the same source, so a ladder costs roughly what its rungs add up to —
+on a small host, pinning a height is the cheaper way to watch.
 
 One honest caveat: a VBV ceiling bounds the average, not every instant. A buffer
 twice the ceiling lets the encoder spend what it has saved, so over a segment

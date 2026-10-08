@@ -53,9 +53,11 @@ Status as of the current build. Evidence for each claim is the test suite
       reserved and the video held to the remainder as a VBV ceiling, uniformly
       across encoder families. Verified end to end — the same 9 Mbps source came
       out at 3.4 Mbps unlimited and 632 kbps under a 500 kbps limit
-- [ ] Bitrate-aware ABR ladder (currently a single target rendition; the
-      client's `max_bitrate_kbps` is honoured as a ceiling on it, and is no
-      longer ignored)
+- [x] Bitrate-aware ABR ladder: up to three rungs with per-rung ceilings in one
+      ffmpeg process, a master playlist the client is pointed at, and per-stream
+      specifiers so each rung really is its own size. A client that pins a height
+      still gets a single rendition
+- [x] `max_bitrate_kbps` honoured as a ceiling, with the audio's share reserved
 - [ ] Dolby Vision profile 5 *correct* conversion (IPTPQc2 needs a Dolby Vision
       tone mapper; the software chain produces approximate colour and says so)
 
@@ -125,11 +127,15 @@ Status as of the current build. Evidence for each claim is the test suite
 
 ## Known gaps
 
-- Transcoding runs one rendition per request: there is still no adaptive bitrate
-  ladder, so a client cannot switch renditions mid-stream and the server ships one
-  target. `max_bitrate_kbps` now acts on that rendition — it reserves the audio's
-  share and holds the video to the remainder as a VBV ceiling — but a ladder of
-  renditions with a master playlist is the piece that remains.
+- A ladder is built only when the client omits `max_height`. A player that pins a
+  height — a viewer choosing a setting from the quality menu — gets exactly one
+  rendition, so the menu caps quality rather than expressing a preference within a
+  ladder. Letting a client pin a *top* rung while still adapting below it would be
+  the more capable design.
+- A ladder multiplies the work: each rung is a separate encode of the same source,
+  so three rungs cost roughly three times one. There is no per-host cap on how many
+  rungs to offer, and no use of the client's bandwidth estimate to skip rungs it
+  could not afford anyway.
 - A VBV ceiling bounds the average rather than every instant, so over a segment
   shorter than the buffer the delivered rate can exceed the client's limit. That
   is standard rate-control behaviour, not a bug, but it is a limit on how literal

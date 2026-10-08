@@ -50,8 +50,15 @@ const defaultMaxSessions = 8
 var ErrDirectPlayHasNoSession = errors.New("direct play does not use a streaming session")
 
 // NamedSegmentRe is the allowlist of files a session directory exposes. Building
-// the path from a matched name is what makes path traversal impossible.
-var NamedSegmentRe = regexp.MustCompile(`^(playlist\.m3u8|seg[0-9]{5}\.ts)$`)
+// the path from a matched name is what makes path traversal impossible, so this
+// is the security boundary of segmented delivery and stays anchored and narrow.
+//
+// Three shapes are served: a session with no ladder (playlist.m3u8, seg00000.ts),
+// a ladder (master.m3u8, playlist_0.m3u8, seg0_00000.ts), and the files of a
+// single-rendition session created before ladders existed, which the first two
+// alternatives still match.
+var NamedSegmentRe = regexp.MustCompile(
+	`^(master\.m3u8|playlist(_[0-9]{1,2})?\.m3u8|seg([0-9]{1,2}_)?[0-9]{5}\.ts)$`)
 
 // Session is one in-flight segmented delivery of a MediaObject.
 type Session struct {
@@ -60,6 +67,9 @@ type Session struct {
 	ObjectPath string
 	Decision   Decision
 	Dir        string
+	// PlaylistName is the playlist a client should open, which is the master
+	// when the decision carries a ladder and the media playlist otherwise.
+	PlaylistName string
 
 	// StartSeconds is where this session begins in the source. A client maps
 	// media time back to source time by adding it, which is what lets a seek or
@@ -93,8 +103,21 @@ func (s *Session) LastAccess() time.Time {
 	return s.lastAccess
 }
 
-// PlaylistPath is the absolute path of the session playlist.
-func (s *Session) PlaylistPath() string { return filepath.Join(s.Dir, "playlist.m3u8") }
+// PlaylistFile is the name of the playlist a client should open: the master when
+// the session has a ladder, the media playlist otherwise. It falls back rather
+// than returning an empty name, so a Session built without one - by a test double,
+// or by a future caller that forgets - still yields a URL a player can open.
+func (s *Session) PlaylistFile() string {
+	if s.PlaylistName == "" {
+		return MediaPlaylistName
+	}
+	return s.PlaylistName
+}
+
+// PlaylistPath is the absolute path of the playlist a client should open.
+func (s *Session) PlaylistPath() string {
+	return filepath.Join(s.Dir, s.PlaylistFile())
+}
 
 // Done is closed once the underlying ffmpeg process has exited.
 func (s *Session) Done() <-chan struct{} { return s.done }
@@ -376,6 +399,7 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 		ObjectPath:   objectPath,
 		Decision:     decision,
 		Dir:          dir,
+		PlaylistName: sessionPlaylistName(decision),
 		cancel:       cancel,
 		done:         make(chan struct{}),
 		startedAt:    time.Now(),
@@ -631,16 +655,18 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		return nil, ErrDirectPlayHasNoSession
 	}
 
-	// The encoder and its picture plan are chosen before the argument list is
+	// The encoder and its picture plans are chosen before the argument list is
 	// assembled because some options are global and have to precede the input:
 	// VAAPI's -vaapi_device, without which its upload filter has no device. An
 	// HDR decision must also be encoded by the encoder that was verified to
 	// produce 10-bit, which is not always the one the preference order picks.
+	// There is one plan per rendition, and one rendition unless the decision
+	// carries a ladder.
 	encoder := ""
-	plan := videoPlan{}
+	var plans []videoPlan
 	if decision.VideoAction == ActionTranscode {
 		var err error
-		encoder, plan, err = videoEncoderFor(decision, cfg.Server)
+		plans, encoder, err = videoPlansFor(decision, cfg.Server)
 		if err != nil {
 			return nil, err
 		}
@@ -656,27 +682,38 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
 	}
 	args = append(args, encoderInputArgs(encoder, device)...)
-	args = append(args,
-		"-i", inputPath,
-		"-map", "0:v:0",
-		"-map", "0:a:0?",
-	)
+	args = append(args, "-i", inputPath)
 
 	switch decision.VideoAction {
 	case ActionCopy:
+		args = append(args, "-map", "0:v:0")
+		if decision.AudioAction != ActionNone {
+			args = append(args, "-map", "0:a:0?")
+		}
 		args = append(args, "-c:v", "copy")
 	case ActionTranscode:
-		// The picture plan carries the colour: the tone-map chain tags its
-		// frames BT.709, and an HDR plan tags them BT.2020/PQ, which is what the
-		// encoder writes into the stream. No -color_primaries option is passed
-		// because ffmpeg ignores it in favour of the frame's own properties.
-		args = append(args, encoderOutputArgs(encoder, plan, device)...)
-		// Cut on the requested segment boundary. Without this ffmpeg only cuts
-		// at encoder keyframes - a ~10s default GOP - so -hls_time is advisory
-		// and the first segment, and therefore first playback, arrives far
-		// later than asked for.
-		args = append(args, "-force_key_frames",
-			fmt.Sprintf("expr:gte(t,n_forced*%d)", cfg.SegmentSeconds))
+		// One -map per rendition: the same source stream feeds every rung, and
+		// what differs is the options that follow it.
+		for index, plan := range plans {
+			args = append(args, "-map", "0:v:0")
+			if decision.AudioAction != ActionNone {
+				args = append(args, "-map", "0:a:0?")
+			}
+			// The picture plan carries the colour: the tone-map chain tags its
+			// frames BT.709, and an HDR plan tags them BT.2020/PQ, which is what
+			// the encoder writes into the stream. No -color_primaries option is
+			// passed because ffmpeg ignores it in favour of the frame's own
+			// properties.
+			args = append(args, encoderOutputArgs(encoder, plan, device, len(plans), index)...)
+			// Cut on the requested segment boundary. Without this ffmpeg only
+			// cuts at encoder keyframes - a ~10s default GOP - so -hls_time is
+			// advisory and the first segment, and therefore first playback,
+			// arrives far later than asked for. It has to be per rendition for
+			// the same reason the encoder options are: unsuffixed, only the
+			// first rung would be cut on the boundary.
+			args = append(args, "-force_key_frames"+videoStreamSuffix(len(plans), index),
+				fmt.Sprintf("expr:gte(t,n_forced*%d)", cfg.SegmentSeconds))
+		}
 	default:
 		return nil, fmt.Errorf("unsupported video action %q", decision.VideoAction)
 	}
@@ -707,8 +744,53 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		"-hls_time", fmt.Sprint(cfg.SegmentSeconds),
 		"-hls_list_size", "0",
 		"-hls_playlist_type", "event",
+	)
+	if len(plans) > 1 {
+		// A ladder gets a master playlist and one media playlist per rung. The
+		// %v placeholders are what ffmpeg substitutes the variant index for;
+		// without them it refuses to write more than one variant at all.
+		args = append(args,
+			"-master_pl_name", MasterPlaylistName,
+			"-var_stream_map", variantStreamMap(decision.AudioAction != ActionNone, len(plans)),
+			"-hls_segment_filename", filepath.Join(dir, "seg%v_%05d.ts"),
+			filepath.Join(dir, "playlist_%v.m3u8"),
+		)
+		return args, nil
+	}
+
+	args = append(args,
 		"-hls_segment_filename", filepath.Join(dir, "seg%05d.ts"),
-		filepath.Join(dir, "playlist.m3u8"),
+		filepath.Join(dir, MediaPlaylistName),
 	)
 	return args, nil
+}
+
+// MasterPlaylistName and MediaPlaylistName are the two playlist names a session
+// can expose. A player is given the master when there is a ladder and the media
+// playlist when there is not.
+const (
+	MasterPlaylistName = "master.m3u8"
+	MediaPlaylistName  = "playlist.m3u8"
+)
+
+// variantStreamMap tells ffmpeg which mapped streams belong to which rendition,
+// pairing each video with its audio when there is audio to pair.
+func variantStreamMap(withAudio bool, renditions int) string {
+	parts := make([]string, 0, renditions)
+	for index := 0; index < renditions; index++ {
+		if withAudio {
+			parts = append(parts, fmt.Sprintf("v:%d,a:%d", index, index))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("v:%d", index))
+	}
+	return strings.Join(parts, " ")
+}
+
+// sessionPlaylistName is the file a client should open for this decision.
+func sessionPlaylistName(decision Decision) string {
+	if len(decision.Renditions) > 1 {
+		return MasterPlaylistName
+	}
+	return MediaPlaylistName
 }

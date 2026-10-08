@@ -53,6 +53,11 @@ type Decision struct {
 	// the client declared a total bitrate limit. It is the client's limit minus
 	// the audio allowance, so the whole stream fits rather than the video alone.
 	TargetBitrateKbps int `json:"target_bitrate_kbps,omitempty"`
+	// Renditions is an adaptive bitrate ladder, populated only when the client
+	// asked to adapt rather than pinning a height. The first entry is the
+	// largest. An empty list means one rendition, described entirely by the
+	// fields above.
+	Renditions []Rendition `json:"renditions,omitempty"`
 	// TargetDynamicRange is the dynamic range of the video this decision
 	// delivers: always "sdr" unless an HDR source is being passed through to a
 	// client that declared HDR support.
@@ -229,22 +234,56 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		}
 	}
 
-	// Turn the client's total bitrate limit into a video ceiling. The audio
+	// Work out what the client's total bitrate limit leaves for video. The audio
 	// keeps its share - either the source's own rate, because it is being
 	// copied, or the rate this server encodes it at - so that what the client
 	// receives fits the limit rather than the video alone fitting it.
-	if capability.MaxBitrateKbps > 0 && decision.VideoAction == ActionTranscode {
-		audio := audioAllowanceKbps(info, decision.AudioAction)
-		if ceiling := capability.MaxBitrateKbps - audio; ceiling < minVideoBitrateKbps {
+	audio := audioAllowanceKbps(info, decision.AudioAction)
+	budget := 0
+	if capability.MaxBitrateKbps > 0 {
+		budget = capability.MaxBitrateKbps - audio
+		if decision.VideoAction == ActionTranscode && budget < minVideoBitrateKbps {
 			decision.Deliverable = false
 			decision.Reasons = append(decision.Reasons,
 				fmt.Sprintf("the client's %d kbps limit leaves %d kbps for video after %d kbps of audio, which is too little to encode",
-					capability.MaxBitrateKbps, ceiling, audio))
-		} else {
-			decision.TargetBitrateKbps = ceiling
+					capability.MaxBitrateKbps, budget, audio))
+			budget = 0
+		}
+	}
+
+	// A ladder, when the client asked to adapt rather than pin a height.
+	laddered := false
+	if decision.Deliverable && decision.VideoAction == ActionTranscode && capability.MaxHeight <= 0 {
+		top := decision.TargetHeight
+		if top <= 0 {
+			top = info.Height
+		}
+		if ladder := videoLadder(top, budget); len(ladder) > 1 {
+			decision.Renditions = ladder
+			laddered = true
+			// The fields that describe "the video" keep describing the largest
+			// rung, so a client reading only them still sees the top of the
+			// ladder rather than an unset height.
+			decision.TargetHeight = ladder[0].Height
+			decision.TargetBitrateKbps = ladder[0].BitrateKbps
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("the client did not pin a height, so it gets a %d-rung ladder from %dp down to %dp",
+					len(ladder), ladder[0].Height, ladder[len(ladder)-1].Height))
+		}
+	}
+
+	// A single rendition gets an explicit ceiling, but only when the limit
+	// actually constrains it. A browser profile's 120 Mbps is a declaration that
+	// nothing is refused, not a request to cap the encode at 119808 kbps, and
+	// saying so would be noise in the reason that a client reads to find out why
+	// it got what it got. (A ladder needs no separate ceiling: each rung carries
+	// its own.)
+	if !laddered && decision.Deliverable && decision.VideoAction == ActionTranscode && budget > 0 {
+		if info.BitrateKbps <= 0 || budget < info.BitrateKbps {
+			decision.TargetBitrateKbps = budget
 			decision.Reasons = append(decision.Reasons,
 				fmt.Sprintf("the video is held to %d kbps so the stream fits the client's %d kbps limit alongside %d kbps of audio",
-					ceiling, capability.MaxBitrateKbps, audio))
+					budget, capability.MaxBitrateKbps, audio))
 		}
 	}
 
@@ -326,6 +365,104 @@ func describeBox(capability ClientCapability) string {
 	default:
 		return "no resolution limit"
 	}
+}
+
+// Rendition is one rung of an adaptive bitrate ladder: a height and the ceiling
+// the video at that height is held to.
+type Rendition struct {
+	Height int `json:"height"`
+	// BitrateKbps is this rung's ceiling, which is what a client's player uses
+	// to decide whether it can afford the rung.
+	BitrateKbps int `json:"bitrate_kbps,omitempty"`
+}
+
+// maxLadderRungs bounds how many encodes one session may run. Each rung is a
+// separate encode of the same source, so a ladder costs roughly what its rungs
+// cost added together; three keeps a household server usable while still giving
+// a player somewhere to drop to.
+const maxLadderRungs = 3
+
+// minLadderHeight is the smallest rung worth encoding.
+const minLadderHeight = 240
+
+// ladderBitrateKbps is the ceiling a rung at this height is given, before a
+// client's own limit scales it. The numbers are the conventional H.264 ladder -
+// roughly 0.1 bits per pixel per frame at 30fps, rounded to familiar values -
+// and they exist so that a lower rung is genuinely cheaper to send rather than
+// merely smaller.
+func ladderBitrateKbps(height int) int {
+	switch {
+	case height >= 2160:
+		return 14_000
+	case height >= 1440:
+		return 7_000
+	case height >= 1080:
+		return 4_500
+	case height >= 720:
+		return 2_500
+	case height >= 480:
+		return 1_200
+	case height >= 360:
+		return 700
+	default:
+		return 400
+	}
+}
+
+// videoLadder builds the rungs for a source delivered at topHeight, within an
+// optional total video budget in kbps (0 meaning no limit).
+//
+// The shape is deliberately simple - the top height, two thirds of it, half of
+// it - because the point of a ladder is that a player can step down and see a
+// difference, not that the steps are mathematically optimal. Rungs that would be
+// too small to encode or too close to the rung above to be a real choice are
+// dropped, and a budget scales every rung's ceiling rather than flattening them
+// onto one number.
+func videoLadder(topHeight, videoBudgetKbps int) []Rendition {
+	if topHeight < minLadderHeight {
+		return nil
+	}
+
+	heights := make([]int, 0, maxLadderRungs)
+	for _, candidate := range []int{topHeight, topHeight * 2 / 3, topHeight / 2} {
+		// Even heights only: 4:2:0 chroma needs them, and an odd rung would
+		// make ffmpeg round it anyway, silently disagreeing with the numbers
+		// this decision reports.
+		if candidate%2 != 0 {
+			candidate--
+		}
+		if candidate < minLadderHeight {
+			continue
+		}
+		if len(heights) > 0 && candidate > heights[len(heights)-1]*9/10 {
+			continue
+		}
+		heights = append(heights, candidate)
+		if len(heights) == maxLadderRungs {
+			break
+		}
+	}
+	if len(heights) < 2 {
+		return nil
+	}
+
+	// A budget the top rung cannot afford scales the whole ladder, so the rungs
+	// stay in proportion instead of collapsing onto the limit.
+	top := ladderBitrateKbps(heights[0])
+	scale := 1.0
+	if videoBudgetKbps > 0 && videoBudgetKbps < top {
+		scale = float64(videoBudgetKbps) / float64(top)
+	}
+
+	renditions := make([]Rendition, 0, len(heights))
+	for _, height := range heights {
+		bitrate := int(float64(ladderBitrateKbps(height))*scale + 0.5)
+		if bitrate < minVideoBitrateKbps {
+			bitrate = minVideoBitrateKbps
+		}
+		renditions = append(renditions, Rendition{Height: height, BitrateKbps: bitrate})
+	}
+	return renditions
 }
 
 // minVideoBitrateKbps is the smallest video ceiling this server will accept. A

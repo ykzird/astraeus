@@ -84,6 +84,7 @@ To ensure maximum efficiency and minimal latency, the server implements a **Proa
 ### 4.2 Streaming Protocols
 * **Primary:** **HLS (HTTP Live Streaming)** or **DASH (Dynamic Adaptive Streaming over HTTP)**. 
 * **Rationale:** These protocols provide the necessary resilience for "over the ether" playback through adaptive bitrate switching and small-chunk buffering.
+* **Adaptive delivery (0.5.0):** a client that does not pin a height is served a **ladder** - up to three rungs, one ffmpeg process, a master playlist, and per-rung ceilings scaled by the client's own limit - so the protocol's adaptive switching is actually used rather than merely available. A client that names a height is asking for one rendition and gets one, which is what a player's quality menu sends.
 
 ---
 

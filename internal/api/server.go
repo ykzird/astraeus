@@ -586,7 +586,9 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response.SessionID = session.ID
-	response.URL = "/hls/" + session.ID + "/playlist.m3u8"
+	// The master playlist when the session carries a ladder, the media playlist
+	// otherwise; either way the client is handed the one file it should open.
+	response.URL = "/hls/" + session.ID + "/" + session.PlaylistFile()
 	writeJSON(w, http.StatusOK, response)
 }
 

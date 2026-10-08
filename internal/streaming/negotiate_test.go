@@ -381,6 +381,19 @@ func TestNamedSegmentRe_RejectsTraversal(t *testing.T) {
 		{name: "absolute path", input: "/etc/passwd", want: false},
 		{name: "wrong extension", input: "playlist.m3u8.bak", want: false},
 		{name: "segment index not padded", input: "seg1.ts", want: false},
+		// The ladder's files. Widening this allowlist is the one change here
+		// that could open a hole, so every new shape is pinned from both sides.
+		{name: "master playlist", input: "master.m3u8", want: true},
+		{name: "variant playlist", input: "playlist_0.m3u8", want: true},
+		{name: "two-digit variant", input: "playlist_11.m3u8", want: true},
+		{name: "variant segment", input: "seg0_00001.ts", want: true},
+		{name: "variant segment, two digits", input: "seg11_00001.ts", want: true},
+		{name: "leading slash on a master", input: "/master.m3u8", want: false},
+		{name: "traversal in a variant name", input: "../playlist_0.m3u8", want: false},
+		{name: "nested variant playlist", input: "sub/playlist_0.m3u8", want: false},
+		{name: "three-digit variant", input: "playlist_123.m3u8", want: false},
+		{name: "segment without a variant index padded", input: "seg0_1.ts", want: false},
+		{name: "playlist that is not a variant", input: "playlist_backup.m3u8", want: false},
 	}
 
 	for _, tt := range tests {
@@ -1257,6 +1270,11 @@ func TestNegotiate_BitrateLimitBelowTheAudioIsRefused(t *testing.T) {
 	if !strings.Contains(reasons, "too little") {
 		t.Errorf("the reasons should explain the shortfall: %s", reasons)
 	}
+	// The arithmetic has to be in the reason, including when it goes negative:
+	// a 300 kbps limit against 448 kbps of audio leaves -148 for the picture.
+	if !strings.Contains(reasons, "-148 kbps") {
+		t.Errorf("the reasons should show the arithmetic rather than a rounded guess: %s", reasons)
+	}
 }
 
 // TestNegotiate_BitrateCeilingLeavesRoomForReEncodedAudio covers the other
@@ -1303,5 +1321,296 @@ func TestNegotiate_BitrateCeilingWithNoAudioLeavesItAllForVideo(t *testing.T) {
 	}
 	if decision.TargetBitrateKbps != 3_000 {
 		t.Errorf("target bitrate = %d, want the whole limit", decision.TargetBitrateKbps)
+	}
+}
+
+// ---- adaptive bitrate ladder -----------------------------------------------
+
+// TestVideoLadder pins the shape of a ladder: the top height, two thirds, half -
+// with rungs that are too small or too close together dropped, because a rung a
+// player cannot tell apart from the one above is a wasted encode.
+func TestVideoLadder(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		top    int
+		budget int
+		want   []Rendition
+	}{
+		{
+			name: "1080p gives three rungs",
+			top:  1080,
+			want: []Rendition{
+				{Height: 1080, BitrateKbps: 4500},
+				{Height: 720, BitrateKbps: 2500},
+				{Height: 540, BitrateKbps: 1200},
+			},
+		},
+		{
+			name: "below the smallest rung there is no ladder",
+			top:  300,
+			want: nil,
+		},
+		{
+			name: "a short ladder keeps only distinct rungs",
+			top:  360,
+			want: []Rendition{
+				{Height: 360, BitrateKbps: 700},
+				{Height: 240, BitrateKbps: 400},
+			},
+		},
+		{
+			name: "odd heights are made even, as 4:2:0 requires",
+			top:  721,
+			want: []Rendition{
+				{Height: 720, BitrateKbps: 2500},
+				{Height: 480, BitrateKbps: 1200},
+				{Height: 360, BitrateKbps: 700},
+			},
+		},
+		{
+			name:   "a budget scales every rung rather than flattening them",
+			top:    1080,
+			budget: 2250,
+			want: []Rendition{
+				{Height: 1080, BitrateKbps: 2250},
+				{Height: 720, BitrateKbps: 1250},
+				{Height: 540, BitrateKbps: 600},
+			},
+		},
+		{
+			name:   "a budget that leaves less than the floor is raised to it",
+			top:    1080,
+			budget: 50,
+			want: []Rendition{
+				{Height: 1080, BitrateKbps: minVideoBitrateKbps},
+				{Height: 720, BitrateKbps: minVideoBitrateKbps},
+				{Height: 540, BitrateKbps: minVideoBitrateKbps},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := videoLadder(tt.top, tt.budget)
+			if len(got) != len(tt.want) {
+				t.Fatalf("ladder = %+v, want %+v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("rung %d = %+v, want %+v", i, got[i], tt.want[i])
+				}
+			}
+			// A ladder is only useful if it descends.
+			for i := 1; i < len(got); i++ {
+				if got[i].Height >= got[i-1].Height {
+					t.Errorf("rung %d (%d) is not below rung %d (%d)", i, got[i].Height, i-1, got[i-1].Height)
+				}
+			}
+		})
+	}
+}
+
+// TestNegotiate_BuildsALadderOnlyWhenNoHeightIsPinned pins the contract behind
+// the player's quality menu: a manifest that names a height is asking for one
+// rendition, and one that omits it is asking to adapt.
+func TestNegotiate_BuildsALadderOnlyWhenNoHeightIsPinned(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "vp9", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, BitrateKbps: 6_000,
+	}
+
+	adaptive := hdrCapability()
+	adaptive.SupportsHDR = false
+	adaptive.MaxBitDepth = 8
+	adaptive.MaxHeight = 0
+	adaptive.MaxWidth = 0
+
+	decision := Negotiate(info, adaptive)
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode: %s", decision.Mode, strings.Join(decision.Reasons, "; "))
+	}
+	if len(decision.Renditions) < 2 {
+		t.Fatalf("expected a ladder, got %+v", decision.Renditions)
+	}
+	if decision.Renditions[0].Height != 1080 {
+		t.Errorf("the top rung is %d, want the source height 1080", decision.Renditions[0].Height)
+	}
+	// The single-value fields keep describing the top of the ladder, so a client
+	// that reads only those still sees a coherent answer.
+	if decision.TargetHeight != 1080 {
+		t.Errorf("target height = %d, want the top rung", decision.TargetHeight)
+	}
+	if decision.TargetBitrateKbps != decision.Renditions[0].BitrateKbps {
+		t.Errorf("target bitrate = %d, want the top rung's %d",
+			decision.TargetBitrateKbps, decision.Renditions[0].BitrateKbps)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "ladder") {
+		t.Errorf("the reasons should say a ladder was built: %s", strings.Join(decision.Reasons, "; "))
+	}
+
+	// A pinned height means one rendition, which is what the quality menu asks
+	// for and what it has to keep getting.
+	pinned := adaptive
+	pinned.MaxHeight = 720
+	if got := Negotiate(info, pinned); len(got.Renditions) != 0 {
+		t.Errorf("a pinned height must produce one rendition, got %+v", got.Renditions)
+	}
+}
+
+// TestNegotiate_LadderRespectsTheBitrateLimit checks that a ladder is scaled by
+// the client's total limit rather than ignoring it.
+func TestNegotiate_LadderRespectsTheBitrateLimit(t *testing.T) {
+	t.Parallel()
+
+	capability := hdrCapability()
+	capability.SupportsHDR = false
+	capability.MaxBitDepth = 8
+	capability.MaxHeight = 0
+	capability.MaxWidth = 0
+	capability.MaxBitrateKbps = 2_000
+
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "vp9", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, BitrateKbps: 6_000, AudioBitrateKbps: 128,
+	}
+
+	decision := Negotiate(info, capability)
+	if len(decision.Renditions) < 2 {
+		t.Fatalf("expected a ladder, got %+v", decision.Renditions)
+	}
+	// The audio is copied at its own rate, so the top rung may use the rest.
+	if got, want := decision.Renditions[0].BitrateKbps, 2_000-128; got != want {
+		t.Errorf("top rung = %d kbps, want %d (the limit less the audio)", got, want)
+	}
+	for _, rung := range decision.Renditions {
+		if rung.BitrateKbps > decision.Renditions[0].BitrateKbps {
+			t.Errorf("rung %+v exceeds the top rung", rung)
+		}
+	}
+}
+
+// TestSessionPlaylistName covers which file a client is told to open.
+func TestSessionPlaylistName(t *testing.T) {
+	t.Parallel()
+
+	single := Decision{Mode: ModeTranscode, VideoAction: ActionTranscode}
+	if got := sessionPlaylistName(single); got != MediaPlaylistName {
+		t.Errorf("single rendition playlist = %q, want %q", got, MediaPlaylistName)
+	}
+
+	ladder := Decision{
+		Mode: ModeTranscode, VideoAction: ActionTranscode,
+		Renditions: []Rendition{{Height: 720, BitrateKbps: 2500}, {Height: 360, BitrateKbps: 700}},
+	}
+	if got := sessionPlaylistName(ladder); got != MasterPlaylistName {
+		t.Errorf("ladder playlist = %q, want %q", got, MasterPlaylistName)
+	}
+
+	// A session built without a name - by a test double, or a future caller -
+	// must still yield a file a player can open rather than an empty path.
+	if got := (&Session{}).PlaylistFile(); got != MediaPlaylistName {
+		t.Errorf("Session without a playlist name = %q, want %q", got, MediaPlaylistName)
+	}
+}
+
+// TestVariantStreamMap covers the ffmpeg incantation that pairs rungs with their
+// audio. Getting it wrong is how a ladder ends up as two copies of one stream.
+func TestVariantStreamMap(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		withAudio bool
+		count     int
+		want      string
+	}{
+		{name: "two rungs with audio", withAudio: true, count: 2, want: "v:0,a:0 v:1,a:1"},
+		{name: "three rungs with audio", withAudio: true, count: 3, want: "v:0,a:0 v:1,a:1 v:2,a:2"},
+		{name: "video only", withAudio: false, count: 2, want: "v:0 v:1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := variantStreamMap(tt.withAudio, tt.count); got != tt.want {
+				t.Errorf("variantStreamMap(%v, %d) = %q, want %q", tt.withAudio, tt.count, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildFFmpegArgs_Ladder covers the command line a ladder produces. Every
+// per-rendition option needs its stream specifier: without one, all of them land
+// on the first rung and the ladder is a ladder in name only.
+func TestBuildFFmpegArgs_Ladder(t *testing.T) {
+	t.Parallel()
+
+	cfg := ManagerConfig{
+		SegmentSeconds: 4,
+		Server:         ServerCapability{VideoEncoders: []string{"libx264"}},
+	}
+	args, err := BuildFFmpegArgs("/tmp/session", "/media/movie.mkv", Decision{
+		Mode: ModeTranscode, Deliverable: true, Container: "hls",
+		VideoAction: ActionTranscode, AudioAction: ActionCopy, TargetVideoCodec: "h264",
+		Renditions: []Rendition{
+			{Height: 720, BitrateKbps: 2500},
+			{Height: 360, BitrateKbps: 700},
+		},
+	}, cfg)
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
+
+	for _, want := range []string{
+		"-c:v:0 libx264", "-c:v:1 libx264",
+		"-filter:v:0 scale=-2:720", "-filter:v:1 scale=-2:360",
+		"-maxrate:0 2500k", "-maxrate:1 700k",
+		"-force_key_frames:0 expr:gte(t,n_forced*4)", "-force_key_frames:1 expr:gte(t,n_forced*4)",
+		"-pix_fmt:0 yuv420p", "-pix_fmt:1 yuv420p",
+		"-master_pl_name master.m3u8",
+		"-var_stream_map v:0,a:0 v:1,a:1",
+		"-hls_segment_filename /tmp/session/seg%v_%05d.ts",
+		"/tmp/session/playlist_%v.m3u8",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("ladder command line is missing %q:\n%s", want, joined)
+		}
+	}
+	// Each rung maps the source once; two rungs and one audio stream each is
+	// four maps, and any fewer would feed a rung the wrong input.
+	if got := strings.Count(joined, "-map 0:v:0"); got != 2 {
+		t.Errorf("video maps = %d, want one per rung:\n%s", got, joined)
+	}
+	if got := strings.Count(joined, "-map 0:a:0?"); got != 2 {
+		t.Errorf("audio maps = %d, want one per rung:\n%s", got, joined)
+	}
+
+	// A single-rendition session must not grow a master playlist or specifiers:
+	// its command line is the one that has always worked.
+	single, err := BuildFFmpegArgs("/tmp/session", "/media/movie.mkv", Decision{
+		Mode: ModeTranscode, Deliverable: true, Container: "hls",
+		VideoAction: ActionTranscode, AudioAction: ActionCopy, TargetVideoCodec: "h264",
+		TargetHeight: 720, TargetBitrateKbps: 2500,
+	}, cfg)
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgs: %v", err)
+	}
+	singleJoined := strings.Join(single, " ")
+	for _, unwanted := range []string{"-master_pl_name", "-var_stream_map", "-c:v:0", "-vf scale=-2:720,zscale"} {
+		if strings.Contains(singleJoined, unwanted) {
+			t.Errorf("a single rendition should not contain %q:\n%s", unwanted, singleJoined)
+		}
+	}
+	for _, want := range []string{"-c:v libx264", "-vf scale=-2:720", "-maxrate 2500k", "playlist.m3u8"} {
+		if !strings.Contains(singleJoined, want) {
+			t.Errorf("single rendition is missing %q:\n%s", want, singleJoined)
+		}
 	}
 }
