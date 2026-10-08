@@ -25,6 +25,7 @@ import (
 	"github.com/jok/astraeus-media/internal/observability"
 	"github.com/jok/astraeus-media/internal/streaming"
 	"github.com/jok/astraeus-media/internal/subtitles"
+	"github.com/jok/astraeus-media/internal/tracing"
 )
 
 // maxRequestBody bounds request bodies so a malformed client cannot exhaust
@@ -83,7 +84,10 @@ type Deps struct {
 	// keyed by - the gate's identity, or a peer address - is decided at the
 	// composition root, where both are known.
 	RateLimit func(http.Handler) http.Handler
-	Logger    *slog.Logger
+	// Tracer, when set, records a span per request and correlates the request
+	// log with it. A nil or disabled tracer is a no-op.
+	Tracer *tracing.Tracer
+	Logger *slog.Logger
 }
 
 // Server renders library state as JSON over HTTP.
@@ -100,6 +104,7 @@ type Server struct {
 	subtitles SubtitleConverter
 	webFS     http.Handler
 	rateLimit func(http.Handler) http.Handler
+	tracer    *tracing.Tracer
 	logger    *slog.Logger
 }
 
@@ -122,6 +127,7 @@ func NewServer(deps Deps) *Server {
 		metrics:   deps.Metrics,
 		subtitles: deps.Subtitles,
 		rateLimit: deps.RateLimit,
+		tracer:    deps.Tracer,
 		logger:    logger,
 	}
 
@@ -175,12 +181,17 @@ func (s *Server) Handler() http.Handler {
 	// Security headers wrap the whole mux, so a route added later cannot forget
 	// them; the request log wraps that, so it records what was actually served.
 	// The rate limiter sits inside both on purpose: a refusal is a response like
-	// any other, so it carries the same headers and appears in the same log.
+	// any other, so it carries the same headers and appears in the same log. The
+	// tracer is outermost so a span covers the whole request, a refusal included.
 	handler := http.Handler(mux)
 	if s.rateLimit != nil {
 		handler = s.rateLimit(handler)
 	}
-	return s.withRequestLogging(s.withSecurityHeaders(handler))
+	handler = s.withRequestLogging(s.withSecurityHeaders(handler))
+	if s.tracer.Enabled() {
+		handler = s.tracer.Middleware(handler)
+	}
+	return handler
 }
 
 // contentSecurityPolicy is the policy the web UI actually needs, and nothing
@@ -293,6 +304,13 @@ func (s *Server) withRequestLogging(next http.Handler) http.Handler {
 		// identity-aware gate is only useful if the identity is auditable.
 		if identity := access.IdentityFromContext(r.Context()); identity != "" {
 			attrs = append(attrs, "user", identity)
+		}
+		// When tracing is on, the ids go on the log line: a log entry nobody can
+		// connect to a span is a log entry without its context.
+		if span := tracing.SpanFromContext(r.Context()); span != nil {
+			if traceID := span.TraceID(); traceID != "" {
+				attrs = append(attrs, "trace_id", traceID, "span_id", span.SpanID())
+			}
 		}
 		s.logger.InfoContext(r.Context(), "http request", attrs...)
 	})
@@ -652,6 +670,13 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	}
 	object := objects[0]
 
+	// One span for the negotiation, which is where the expensive decisions are
+	// made. The session it may start gets its own span inside the manager.
+	ctx, span := s.tracer.Start(ctx, "playback.negotiate", tracing.SpanKindInternal,
+		tracing.String("media.entity_id", entity.ID),
+		tracing.String("media.object_id", object.ID))
+	defer span.End()
+
 	capability := streaming.BrowserCapability()
 	startSeconds := 0.0
 	// A non-zero ContentLength includes the -1 sent by chunked requests, so a
@@ -736,6 +761,17 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	s.metrics.IncCounter("astraeus_playback_decisions_total",
 		"Playback negotiations, by the mode they chose.",
 		map[string]string{"mode": string(decision.Mode)})
+	span.SetAttributes(
+		tracing.String("playback.mode", string(decision.Mode)),
+		tracing.String("playback.video_action", string(decision.VideoAction)),
+		tracing.Bool("playback.deliverable", decision.Deliverable),
+	)
+	if decision.BurnedSubtitleIndex > 0 {
+		span.SetAttributes(tracing.Int("playback.burned_subtitle_index", int64(decision.BurnedSubtitleIndex)))
+	}
+	if !decision.Deliverable {
+		span.SetStatus(tracing.StatusError, strings.Join(decision.Reasons, "; "))
+	}
 	response := playbackResponse{
 		EntityID:     entity.ID,
 		ObjectID:     object.ID,

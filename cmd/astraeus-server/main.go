@@ -40,10 +40,11 @@ import (
 	"github.com/jok/astraeus-media/internal/ratelimit"
 	"github.com/jok/astraeus-media/internal/streaming"
 	"github.com/jok/astraeus-media/internal/subtitles"
+	"github.com/jok/astraeus-media/internal/tracing"
 )
 
 // version is the build identifier reported by `astraeus-server version`.
-const version = "0.12.0"
+const version = "0.13.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -222,6 +223,10 @@ func runServe(args []string) error {
 		"API requests per second allowed per client (0 disables; only /api paths are limited)")
 	rateLimitBurst := fs.Int("rate-limit-burst", 0,
 		"requests a client may make at once above the rate (0 means the rate rounded up)")
+	otelEndpoint := fs.String("otel-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		"OTLP/HTTP endpoint to export traces to, for example http://127.0.0.1:4318 (empty disables tracing)")
+	otelServiceName := fs.String("otel-service-name", "astraeus-media",
+		"service.name recorded on exported traces")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -286,6 +291,29 @@ func runServe(args []string) error {
 		WebDir:     *webDir,
 		Logger:     app.logger,
 	}
+
+	// Tracing is opt-in and off without an endpoint: a media server should not
+	// need a collector to start. The flush on the way out is what makes the last
+	// spans arrive rather than being cut off with the process.
+	tracer, err := tracing.New(tracing.Config{
+		ServiceName: *otelServiceName,
+		Version:     version,
+		Endpoint:    *otelEndpoint,
+		Metrics:     metrics,
+		Logger:      app.logger,
+	})
+	if err != nil {
+		return err
+	}
+	deps.Tracer = tracer
+	if tracer.Enabled() {
+		app.logger.Info("trace export enabled", "endpoint", *otelEndpoint, "service", *otelServiceName)
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracer.Shutdown(flushCtx)
+	}()
 
 	if *rateLimit > 0 {
 		limiter, err := ratelimit.New(ratelimit.Config{
@@ -362,6 +390,7 @@ func runServe(args []string) error {
 			MaxSessions:    *maxSessions,
 			Server:         deps.Server,
 			Metrics:        metrics,
+			Tracer:         tracer,
 			Logger:         app.logger,
 		})
 		if err != nil {

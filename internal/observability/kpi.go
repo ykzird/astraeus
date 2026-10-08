@@ -34,6 +34,7 @@ const (
 	MetricAuthGranted          = "astraeus_auth_granted_total"
 	MetricAuthDenied           = "astraeus_auth_denied_total"
 	MetricRateLimited          = "astraeus_rate_limited_total"
+	MetricSpansDropped         = "astraeus_spans_dropped_total"
 )
 
 // KPIDefinition describes one entry in the registry.
@@ -128,6 +129,11 @@ var KPIRegistry = []KPIDefinition{
 	{
 		Name: MetricRateLimited,
 		Help: "API requests refused by the rate limiter. A sustained non-zero rate means a client is over its allowance.",
+		Kind: "counter",
+	},
+	{
+		Name: MetricSpansDropped,
+		Help: "Trace spans dropped because the export queue was full, which means the collector is slower than the traffic.",
 		Kind: "counter",
 	},
 }

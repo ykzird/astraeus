@@ -257,7 +257,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.12.0`).
+identifier (currently `0.13.0`).
 
 ## HTTP API
 
@@ -353,6 +353,7 @@ metric and absence-based alerting works.
 | `astraeus_transcode_fallbacks_total` | Hardware transcodes retried in software |
 | `astraeus_auth_granted_total`, `astraeus_auth_denied_total{reason}` | Access gate grants and denials |
 | `astraeus_rate_limited_total` | API requests refused by the rate limiter |
+| `astraeus_spans_dropped_total` | Trace spans dropped because the export queue was full |
 
 Errors are `{"code": "...", "message": "..."}` with a matching status code.
 
@@ -663,6 +664,42 @@ rather than charged to a bucket it shares with everyone else.
 The limiter is per process. Several servers behind one proxy each hold their own
 buckets, so the effective limit is the sum; a shared limit would need a shared
 store.
+
+## Tracing
+
+`--otel-endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) turns on trace export over
+**OTLP/HTTP**; empty disables it, which is the default. `--otel-service-name`
+sets the resource's `service.name` (default `astraeus-media`).
+
+```sh
+./astraeus-server serve --otel-endpoint http://127.0.0.1:4318
+```
+
+Every HTTP request becomes a **server span** carrying the method, path, peer
+address and response status, and an incoming W3C `traceparent` is continued, so a
+trace started by a proxy or another service keeps its id here. Inside a request,
+a playback negotiation and the streaming session it starts are **child spans**
+(the second carries the mode, the video action and the session id), so the slow
+part — forking ffmpeg and waiting for the first segment — is visible as the part
+that took the time. The request log line carries `trace_id` and `span_id`, which
+is what connects a log entry to the trace it belongs to. Spans are batched and
+posted to `<endpoint>/v1/traces`.
+
+The encoder and the batcher are hand-rolled rather than the OpenTelemetry SDK —
+the same trade the Prometheus exposition makes — so the dependency list stays at
+three modules. Three consequences are worth knowing:
+
+- A full export queue **drops spans and counts them** in
+  `astraeus_spans_dropped_total` instead of adding latency to a request that has
+  already finished, and a collector that is down is logged rather than retried
+  into a growing queue.
+- What is sent is traces only. Metrics stay on `/metrics`; logs stay on stderr.
+- There is no sampling beyond honouring a parent's sampled flag, no baggage, and
+  no propagation to the outbound calls the server itself makes.
+
+Verified end to end against a real collector: Jaeger all-in-one in a container
+listed `astraeus-media` as a service, received a span per request, and showed a
+span carrying an incoming `traceparent` as its child.
 
 ## Testing
 

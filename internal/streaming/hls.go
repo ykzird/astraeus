@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jok/astraeus-media/internal/observability"
+	"github.com/jok/astraeus-media/internal/tracing"
 )
 
 const (
@@ -177,7 +178,11 @@ type ManagerConfig struct {
 	MaxSessions int
 	// Metrics collects the streaming KPIs. A nil value disables instrumentation.
 	Metrics *observability.Metrics
-	Logger  *slog.Logger
+	// Tracer records a span around starting each session, which is the slowest
+	// thing this server does: it forks ffmpeg and waits for the first segment. A
+	// nil tracer is a no-op.
+	Tracer *tracing.Tracer
+	Logger *slog.Logger
 }
 
 // Manager owns the active streaming sessions.
@@ -286,9 +291,24 @@ func (m *Manager) StartAt(ctx context.Context, entityID, objectPath string, deci
 	if startSeconds < 0 {
 		startSeconds = 0
 	}
+
+	// The span covers the whole start, including the hardware-then-software
+	// retry, because the retry is part of how long the viewer waited.
+	ctx, span := m.cfg.Tracer.Start(ctx, "stream.session.start", tracing.SpanKindInternal,
+		tracing.String("stream.entity_id", entityID),
+		tracing.String("stream.mode", string(decision.Mode)),
+		tracing.String("stream.video_action", string(decision.VideoAction)),
+		tracing.Int("stream.start_seconds", int64(startSeconds)))
+	defer span.End()
+
 	cfg := m.cfg
 	session, err := m.startOnce(ctx, entityID, objectPath, decision, cfg, startSeconds)
 	if err == nil || !wouldUseHardware(decision, cfg) {
+		if err != nil {
+			span.RecordError(err)
+		} else {
+			span.SetAttributes(tracing.String("stream.session_id", session.ID))
+		}
 		return session, err
 	}
 
@@ -296,10 +316,20 @@ func (m *Manager) StartAt(ctx context.Context, entityID, objectPath string, deci
 		"entity_id", entityID, "error", err)
 	m.cfg.Metrics.IncCounter(observability.MetricTranscodeFallbacks,
 		"Transcodes that failed on a hardware encoder and were retried in software.", nil)
+	span.SetAttributes(tracing.Bool("stream.hardware_fallback", true))
 
 	cfg = withoutHardware(cfg)
 	decision = softwareOnlyDecision(decision, cfg.Server)
-	return m.startOnce(ctx, entityID, objectPath, decision, cfg, startSeconds)
+	session, err = m.startOnce(ctx, entityID, objectPath, decision, cfg, startSeconds)
+	if err != nil {
+		span.RecordError(err)
+	} else {
+		span.SetAttributes(
+			tracing.String("stream.session_id", session.ID),
+			tracing.String("stream.fallback_video_action", string(decision.VideoAction)),
+		)
+	}
+	return session, err
 }
 
 // wouldUseHardware reports whether this decision would be served by a hardware

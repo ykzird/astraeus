@@ -19,7 +19,7 @@ Whatever you pick, three facts decide whether the install is sound:
 ## Container
 
 ```sh
-docker build -t astraeus-media:0.12.0 .
+docker build -t astraeus-media:0.13.0 .
 
 # The image's default command serves on :8642 with every writable path inside
 # /data. This one has no access gate, so keep it on loopback.
@@ -27,7 +27,7 @@ docker run -d --name astraeus \
   -p 127.0.0.1:8642:8642 \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.12.0
+  astraeus-media:0.13.0
 ```
 
 Flags are passed through the entrypoint, so the server's own options can be
@@ -57,7 +57,7 @@ docker run -d --name astraeus \
   -e ASTRAEUS_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.12.0 \
+  astraeus-media:0.13.0 \
   serve --addr 0.0.0.0:8642 --web-dir /app/web \
         --db /data/astraeus.db --stream-root /data/streams \
         --image-cache /data/images --subtitle-cache /data/subtitles \
@@ -81,6 +81,13 @@ API client shares one bucket, and with the gate off the peer address is used —
 which, behind a reverse proxy, is the proxy's own address, so the limit becomes
 global. The limiter is per process, so several replicas behind one proxy each
 hold their own buckets.
+
+**Tracing is opt-in and needs to reach the collector.** `--otel-endpoint
+http://collector:4318` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) exports spans over
+OTLP/HTTP; empty disables it. In a container, that endpoint has to be reachable
+from inside the container's network namespace — a collector on the host is not
+`127.0.0.1` from there. The request log line then carries `trace_id` and
+`span_id`, so `docker logs` and the trace viewer line up.
 
 **Hardware acceleration.** A container does not see the GPU unless it is passed
 in: add `--device /dev/dri` for VAAPI, and the container's ffmpeg must be able to

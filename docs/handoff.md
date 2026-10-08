@@ -1,11 +1,11 @@
 # Handoff
 
-**As of the round-5 work of 2026-10-08 — API rate limiting. Version 0.12.0. 102
-tracked files.** (`git log` names the commits; the previous handoff was
-`5458ab2`, which delivered image subtitles by burn-in. Round 3 landed per-viewer
-progress; round 2 landed HDR/Dolby Vision, packaging, the bitrate ceiling, the
-adaptive ladder, audio track selection, resumable playback, the continue-watching
-list and response hardening.)
+**As of the round-6 work of 2026-10-08 — OpenTelemetry trace export. Version
+0.13.0. 105 tracked files.** (`git log` names the commits; the previous handoff
+was `9458674`, which added API rate limiting. Round 4 delivered image subtitles
+by burn-in, round 3 per-viewer progress, and round 2 HDR/Dolby Vision, packaging,
+the bitrate ceiling, the adaptive ladder, audio track selection, resumable
+playback, the continue-watching list and response hardening.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -137,6 +137,20 @@ mise exec -- go test -race -run 'Limiter|RateLimit' ./internal/ratelimit/ ./inte
   --rate-limit 1 --rate-limit-burst 2 &
 for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code}\n' localhost:8927/api/entities; done  # 200 200 429
 curl -s localhost:8927/metrics | grep '^astraeus_rate_limited_total'                # 1
+
+# Tracing. The encoder and batcher are unit-tested against a stub OTLP receiver
+# (the payload is decoded with the OTLP field names, so a wrong shape fails the
+# test), and the whole path was checked against a real collector: run Jaeger,
+# point the server at it, and query the collector's own API.
+mise exec -- go test -race -run 'Trace|Tracer|Exporter|Middleware|Queue' ./internal/tracing/
+docker run -d --name astraeus-jaeger -p 127.0.0.1:4318:4318 -p 127.0.0.1:16686:16686 jaegertracing/all-in-one:latest
+./astraeus-server serve --db .tmp/demo-verify.db --web-dir web --addr 127.0.0.1:8929 \
+  --enrich-interval 0 --scan-interval 0 --stream-root "$PWD/.tmp/otel-streams" \
+  --otel-endpoint http://127.0.0.1:4318 &
+curl -s -o /dev/null -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+  localhost:8929/api/libraries
+curl -s 'http://127.0.0.1:16686/api/traces?service=astraeus-media&limit=10'   # trace 4bf9... continued
+docker rm -f astraeus-jaeger
 
 # Both resume paths in a real browser - direct play seeks the element itself,
 # segmented delivery is started at the offset by the server - plus the
@@ -327,6 +341,30 @@ HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
 Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 10/10 subtitles. Full Go suite green with race and integration.
 
+**OpenTelemetry trace export** landed as of 0.13.0: `internal/tracing` is a
+hand-rolled OTLP/HTTP JSON encoder and batcher, opt-in with `--otel-endpoint`
+(or `OTEL_EXPORTER_OTLP_ENDPOINT`). The choice mirrors the Prometheus
+exposition: the wire format is the standard, so any OTLP backend receives the
+spans, and the dependency list stays at three modules instead of taking the SDK
+with its protobuf and gRPC trees. Every request is a server span carrying method,
+path, peer and status; an incoming W3C `traceparent` is continued, so a trace
+started by a proxy keeps its id here; a **playback negotiation** and the
+**streaming session it starts** are child spans, so forking ffmpeg and waiting for
+the first segment shows up as the part of the request that took the time; and the
+request log line carries `trace_id` and `span_id`. The exporter batches, and three
+behaviours are deliberate: a full queue **drops spans and counts them** in
+`astraeus_spans_dropped_total` rather than adding latency to a finished request, a
+collector that is down is logged rather than retried into a growing queue, and
+shutdown drains before exiting.
+Verified against a **real collector**: Jaeger all-in-one in a container listed
+`astraeus-media`, received a span per request, and showed a request carrying an
+incoming `traceparent` as a `CHILD_OF` span of it. A remux playback then produced
+`playback.negotiate` (`playback.mode=remux`) and `stream.session.start`
+(`stream.mode=remux`, `stream.session_id=...`) as a child of the request, in the
+trace the request's own `traceparent` named. The request log correlation was read
+back from the running server (`trace_id=4bf92f...` on the matching line), and so
+was the export-failure warning when the collector was stopped.
+
 **API rate limiting** landed as of 0.12.0: `internal/ratelimit` is a token bucket
 per client in front of `/api/` only, off by default, with `--rate-limit` and
 `--rate-limit-burst`. The two decisions that matter are both about what a client
@@ -481,11 +519,13 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **OpenTelemetry tracing**, then **UI unit tests** (the front end is one 133 KB
-   file with no seam — `web/core.js` for the pure timeline maths is the cheapest
-   first cut). CSP, security headers and the artwork leak are done as of 0.9.0,
-   per-user progress as of 0.10.0, image subtitles by burn-in as of 0.11.0, and
-   API rate limiting as of 0.12.0.
+1. **UI unit tests.** The front end is one 133 KB file with no seam, and that is
+   now the largest untested surface in the project: everything else has unit or
+   integration coverage. `web/core.js` for the pure timeline maths is the
+   cheapest first cut, and the CDP harnesses already pin the behaviour a unit
+   test would protect. CSP, security headers and the artwork leak are done as of
+   0.9.0; per-user progress 0.10.0; image subtitles by burn-in 0.11.0; rate
+   limiting 0.12.0; trace export 0.13.0.
 2. **OCR for image subtitles, if the burn-in cost is unwanted.** A burn is exact
    but needs a re-encode, cannot be toggled without one, and cannot be searched or
    restyled. OCR (tesseract is already installed on the development host) would
@@ -543,6 +583,14 @@ Priority order, with the reasoning. Take it top-down.
   be refused at runtime and show up as a console error in the harness — which is
   the point of the policy, but it means a front-end change that adds one will
   fail verification rather than merely being flagged.
+- **Tracing is verified for traces over OTLP/HTTP against one backend.** The
+  encoder was accepted by Jaeger all-in-one (pulled and run here), but no other
+  OTLP backend has been tried, and only the attribute types this code emits were
+  exercised. OTLP over gRPC, sampling policies, baggage and propagation to the
+  server's own outbound calls (metadata provider, artwork proxy) are not
+  implemented, and scans, metadata lookups and individual segments are not
+  spanned — so the specification's "from API call to media segment delivery" is
+  covered up to the session starting, not to each segment.
 - **Rate limiting is verified by unit tests and one manual run, not by a real
   proxy or a load test.** The identity-keyed path is exercised through the gate's
   context in a test, not by Tailscale or Cloudflare Access forwarding headers on a

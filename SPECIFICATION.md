@@ -342,8 +342,24 @@ exposed at `/metrics` in the Prometheus text exposition format. The registry is
 declared at startup so an idle server still reports every metric. The metrics
 are produced by a small in-process implementation rather than the
 `prometheus/client_golang` dependency; replacing it is a contained change if
-summaries, exemplars or a push gateway are ever needed. Distributed tracing
-(OpenTelemetry) is still outstanding.
+summaries, exemplars or a push gateway are ever needed.
+
+Distributed tracing is implemented for traces only, over OTLP/HTTP, and is
+opt-in (`--otel-endpoint`; empty disables it). It follows §6.2's intent — end-to-end
+visibility from an API call — while keeping the dependency list short: the OTLP
+JSON encoder and the batcher are hand-rolled in `internal/tracing`, the same
+trade the Prometheus exposition makes. A request span reads an incoming W3C
+`traceparent` so a trace started upstream continues here, and inside a request a
+**playback negotiation** and the **streaming session it starts** are child spans,
+so forking ffmpeg and waiting for the first segment — the slow part of a request —
+is visible as the part that took the time. The request log line carries
+`trace_id` and `span_id`, which is what connects a log entry to the trace it
+belongs to. Spans are exported in batches; a full export queue drops spans and
+counts them in `astraeus_spans_dropped_total` rather than adding latency to a
+request that has already finished, and a collector that is down is logged rather
+than retried into a growing queue. Metrics and logs are *not* sent over OTLP:
+metrics stay on `/metrics` and logs stay on stderr. Scans and metadata lookups
+are not spanned yet.
 
 Authentication is implemented as an access gate in front of the whole server
 (§7.1's model: identity is established at the edge, not by a built-in user

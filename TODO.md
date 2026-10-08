@@ -101,7 +101,13 @@ Status as of the current build. Evidence for each claim is the test suite
       default (`--rate-limit`), answering `429` with a `Retry-After` and counted in
       `astraeus_rate_limited_total`. Per process, so several servers behind one
       proxy limit as a sum
-- [ ] OpenTelemetry tracing
+- [x] OpenTelemetry tracing: opt-in OTLP/HTTP export (`--otel-endpoint`), a span
+      per HTTP request that continues an incoming W3C `traceparent`, child spans
+      for the playback negotiation and the streaming session it starts, and
+      `trace_id`/`span_id` on the request log line. Hand-rolled encoder and
+      batcher, so no SDK dependency; verified against a real collector (Jaeger
+      all-in-one in a container) end to end, including the session span arriving
+      as a child of its request
 
 ## Phase 4: Spatial Web UI — complete for MVP scope
 
@@ -264,7 +270,11 @@ Status as of the current build. Evidence for each claim is the test suite
   header would mean nothing there; a TLS-terminating proxy should set it.
 - Cross-origin isolation (`COOP`/`COEP`) is not configured. Nothing here needs
   it, and enabling it would break resources that are not `CORP`-tagged.
-- OpenTelemetry tracing is not implemented; beyond the four specified metrics,
-  the registry holds counters and histograms for HTTP, scanning, streaming
-  sessions, playback decisions, probe errors, transcoder fallbacks and the
-  access gate.
+- Tracing is traces only, over OTLP/HTTP, and opt-in. There is no OTLP over
+  gRPC, no sampling beyond honouring a parent's sampled flag, no baggage, and no
+  propagation to the outbound calls the server makes (the metadata provider and
+  the artwork proxy). Only the request, the playback negotiation and the session
+  start are spanned: scans, metadata lookups and individual segments are not.
+  Beyond the four specified metrics, the registry holds counters and histograms
+  for HTTP, scanning, streaming sessions, playback decisions, probe errors,
+  transcoder fallbacks, the access gate, the rate limiter and dropped spans.
