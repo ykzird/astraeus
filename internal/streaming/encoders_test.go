@@ -773,3 +773,58 @@ func TestSoftwareOnlyDecision_ToneMapsWhenHDRCannotSurvive(t *testing.T) {
 		t.Errorf("an SDR decision should pass through unchanged:\n got %+v\nwant %+v", got, sdr)
 	}
 }
+
+// TestEncoderOutputArgs_BitrateCeiling covers the VBV constraint that makes a
+// client's bitrate limit real. -maxrate with -bufsize is the spelling every
+// family understands, so the ceiling is applied uniformly rather than each
+// family inventing a target bitrate.
+func TestEncoderOutputArgs_BitrateCeiling(t *testing.T) {
+	t.Parallel()
+
+	for _, encoder := range []string{"libx264", "libx265", "h264_nvenc", "h264_qsv", "h264_amf", "h264_vaapi"} {
+		t.Run(encoder, func(t *testing.T) {
+			t.Parallel()
+
+			joined := strings.Join(encoderOutputArgs(encoder, videoPlan{BitrateKbps: 5_000}, encoderDevice{}), " ")
+			for _, want := range []string{"-maxrate 5000k", "-bufsize 10000k"} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("%s is missing %q:\n%s", encoder, want, joined)
+				}
+			}
+			// Quality-driven encodes must stay quality-driven: a hard -b:v would
+			// turn CRF and CQ modes into fixed-rate ones.
+			if strings.Contains(joined, "-b:v") {
+				t.Errorf("%s should bound the rate, not dictate it:\n%s", encoder, joined)
+			}
+		})
+	}
+}
+
+// TestEncoderOutputArgs_NoCeilingMeansNoConstraint guards the common path.
+func TestEncoderOutputArgs_NoCeilingMeansNoConstraint(t *testing.T) {
+	t.Parallel()
+
+	joined := strings.Join(encoderOutputArgs("libx264", videoPlan{Height: 720}, encoderDevice{}), " ")
+	if strings.Contains(joined, "-maxrate") || strings.Contains(joined, "-bufsize") {
+		t.Errorf("an unlimited session must not gain rate-control flags:\n%s", joined)
+	}
+}
+
+// TestVideoEncoderFor_CarriesTheBitrateCeiling checks that the plan the args are
+// built from actually receives the decision's ceiling - the step that would
+// otherwise drop it silently.
+func TestVideoEncoderFor_CarriesTheBitrateCeiling(t *testing.T) {
+	t.Parallel()
+
+	server := ServerCapability{VideoEncoders: []string{"libx264"}}
+	_, plan, err := videoEncoderFor(Decision{
+		VideoAction: ActionTranscode, TargetVideoCodec: "h264",
+		TargetDynamicRange: RangeSDR, TargetBitrateKbps: 4_500,
+	}, server)
+	if err != nil {
+		t.Fatalf("videoEncoderFor: %v", err)
+	}
+	if plan.BitrateKbps != 4_500 {
+		t.Errorf("plan.BitrateKbps = %d, want 4500", plan.BitrateKbps)
+	}
+}

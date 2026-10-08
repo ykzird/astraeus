@@ -639,3 +639,98 @@ func TestManager_KeepsHDRForAClientThatCanShowIt(t *testing.T) {
 		t.Errorf("HDR segment reports range %q, want hdr10", produced.DynamicRange)
 	}
 }
+
+// generateExpensiveClip renders a deliberately high-bitrate clip, so that a
+// bitrate ceiling has something real to reduce. testsrc2 is noisy, which is what
+// keeps a CRF encode from being tiny on its own.
+func generateExpensiveClip(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=6",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+		"-c:v", "libx264", "-preset", "ultrafast", "-b:v", "8M",
+		"-c:a", "aac", "-shortest",
+		path,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("this ffmpeg cannot produce the fixture: %v\n%s", err, output)
+	}
+	return path
+}
+
+// TestManager_BitrateCeilingHoldsEndToEnd is the check that max_bitrate_kbps is
+// not merely echoed back. It encodes the same source twice - once unlimited and
+// once under a 500 kbps ceiling - and compares what actually came out, because a
+// flag in a command line is not evidence that the rate was bounded.
+func TestManager_BitrateCeilingHoldsEndToEnd(t *testing.T) {
+	requireFFmpeg(t)
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	source := generateExpensiveClip(t, dir, "expensive.mkv")
+
+	prober := NewFFProbe("ffprobe")
+	info, err := prober.Probe(ctx, source)
+	if err != nil {
+		t.Fatalf("probing the fixture: %v", err)
+	}
+	server := DetectServerCapability(ctx, "ffmpeg", "ffprobe", "")
+
+	const ceiling = 500
+	capability := BrowserCapability()
+	capability.MaxBitrateKbps = ceiling
+
+	capped := NegotiateForServer(info, capability, server)
+	if capped.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode for a source over the limit", capped.Mode)
+	}
+	if capped.TargetBitrateKbps <= 0 || capped.TargetBitrateKbps > ceiling {
+		t.Fatalf("target bitrate = %d, want a positive ceiling no higher than %d",
+			capped.TargetBitrateKbps, ceiling)
+	}
+
+	// The unlimited decision differs only in the cap, so anything the two have
+	// in common - codec, scaling, audio - cannot explain the difference.
+	unlimited := capped
+	unlimited.TargetBitrateKbps = 0
+	unlimited.Reasons = append([]string{}, capped.Reasons...)
+
+	measure := func(decision Decision) int {
+		t.Helper()
+		manager, session, _ := startSession(t, dir, source, decision)
+		defer manager.Stop(session.ID)
+
+		segment := waitForSegment(t, session.Dir, 90*time.Second)
+		if segment == "" {
+			t.Fatal("no segment was produced")
+		}
+		produced, err := prober.Probe(ctx, filepath.Join(session.Dir, segment))
+		if err != nil {
+			t.Fatalf("probing the produced segment: %v", err)
+		}
+		return produced.BitrateKbps
+	}
+
+	cappedKbps := measure(capped)
+	unlimitedKbps := measure(unlimited)
+
+	// If the fixture is not expensive enough there is nothing to prove, and a
+	// threshold picked to pass anyway would be a test that cannot fail.
+	if unlimitedKbps < 3*ceiling {
+		t.Skipf("the fixture only reached %d kbps unlimited, too close to the %d kbps ceiling to be evidence",
+			unlimitedKbps, ceiling)
+	}
+
+	if cappedKbps > 2*ceiling {
+		t.Errorf("capped segment is %d kbps, want it near the %d kbps ceiling", cappedKbps, ceiling)
+	}
+	if cappedKbps*2 > unlimitedKbps {
+		t.Errorf("capped segment is %d kbps against %d kbps unlimited: the ceiling did not bite",
+			cappedKbps, unlimitedKbps)
+	}
+	t.Logf("bitrate: unlimited %d kbps, capped %d kbps (ceiling %d, video target %d)",
+		unlimitedKbps, cappedKbps, ceiling, capped.TargetBitrateKbps)
+}

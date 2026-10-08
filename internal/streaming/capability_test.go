@@ -223,3 +223,34 @@ func TestClientCapability_PreferredVideoCodecForHDR(t *testing.T) {
 		})
 	}
 }
+
+// TestClientCapability_BitrateFloor covers a limit that is not a small budget
+// but an unplayable one, refused as malformed rather than encoded into a
+// slideshow.
+func TestClientCapability_BitrateFloor(t *testing.T) {
+	t.Parallel()
+
+	base := ClientCapability{
+		Containers:  []string{"hls"},
+		VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"},
+	}
+
+	tooLow := base
+	tooLow.MaxBitrateKbps = 50
+	if err := tooLow.Validate(); err == nil {
+		t.Error("a 50 kbps limit should be refused as malformed")
+	}
+
+	atFloor := base
+	atFloor.MaxBitrateKbps = minVideoBitrateKbps
+	if err := atFloor.Validate(); err != nil {
+		t.Errorf("the floor itself should be accepted: %v", err)
+	}
+
+	unlimited := base
+	unlimited.MaxBitrateKbps = 0
+	if err := unlimited.Validate(); err != nil {
+		t.Errorf("an omitted limit means unrestricted and must be valid: %v", err)
+	}
+}

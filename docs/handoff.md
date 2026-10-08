@@ -1,7 +1,8 @@
 # Handoff
 
-**As of `f489fa4` plus the packaging commits that follow it. Version 0.3.0.
-2026-10-08. 90 tracked files.**
+**As of the round-2 work of 2026-10-08 — HDR and Dolby Vision, packaging, and the
+bitrate ceiling. Version 0.4.0. 90 tracked files.** (`git log` names the commits;
+the previous handoff was `b76a14f`.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -91,6 +92,11 @@ to negotiation or to the ffmpeg argument builder:
 # ffmpeg, asserting the *produced segment*: 8-bit bt709 after a tone map, 10-bit
 # smpte2084/bt2020 when HDR is kept.
 mise exec -- go test -tags=integration -run 'ToneMapsHDR|KeepsHDR' -v ./internal/streaming/
+
+# Encodes the same expensive source twice - unlimited and under a 500 kbps
+# ceiling - and compares the measured bitrates, because a flag in an argument
+# list is not evidence that the rate was bounded.
+mise exec -- go test -tags=integration -run BitrateCeiling -v ./internal/streaming/
 
 # The real thing, against the 17 GB film: a browser profile gets bt709/bt709,
 # an HDR manifest gets 10-bit bt2020/PQ. Copy real.db first; *.db is local state.
@@ -265,6 +271,13 @@ HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
 Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 10/10 subtitles. Full Go suite green with race and integration.
 
+The bitrate axis landed too, as of 0.4.0: a client's `max_bitrate_kbps` reserves
+the audio's share and holds the video to the remainder as a VBV ceiling, applied
+uniformly to every encoder family so quality-driven encodes stay quality-driven.
+Verified end to end by encoding the same 9 Mbps source twice — 3.4 Mbps
+unlimited, 632 kbps under a 500 kbps limit. What remains of that item is the
+*ladder*: one rendition per request, no master playlist.
+
 Packaging landed after that, in the commits following `f489fa4`: a multi-stage
 `Dockerfile`, `deploy/astraeus.service`, `deploy/README.md` as the runbook, and
 `.github/workflows/ci.yml`. The image was **run**, not just built: it serves
@@ -280,9 +293,13 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **A real ABR ladder**, and making `max_bitrate_kbps` do something. The field is
-   currently accepted, validated and echoed but never acted on, which is worse
-   than not having it. It is now the most valuable *engine* work left.
+1. **A real ABR ladder.** One rendition per request today. The bitrate limit is
+   honoured as a ceiling on that rendition, but there is no master playlist and no
+   way to switch quality mid-stream, so a client on a flaky link has one choice:
+   the target the server picked. This is the most valuable *engine* work left, and
+   it touches the player: the front end's quality menu re-negotiates a height
+   server-side, which is a different mechanism from hls.js level switching, so
+   both the API and `web/app.js` change together.
 2. **Multi-audio-track selection** (the first stream wins today) and **image
    subtitles** (PGS/VobSub are detected, reported, and refused).
 3. **Resume / watch state.** The hard part already works: a session can start at
@@ -395,6 +412,12 @@ documentation without hardware to check them against.
   an incompatible container is copied rather than converted. Only a client that
   declared `supports_hdr` ever reaches that path, because an SDR client's
   decision is a tone map.
+- **A bitrate limit is honoured as a ceiling, not as a target.** The video keeps
+  its own quality settings and is bounded with `-maxrate`/`-bufsize`; converting
+  the encode to a fixed `-b:v` would make quality-driven encodes worse at the same
+  size. The ceiling is an average, so a segment shorter than the buffer can
+  measure above it — 632 kbps measured against a 500 kbps limit on a six-second
+  fixture, converging over a real stream.
 - **A tone-map session fails rather than degrades on a mis-tagged source.**
   `zscale` reports "no path between colorspaces" if a file claims PQ but is not
   HDR. Failing is deliberate — a wrong picture delivered silently is worse — but

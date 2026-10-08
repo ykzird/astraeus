@@ -87,8 +87,13 @@ type MediaInfo struct {
 	// AudioChannels is the channel count of the first audio stream. Chromium
 	// refuses a 5.1 AAC SourceBuffer, so this has to be negotiable.
 	AudioChannels int `json:"audio_channels,omitempty"`
-	Width         int `json:"width,omitempty"`
-	Height        int `json:"height,omitempty"`
+	// AudioBitrateKbps is the first audio stream's bitrate, when the container
+	// states one (Matroska usually does not). It is what makes a client's
+	// *total* bitrate limit actionable rather than approximate: the video
+	// ceiling is the limit minus what the audio will take.
+	AudioBitrateKbps int `json:"audio_bitrate_kbps,omitempty"`
+	Width            int `json:"width,omitempty"`
+	Height           int `json:"height,omitempty"`
 	// PixelFormat and BitDepth describe the decoded video. They matter because
 	// a 10-bit stream is not playable in a browser even when its codec name is
 	// one the browser claims to support.
@@ -266,6 +271,7 @@ func mediaInfoFromProbe(output ffprobeOutput, path string) (*MediaInfo, error) {
 			if info.AudioCodec == "" {
 				info.AudioCodec = stream.CodecName
 				info.AudioChannels = stream.Channels
+				info.AudioBitrateKbps = atoiSafe(stream.BitRate) / 1000
 			}
 		case "subtitle":
 			if stream.CodecName == "" {

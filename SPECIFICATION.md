@@ -254,6 +254,19 @@ whether the base layer is HDR10); its dynamic metadata cannot survive a
 re-encode and profile 5's IPTPQc2 base layer cannot be converted correctly
 without a Dolby Vision tone mapper, both of which appear in the reasons.
 
+Bandwidth is the seventh. A client's `max_bitrate_kbps` is a limit on the whole
+stream, so it is honoured by reserving the audio's share — the source's own rate
+when the audio is copied, this server's encode target otherwise — and holding the
+video to the remainder as a VBV ceiling (`-maxrate` with a buffer twice that
+size, applied uniformly to every encoder family, so quality-driven encodes stay
+quality-driven). A source the client can decode but cannot afford is therefore
+re-encoded rather than copied, and a limit below what the audio alone needs is
+refused as undeliverable instead of being met with an unwatchable picture. Two
+honest consequences: an unknown source bitrate is not assumed to exceed the limit,
+because guessing would transcode files that fit, and a VBV ceiling is an average
+rather than an instantaneous bound — over a segment shorter than the buffer the
+measured rate can exceed it while the encoder spends what it has saved.
+
 The output's colour is set on the frames, not through `-color_primaries` and
 friends: those options were measured not to reach the output, because ffmpeg
 writes the encoder's VUI from the frame properties. The tone-map chain sets

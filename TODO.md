@@ -49,7 +49,13 @@ Status as of the current build. Evidence for each claim is the test suite
       separate from the 8-bit one because an encoder that works at 8 may refuse 10
 - [ ] Multi-audio-track selection
 - [ ] Serving image-based subtitles (PGS/VobSub) — needs OCR or bitmap overlay
-- [ ] Bitrate-aware ABR ladder (currently a single target rendition)
+- [x] `max_bitrate_kbps` acted on rather than echoed: the audio's share is
+      reserved and the video held to the remainder as a VBV ceiling, uniformly
+      across encoder families. Verified end to end — the same 9 Mbps source came
+      out at 3.4 Mbps unlimited and 632 kbps under a 500 kbps limit
+- [ ] Bitrate-aware ABR ladder (currently a single target rendition; the
+      client's `max_bitrate_kbps` is honoured as a ceiling on it, and is no
+      longer ignored)
 - [ ] Dolby Vision profile 5 *correct* conversion (IPTPQc2 needs a Dolby Vision
       tone mapper; the software chain produces approximate colour and says so)
 
@@ -119,8 +125,15 @@ Status as of the current build. Evidence for each claim is the test suite
 
 ## Known gaps
 
-- Transcoding runs one rendition per request; there is no adaptive bitrate
-  ladder, and `max_bitrate_kbps` is accepted but not yet acted on.
+- Transcoding runs one rendition per request: there is still no adaptive bitrate
+  ladder, so a client cannot switch renditions mid-stream and the server ships one
+  target. `max_bitrate_kbps` now acts on that rendition — it reserves the audio's
+  share and holds the video to the remainder as a VBV ceiling — but a ladder of
+  renditions with a master playlist is the piece that remains.
+- A VBV ceiling bounds the average rather than every instant, so over a segment
+  shorter than the buffer the delivered rate can exceed the client's limit. That
+  is standard rate-control behaviour, not a bug, but it is a limit on how literal
+  the guarantee is.
 - Seeking is no longer bounded by how far the transcoder has got: the client
   re-negotiates with `start_seconds` and ffmpeg seeks the input, so any point
   in the film is reachable in a couple of seconds. The landing point is

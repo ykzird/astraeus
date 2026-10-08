@@ -42,7 +42,7 @@ import (
 )
 
 // version is the build identifier reported by `astraeus-server version`.
-const version = "0.3.0"
+const version = "0.4.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {

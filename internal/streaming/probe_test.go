@@ -117,6 +117,7 @@ func hdrProbeOutput() ffprobeOutput {
 	audio.CodecName = "eac3"
 	audio.CodecType = "audio"
 	audio.Channels = 6
+	audio.BitRate = "448000"
 
 	output := ffprobeOutput{Streams: []ffprobeStream{stream, audio}}
 	output.Format.FormatName = "matroska,webm"
@@ -151,6 +152,11 @@ func TestMediaInfoFromProbe_ReadsDynamicRangeAndDolbyVision(t *testing.T) {
 	}
 	if info.BitDepth != 10 {
 		t.Errorf("bit depth = %d, want 10", info.BitDepth)
+	}
+	// The audio's own rate is what a client's total-bitrate limit has to leave
+	// room for when the audio is being copied.
+	if info.AudioBitrateKbps != 448 {
+		t.Errorf("audio bitrate = %d, want 448", info.AudioBitrateKbps)
 	}
 	if info.Container != "matroska" {
 		t.Errorf("container = %q, want matroska", info.Container)

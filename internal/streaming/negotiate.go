@@ -49,6 +49,10 @@ type Decision struct {
 	// TargetAudioChannels is set when the source carries more channels than the
 	// client accepts and the audio is being re-encoded anyway.
 	TargetAudioChannels int `json:"target_audio_channels,omitempty"`
+	// TargetBitrateKbps is the ceiling the delivered video is held to, set when
+	// the client declared a total bitrate limit. It is the client's limit minus
+	// the audio allowance, so the whole stream fits rather than the video alone.
+	TargetBitrateKbps int `json:"target_bitrate_kbps,omitempty"`
 	// TargetDynamicRange is the dynamic range of the video this decision
 	// delivers: always "sdr" unless an HDR source is being passed through to a
 	// client that declared HDR support.
@@ -137,8 +141,28 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 				dynamicRangeLabel(info)))
 	}
 
+	// A bitrate limit the source exceeds is also a reason to re-encode: there is
+	// no way to honour it while copying the bits. An unknown source bitrate is
+	// deliberately not treated as exceeding it, because guessing would transcode
+	// files that probably fit - but it is worth saying, since the limit then
+	// cannot be shown to hold.
+	bitrateTooHigh := false
+	if capability.MaxBitrateKbps > 0 {
+		switch {
+		case info.BitrateKbps <= 0:
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("the source bitrate is unknown, so the client's %d kbps limit cannot be checked; a re-encode would be held to it",
+					capability.MaxBitrateKbps))
+		case info.BitrateKbps > capability.MaxBitrateKbps:
+			bitrateTooHigh = true
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("source is %d kbps but the client accepts at most %d kbps",
+					info.BitrateKbps, capability.MaxBitrateKbps))
+		}
+	}
+
 	switch {
-	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany || hdrMismatch:
+	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany || hdrMismatch || bitrateTooHigh:
 		decision.Mode = ModeTranscode
 	case containerCompatible:
 		decision.Mode = ModeDirectPlay
@@ -147,7 +171,7 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	}
 
 	// Video action.
-	if !videoCompatible || needsDownscale || tooDeep || hdrMismatch {
+	if !videoCompatible || needsDownscale || tooDeep || hdrMismatch || bitrateTooHigh {
 		decision.VideoAction = ActionTranscode
 		decision.TargetVideoCodec = capability.PreferredVideoCodec()
 		// An HDR source that has to be re-encoded should land in a codec that can
@@ -202,6 +226,25 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		}
 		if channelsTooMany {
 			decision.TargetAudioChannels = capability.MaxAudioChannels
+		}
+	}
+
+	// Turn the client's total bitrate limit into a video ceiling. The audio
+	// keeps its share - either the source's own rate, because it is being
+	// copied, or the rate this server encodes it at - so that what the client
+	// receives fits the limit rather than the video alone fitting it.
+	if capability.MaxBitrateKbps > 0 && decision.VideoAction == ActionTranscode {
+		audio := audioAllowanceKbps(info, decision.AudioAction)
+		if ceiling := capability.MaxBitrateKbps - audio; ceiling < minVideoBitrateKbps {
+			decision.Deliverable = false
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("the client's %d kbps limit leaves %d kbps for video after %d kbps of audio, which is too little to encode",
+					capability.MaxBitrateKbps, ceiling, audio))
+		} else {
+			decision.TargetBitrateKbps = ceiling
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("the video is held to %d kbps so the stream fits the client's %d kbps limit alongside %d kbps of audio",
+					ceiling, capability.MaxBitrateKbps, audio))
 		}
 	}
 
@@ -282,6 +325,35 @@ func describeBox(capability ClientCapability) string {
 		return fmt.Sprintf("%dpx wide", capability.MaxWidth)
 	default:
 		return "no resolution limit"
+	}
+}
+
+// minVideoBitrateKbps is the smallest video ceiling this server will accept. A
+// limit that leaves less than this for the picture is not a delivery decision,
+// it is a request that cannot be met, and saying so beats encoding something
+// nobody can watch.
+const minVideoBitrateKbps = 100
+
+// defaultAudioAllowanceKbps is what the audio is assumed to take when it is
+// being re-encoded, or when it is copied from a container that does not state
+// its bitrate (Matroska often does not). It matches the -b:a this server passes
+// to ffmpeg for a re-encoded track; if that changes, this should change with it.
+const defaultAudioAllowanceKbps = 192
+
+// audioAllowanceKbps is how much of the client's bitrate limit the audio track
+// will use: the source's own rate when it is copied and the container states it,
+// nothing when there is no audio, and the encode target otherwise.
+func audioAllowanceKbps(info *MediaInfo, audioAction Action) int {
+	switch audioAction {
+	case ActionNone:
+		return 0
+	case ActionCopy:
+		if info.AudioBitrateKbps > 0 {
+			return info.AudioBitrateKbps
+		}
+		return defaultAudioAllowanceKbps
+	default:
+		return defaultAudioAllowanceKbps
 	}
 }
 

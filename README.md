@@ -253,7 +253,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.3.0`).
+identifier (currently `0.4.0`).
 
 ## HTTP API
 
@@ -370,18 +370,20 @@ Modes:
 - **`remux`** — streams are compatible but the container is not; they are copied
   into HLS unchanged, so quality is bit-identical.
 - **`transcode`** — at least one stream is incompatible, or the source is larger
-  than the client accepts; only the offending streams are re-encoded. This is
-  also where an HDR source is tone mapped for a client that cannot show HDR.
+  than the client accepts, or its bitrate is above what the client will take; only
+  the offending streams are re-encoded. This is also where an HDR source is tone
+  mapped for a client that cannot show HDR.
 
 A `409` means the client's declaration makes delivery impossible (for example it
-needs re-encoding but cannot play HLS); the reasons explain why.
+needs re-encoding but cannot play HLS, or its bitrate limit leaves nothing for
+video after the audio); the reasons explain why.
 
 The decision also carries the concrete targets it chose — `target_height` for a
-downscale, `target_audio_channels` for a downmix, and `target_dynamic_range` for
-the delivered video's dynamic range — so a client can see not just that it will
-be re-encoded but what it will get. A `tone_map` flag says the picture was
-converted from HDR to SDR, which is a visible change rather than a quality
-trade-off.
+downscale, `target_audio_channels` for a downmix, `target_dynamic_range` for
+the delivered video's dynamic range, and `target_bitrate_kbps` for a bitrate
+ceiling — so a client can see not just that it will be re-encoded but what it will
+get. A `tone_map` flag says the picture was converted from HDR to SDR, which is a
+visible change rather than a quality trade-off.
 
 A manifest naming a codec that does not exist is refused with `400` before it
 can reach ffmpeg. A codec that exists but that this host cannot encode is a
@@ -404,6 +406,24 @@ it washed out. A client that really can — a television app, a browser on an HD
 display reporting through its own manifest — says so. Declaring it alongside
 `max_bit_depth: 8` is a contradiction and is refused with `400`: HDR is stored at
 ten bits or more.
+
+`max_bitrate_kbps` is a limit on the **whole** stream, and it is acted on rather
+than echoed. The audio's share is reserved first — the source's own rate when the
+audio is being copied and the container states it, otherwise the 192 kbps this
+server encodes audio at — and the video is held to the remainder with a VBV
+ceiling, which every encoder family honours while keeping its own quality
+settings. So a source the client can decode but cannot afford is re-encoded
+rather than copied, a source that already fits is left alone, and an unknown
+source bitrate is not assumed to exceed the limit (the reasons say the limit could
+not be checked). A limit under 100 kbps is refused as malformed, and one that
+leaves nothing for video after the audio is a `409` with the arithmetic in the
+reason.
+
+One honest caveat: a VBV ceiling bounds the average, not every instant. A buffer
+twice the ceiling lets the encoder spend what it has saved, so over a segment
+shorter than the buffer the measured rate can exceed the ceiling — on a
+six-second test segment a 500 kbps limit measured 632 kbps muxed, while the same
+source unlimited measured 3.3 Mbps. Over a real stream the average converges.
 
 ## Access gate
 

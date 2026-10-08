@@ -101,6 +101,13 @@ func (c ClientCapability) Validate() error {
 	if c.SupportsHDR && c.MaxBitDepth > 0 && c.MaxBitDepth < 10 {
 		return fmt.Errorf("supports_hdr requires max_bit_depth of at least 10, got %d", c.MaxBitDepth)
 	}
+	// A video limit below 100 kbps is not a low-quality request, it is an
+	// unplayable one: there is nothing left for a picture to be encoded into.
+	// Refusing it as malformed is friendlier than encoding a slideshow.
+	if c.MaxBitrateKbps > 0 && c.MaxBitrateKbps < minVideoBitrateKbps {
+		return fmt.Errorf("max_bitrate_kbps must be at least %d when set, got %d",
+			minVideoBitrateKbps, c.MaxBitrateKbps)
+	}
 	if unknown := firstUnknown(c.VideoCodecs, knownVideoCodecs, NormaliseVideoCodec); unknown != "" {
 		return fmt.Errorf("unknown video codec %q", unknown)
 	}

@@ -1150,3 +1150,158 @@ func TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped(t *testing.T) {
 		t.Errorf("target codec = %q, want h264", decision.TargetVideoCodec)
 	}
 }
+
+// ---- bitrate ---------------------------------------------------------------
+
+// TestNegotiate_BitrateLimitForcesATranscode covers the field that used to be
+// accepted and ignored. A source the client can technically decode but cannot
+// afford has to be re-encoded: there is no way to honour a bitrate limit while
+// copying the bits.
+func TestNegotiate_BitrateLimitForcesATranscode(t *testing.T) {
+	t.Parallel()
+
+	capability := BrowserCapability()
+	capability.MaxBitrateKbps = 20_000
+
+	info := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8,
+		BitrateKbps: 40_000, AudioBitrateKbps: 448,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode for a source over the client's limit", decision.Mode)
+	}
+	if decision.VideoAction != ActionTranscode {
+		t.Errorf("video action = %q, want transcode", decision.VideoAction)
+	}
+	// The audio is copied, so its own bitrate is what the ceiling must leave
+	// room for - not a guess.
+	want := 20_000 - 448
+	if decision.TargetBitrateKbps != want {
+		t.Errorf("target bitrate = %d, want %d", decision.TargetBitrateKbps, want)
+	}
+	reasons := strings.Join(decision.Reasons, "; ")
+	if !strings.Contains(reasons, "40000 kbps") || !strings.Contains(reasons, "20000 kbps") {
+		t.Errorf("the reasons should name both bitrates: %s", reasons)
+	}
+}
+
+// TestNegotiate_BitrateLimitIsIgnoredWhenTheSourceFits is the guard against
+// turning every request into a transcode: a limit the source already satisfies
+// changes nothing.
+func TestNegotiate_BitrateLimitIsIgnoredWhenTheSourceFits(t *testing.T) {
+	t.Parallel()
+
+	capability := BrowserCapability()
+	capability.MaxBitrateKbps = 20_000
+
+	info := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, BitrateKbps: 5_000,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.Mode != ModeDirectPlay {
+		t.Fatalf("mode = %q, want direct play: %s", decision.Mode, strings.Join(decision.Reasons, "; "))
+	}
+	if decision.TargetBitrateKbps != 0 {
+		t.Errorf("target bitrate = %d, want none when the source already fits", decision.TargetBitrateKbps)
+	}
+}
+
+// TestNegotiate_UnknownSourceBitrateDoesNotForceATranscode pins the conservative
+// choice. Treating an unknown rate as over the limit would transcode files that
+// probably fit; saying so is the honest middle ground.
+func TestNegotiate_UnknownSourceBitrateDoesNotForceATranscode(t *testing.T) {
+	t.Parallel()
+
+	capability := BrowserCapability()
+	capability.MaxBitrateKbps = 20_000
+
+	info := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.Mode != ModeDirectPlay {
+		t.Fatalf("mode = %q, want direct play when the source bitrate is unknown", decision.Mode)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "bitrate is unknown") {
+		t.Errorf("the reasons should admit the limit cannot be checked: %s", strings.Join(decision.Reasons, "; "))
+	}
+}
+
+// TestNegotiate_BitrateLimitBelowTheAudioIsRefused covers a limit that cannot be
+// met at all. Encoding a picture into what is left would produce something
+// nobody can watch, so the request is refused with the arithmetic spelled out.
+func TestNegotiate_BitrateLimitBelowTheAudioIsRefused(t *testing.T) {
+	t.Parallel()
+
+	capability := BrowserCapability()
+	capability.MaxBitrateKbps = 300
+
+	info := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8,
+		BitrateKbps: 40_000, AudioBitrateKbps: 448,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.Deliverable {
+		t.Fatal("a limit that leaves nothing for video must not be called deliverable")
+	}
+	reasons := strings.Join(decision.Reasons, "; ")
+	if !strings.Contains(reasons, "too little") {
+		t.Errorf("the reasons should explain the shortfall: %s", reasons)
+	}
+}
+
+// TestNegotiate_BitrateCeilingLeavesRoomForReEncodedAudio covers the other
+// allowance: when the audio is being re-encoded, the ceiling reserves what this
+// server encodes it at rather than the source's rate.
+func TestNegotiate_BitrateCeilingLeavesRoomForReEncodedAudio(t *testing.T) {
+	t.Parallel()
+
+	capability := BrowserCapability()
+	capability.MaxBitrateKbps = 2_000
+
+	info := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "ac3",
+		Width: 1920, Height: 1080, BitDepth: 8,
+		BitrateKbps: 40_000, AudioChannels: 6, AudioBitrateKbps: 640,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.AudioAction != ActionTranscode {
+		t.Fatalf("audio action = %q, want transcode for 5.1 into a stereo client", decision.AudioAction)
+	}
+	if want := 2_000 - defaultAudioAllowanceKbps; decision.TargetBitrateKbps != want {
+		t.Errorf("target bitrate = %d, want %d (the re-encode target, not the source's 640)",
+			decision.TargetBitrateKbps, want)
+	}
+}
+
+// TestNegotiate_BitrateCeilingWithNoAudioLeavesItAllForVideo covers an entity
+// with no audio track: nothing needs reserving.
+func TestNegotiate_BitrateCeilingWithNoAudioLeavesItAllForVideo(t *testing.T) {
+	t.Parallel()
+
+	capability := BrowserCapability()
+	capability.MaxBitrateKbps = 3_000
+
+	info := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264",
+		Width: 1920, Height: 1080, BitDepth: 8, BitrateKbps: 40_000,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.AudioAction != ActionNone {
+		t.Fatalf("audio action = %q, want none", decision.AudioAction)
+	}
+	if decision.TargetBitrateKbps != 3_000 {
+		t.Errorf("target bitrate = %d, want the whole limit", decision.TargetBitrateKbps)
+	}
+}
