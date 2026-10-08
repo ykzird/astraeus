@@ -1,15 +1,14 @@
 # Handoff
 
-**As of the round-10 work of 2026-10-08 — release automation, and the repository
-going public. 126 tracked files; the in-tree version is `dev` and a release takes
-its number from its tag (the next tag would be v0.17.0).** (`git log` names the
-commits; the previous handoff was `e2a434e`, which made a quality choice cap a
-ladder. Round 9 was that ladder cap, round 8 OCR for PGS image subtitles, round 7
-front-end unit tests, round 6 trace export, round 5 API rate limiting, round 4
-image subtitles by burn-in, round 3 per-viewer progress, and round 2 HDR/Dolby
-Vision, packaging, the bitrate ceiling, the adaptive ladder, audio track
-selection, resumable playback, the continue-watching list and response
-hardening.)
+**As of the round-11 work of 2026-10-08 — the documentation restructure. 130
+tracked files; the in-tree version is `dev` and a release takes its number from
+its tag (the next tag would be v0.17.0).** (`git log` names the commits; the
+previous handoff was `db4b6b4`. Round 10 was release automation and going public,
+which found a ladder defect the development host's ffmpeg had been hiding; round
+9 made a quality choice cap a ladder; round 8 was OCR for PGS image subtitles;
+round 7 front-end unit tests; round 6 trace export; round 5 API rate limiting;
+round 4 image subtitles by burn-in; round 3 per-viewer progress; earlier rounds
+are in `git log`.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -25,9 +24,11 @@ rule there that decides when to stop and hand over rather than run long.
 A from-scratch, single-binary media server in Go with an embedded vanilla-JS
 "spatial" web UI: it scans a library, negotiates how to deliver each file to the
 client that asked for it, and transcodes with ffmpeg when it has to. SQLite, no
-cgo, no build step for the front end. `README.md` is the reference for what it
-does; `SPECIFICATION.md` is the design; `TODO.md` holds the honest state of what
-is missing.
+cgo, no build step for the front end. `README.md` is the user-facing way in and
+[`docs/index.md`](index.md) is the map of everything else: `docs/playback.md` and
+`docs/configuration.md` for how it behaves, `docs/api.md` for the endpoints,
+`docs/development.md` for the tests and harnesses, `SPECIFICATION.md` for the
+design, and `TODO.md` for the honest state of what is missing.
 
 An adversarial review of the codebase, the competitive landscape and the front
 end lives in `docs/adversarial-review.md`, with the two raw reports in
@@ -235,9 +236,9 @@ Two mechanical checks worth re-running after any change to the API surface or th
 metrics registry — both are scripted in the review's spirit and catch documentation
 drift that eyeballing does not:
 
-- every metric declared in `internal/observability/kpi.go` is named in the README,
-  and nothing named there is undeclared;
-- every route mounted in `internal/api/server.go` appears in the README's table.
+- every metric declared in `internal/observability/kpi.go` is named in
+  `docs/api.md`, and nothing named there is undeclared;
+- every route mounted in `internal/api/server.go` appears in that page's table.
 
 Deployment has its own checks. The unit is checked statically and the image is
 checked by running it:
@@ -338,10 +339,11 @@ Conventions that matter more than they look:
   discipline is what keeps the policy strict: an inline script or an
   HTML-injection sink would mean weakening the policy or handing a filename on
   disk a way into the DOM, not just a code smell.
-- **Docs are part of the change.** `README`, `SPECIFICATION`, `TODO`, and the two
-  READMEs beside the code they describe (`web/README.md`, `deploy/README.md`)
-  have all been kept in sync; `TODO.md` marks gaps honestly rather than
-  aspirationally.
+- **Docs are part of the change.** `README` (the user's way in), the pages under
+  `docs/`, `SPECIFICATION`, `TODO`, and the READMEs beside the code they describe
+  (`web/README.md`, `deploy/README.md`) have all been kept in sync; `TODO.md`
+  marks gaps honestly rather than aspirationally. `docs/index.md` is the map, and
+  every page carries what it is for.
 
 ---
 
@@ -475,6 +477,28 @@ This is the clearest argument for the CI and the container being real: the host'
 ffmpeg is not the shipped one, and only running the test on the shipped version
 told the truth.
 
+**The documentation was restructured** in round 11, which changes how the project
+explains itself rather than what it does. `README.md` had grown to 900 lines and
+had become the reference manual: accurate, but not a front door. It is now the
+front door — what this is, what it does, how to run it, where to read more — and
+the detail moved, unchanged, into `docs/`: [playback.md](playback.md) (delivery,
+negotiation, HDR, hardware encoders, audio, subtitles, the ladder),
+[configuration.md](configuration.md) (scanning, every flag, the gate, rate
+limiting, tracing), [api.md](api.md) (endpoints, resume state, metrics) and
+[development.md](development.md) (tests, harnesses, layout), with
+[index.md](index.md) as the map. Nothing was rewritten in the move: a script
+sliced the old README by heading and normalised the heading levels, so the prose
+and its claims are the ones that were already verified, and a link check confirms
+every relative link still resolves. Two choices were deliberate. **The wiki was
+rejected**: it is a separate git repository, so it cannot be reviewed in the pull
+request that changes the code it describes, and it is not in the checkout an agent
+or a contributor reads. **The code of conduct was removed**: nobody asked for one,
+and a document nobody reads is worse than no document, because it implies a
+process that does not exist. `CONTRIBUTING.md` and the pull-request template now
+name `docs/` in the "docs are part of the change" rule, and the handoff's two
+mechanical drift checks point at `docs/api.md` for the metric and route tables
+they compare against.
+
 **The repository went public** in round 10, which changes the project's surface
 rather than its behaviour. The module path was `github.com/jok/astraeus-media`
 while the remote is `github.com/ykzird/astraeus`, so `go install` and pkg.go.dev
@@ -497,8 +521,9 @@ Dependabot watches the Go modules, the workflow actions including those commit
 pins, and the two container base images. The files a public repository is expected
 to have came with it — CONTRIBUTING (the verification rules this project actually
 follows), SECURITY, a pull-request template that asks for evidence, issue
-templates, a code of conduct and CODEOWNERS — and `main` is protected: a pull
-request, green CI, linear history.
+templates and CODEOWNERS — and `main` is protected: a pull request, green CI,
+linear history. There is deliberately no code of conduct: nobody asked for one and
+it would be a document nobody reads.
 
 **Release automation** landed as of round 10 (untagged; the next tag is
 v0.17.0). Pushing a `v*` tag runs `.github/workflows/release.yml`, which gates on
