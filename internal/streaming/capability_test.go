@@ -137,3 +137,89 @@ func TestClientCapability_Validate(t *testing.T) {
 		})
 	}
 }
+
+// TestClientCapability_HDRSupport covers the contradiction a manifest can carry:
+// HDR is stored at ten bits or more, so declaring HDR while capping the decoder
+// at eight is asking for something that cannot exist.
+func TestClientCapability_HDRSupport(t *testing.T) {
+	t.Parallel()
+
+	base := ClientCapability{
+		Containers:  []string{"hls"},
+		VideoCodecs: []string{"hevc"},
+		AudioCodecs: []string{"aac"},
+		MaxBitDepth: 10,
+	}
+
+	hdr := base
+	hdr.SupportsHDR = true
+	if err := hdr.Validate(); err != nil {
+		t.Errorf("an HDR manifest at 10 bits should be valid: %v", err)
+	}
+
+	// An unrestricted bit depth is not a contradiction: it says nothing.
+	unrestricted := base
+	unrestricted.SupportsHDR = true
+	unrestricted.MaxBitDepth = 0
+	if err := unrestricted.Validate(); err != nil {
+		t.Errorf("HDR with no declared bit depth cap should be valid: %v", err)
+	}
+
+	contradictory := base
+	contradictory.SupportsHDR = true
+	contradictory.MaxBitDepth = 8
+	err := contradictory.Validate()
+	if err == nil {
+		t.Fatal("HDR with an 8-bit cap is self-contradictory and must be refused")
+	}
+	if !strings.Contains(err.Error(), "supports_hdr") {
+		t.Errorf("the error should name the offending field, got %v", err)
+	}
+
+	// Normalise must not quietly drop the declaration, which would deliver
+	// tone-mapped SDR to a client that can do better.
+	if !hdr.Normalise().SupportsHDR {
+		t.Error("Normalise dropped SupportsHDR")
+	}
+}
+
+// TestBrowserCapability_IsSDR pins the default. Nothing about an arbitrary
+// browser proves it can render HDR, and assuming it would hand a PQ stream to a
+// compositor that shows it washed out - the bug this work fixes.
+func TestBrowserCapability_IsSDR(t *testing.T) {
+	t.Parallel()
+
+	if BrowserCapability().SupportsHDR {
+		t.Error("the browser profile must not claim HDR support on the client's behalf")
+	}
+}
+
+// TestClientCapability_PreferredVideoCodecForHDR checks the HDR-specific
+// preference, which must never fall back to a codec that cannot carry HDR.
+func TestClientCapability_PreferredVideoCodecForHDR(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		codecs []string
+		want   string
+	}{
+		{name: "H.264 alone has no HDR answer", codecs: []string{"h264"}, want: ""},
+		{name: "HEVC is preferred over AV1", codecs: []string{"av1", "hevc"}, want: "hevc"},
+		{name: "HEVC beats H.264 even though H.264 is listed", codecs: []string{"h264", "hevc"}, want: "hevc"},
+		{name: "AV1 when there is no HEVC", codecs: []string{"h264", "av1"}, want: "av1"},
+		{name: "VP9 is better than nothing", codecs: []string{"h264", "vp9"}, want: "vp9"},
+		{name: "an empty list has no answer", codecs: nil, want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			capability := ClientCapability{VideoCodecs: tt.codecs}
+			if got := capability.PreferredVideoCodecForHDR(); got != tt.want {
+				t.Errorf("PreferredVideoCodecForHDR(%v) = %q, want %q", tt.codecs, got, tt.want)
+			}
+		})
+	}
+}

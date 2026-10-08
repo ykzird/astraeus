@@ -161,6 +161,56 @@ type encoderDevice struct {
 	RenderNode string
 }
 
+// videoPlan is what a session intends to do to the picture, reduced to the
+// parts that change ffmpeg's arguments.
+type videoPlan struct {
+	// Height is the target height, 0 when the picture needs no scaling.
+	Height int
+	// ToneMap converts HDR to SDR, which by definition produces 8-bit BT.709.
+	ToneMap bool
+	// HDRPixelFormat is the pixel format verified for a 10-bit HDR output. It is
+	// empty for SDR output and is what makes a plan an HDR plan, so there is no
+	// separate flag to disagree with it.
+	HDRPixelFormat string
+	// TargetRange is the dynamic range the output is meant to have. It is only
+	// consulted when HDRPixelFormat is set, to pick the transfer function the
+	// output is tagged with.
+	TargetRange DynamicRange
+}
+
+// HDR reports whether this plan keeps high dynamic range.
+func (p videoPlan) HDR() bool { return p.HDRPixelFormat != "" }
+
+// videoEncoderFor returns the encoder and the picture plan a decision will use.
+//
+// Choosing them together is deliberate: an HDR decision must be encoded by the
+// encoder that was verified to produce 10-bit, and that is not necessarily the
+// encoder the ordinary preference order picks - a host whose QuickSync cannot
+// do 10-bit still has libx265 that can.
+func videoEncoderFor(decision Decision, server ServerCapability) (string, videoPlan, error) {
+	plan := videoPlan{
+		Height:      decision.TargetHeight,
+		ToneMap:     decision.ToneMap,
+		TargetRange: decision.TargetDynamicRange,
+	}
+
+	codec := decision.TargetVideoCodec
+	if decision.TargetDynamicRange.IsHDR() {
+		support, ok := EncoderForHDR(codec, server)
+		if !ok {
+			return "", plan, fmt.Errorf("no verified 10-bit HDR encoder for video codec %q", codec)
+		}
+		plan.HDRPixelFormat = support.PixelFormat
+		return support.Encoder, plan, nil
+	}
+
+	encoder := EncoderFor(codec, server)
+	if encoder == "" {
+		return "", plan, fmt.Errorf("no ffmpeg encoder available for video codec %q", codec)
+	}
+	return encoder, plan, nil
+}
+
 // encoderInputArgs returns the options that must precede the input.
 //
 // Only VAAPI has any, and it needs them: its upload filter has no device to
@@ -172,6 +222,94 @@ func encoderInputArgs(encoder string, dev encoderDevice) []string {
 		return nil
 	}
 	return []string{"-vaapi_device", dev.RenderNode}
+}
+
+// toneMapFilterChain converts HDR to SDR BT.709 in software.
+//
+// The shape is the documented one: linearise through zscale, hand float samples
+// to the tonemap filter, then tag the result as conventional limited-range
+// BT.709. The intermediate zscale=p=bt709 is what keeps the primaries
+// conversion in linear light; applying it after the tone map would run the
+// matrix over already-compressed values.
+//
+// hable is the compressor. It rolls highlights off smoothly instead of clipping
+// them, which is what stops a window or a lamp becoming a white hole, and desat
+// reins in the chroma that a luminance-only tone map would leave
+// over-saturated.
+//
+// The colour properties are the zscale stages' doing, and they are what the
+// output ends up tagged with: ffmpeg writes the encoder's VUI from the frame
+// properties rather than from -color_primaries. A PQ source tone mapped through
+// this chain and encoded with both libx264 and libx265 came out tagged
+// bt709/bt709/bt709, which is what makes this chain's output verifiable rather
+// than merely plausible.
+//
+// It is a software chain on purpose. libplacebo tone maps better and
+// understands BT.2390 and Dolby Vision, but it needs a working Vulkan device,
+// and on a host without one it fails the whole transcode rather than falling
+// back - which is exactly the trade this project refuses to make.
+const toneMapFilterChain = "zscale=t=linear,format=gbrpf32le,zscale=p=bt709," +
+	"tonemap=tonemap=hable:desat=2,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+
+// hdrTagFilter states an HDR output's colour on the frames themselves.
+//
+// This is a filter rather than -color_primaries/-color_trc for a measured
+// reason: those options did not reach the output at all. A 10-bit source
+// re-encoded with them came back with unknown primaries and unknown transfer,
+// because ffmpeg writes the encoder's VUI from the frame properties instead; and
+// passing them beside -x265-params broke tags that -x265-params alone had got
+// right. A player handed an untagged PQ stream reads it as BT.709 and shows
+// exactly the washed-out picture this work exists to remove, so the tags are set
+// where they are actually read. Verified through to the HLS segment a player
+// fetches.
+func hdrTagFilter(dynamicRange DynamicRange) string {
+	return fmt.Sprintf("setparams=color_primaries=bt2020:color_trc=%s:colorspace=bt2020nc:range=limited",
+		hdrTransferName(dynamicRange))
+}
+
+// videoFilters renders the -vf chain for a plan and an encoder.
+//
+// The two arrangements differ because VAAPI scales on the GPU after uploading
+// and cannot convert a transfer function itself (tonemap_vaapi exists but has
+// never been run on hardware here), so it tone maps in software first and
+// scales afterwards. Everything else scales first and then tone maps: the float
+// conversion is the expensive part, and doing it on a 1080p frame instead of a
+// 4K one costs a quarter as much for a picture nobody can tell apart.
+func videoFilters(encoder string, plan videoPlan) []string {
+	scale := ""
+	if plan.Height > 0 {
+		scale = fmt.Sprintf("scale=-2:%d", plan.Height)
+	}
+
+	var filters []string
+	if strings.HasSuffix(encoder, "_vaapi") {
+		if plan.ToneMap {
+			filters = append(filters, toneMapFilterChain)
+		}
+		if plan.HDR() {
+			filters = append(filters, hdrTagFilter(plan.TargetRange))
+		}
+		format := "nv12"
+		if plan.HDR() {
+			format = plan.HDRPixelFormat
+		}
+		filters = append(filters, "format="+format, "hwupload")
+		if plan.Height > 0 {
+			filters = append(filters, fmt.Sprintf("scale_vaapi=w=-2:h=%d", plan.Height))
+		}
+		return filters
+	}
+
+	if scale != "" {
+		filters = append(filters, scale)
+	}
+	if plan.ToneMap {
+		filters = append(filters, toneMapFilterChain)
+	}
+	if plan.HDR() {
+		filters = append(filters, hdrTagFilter(plan.TargetRange))
+	}
+	return filters
 }
 
 // encoderOutputArgs returns the encoder options for a session.
@@ -188,62 +326,35 @@ func encoderInputArgs(encoder string, dev encoderDevice) []string {
 //     quality, which it infers from the presence of -qp_*.
 //   - VideoToolbox is quality-driven through -q:v. -allow_sw stays off, so a
 //     machine without the hardware says so instead of quietly using its CPU.
-func encoderOutputArgs(encoder string, targetHeight int, dev encoderDevice) []string {
-	softwareScale := ""
-	if targetHeight > 0 {
-		softwareScale = fmt.Sprintf("scale=-2:%d", targetHeight)
-	}
-
+func encoderOutputArgs(encoder string, plan videoPlan, dev encoderDevice) []string {
+	filters := videoFilters(encoder, plan)
 	var args []string
 	switch {
 	case strings.HasSuffix(encoder, "_nvenc"):
 		args = []string{"-c:v", encoder, "-preset", nvencPreset, "-tune", "hq", "-rc", "vbr", "-cq", "22"}
-		if softwareScale != "" {
-			args = append(args, "-vf", softwareScale)
-		}
 	case strings.HasSuffix(encoder, "_qsv"):
 		args = []string{"-c:v", encoder, "-preset", "veryfast", "-global_quality", "22"}
-		if softwareScale != "" {
-			args = append(args, "-vf", softwareScale)
-		}
 	case strings.HasSuffix(encoder, "_vaapi"):
-		// Software scaling happens before the upload, hardware scaling after it.
-		filter := "format=nv12,hwupload"
-		if targetHeight > 0 {
-			filter += fmt.Sprintf(",scale_vaapi=w=-2:h=%d", targetHeight)
-		}
-		args = []string{"-c:v", encoder, "-vf", filter}
+		args = []string{"-c:v", encoder}
 	case strings.HasSuffix(encoder, "_amf"):
 		args = []string{"-c:v", encoder, "-quality", "balanced",
 			"-rc", "cqp", "-qp_i", "22", "-qp_p", "22", "-qp_b", "22"}
-		if softwareScale != "" {
-			args = append(args, "-vf", softwareScale)
-		}
 	case strings.HasSuffix(encoder, "_videotoolbox"):
 		args = []string{"-c:v", encoder, "-q:v", "60"}
-		if softwareScale != "" {
-			args = append(args, "-vf", softwareScale)
-		}
 	case encoder == "libx264" || encoder == "libx265":
 		args = []string{"-c:v", encoder, "-preset", "veryfast", "-crf", "21"}
-		if softwareScale != "" {
-			args = append(args, "-vf", softwareScale)
-		}
 	case encoder == "libvpx-vp9":
 		args = []string{"-c:v", encoder, "-crf", "31", "-b:v", "0"}
-		if softwareScale != "" {
-			args = append(args, "-vf", softwareScale)
-		}
 	case encoder == "libsvtav1" || encoder == "libaom-av1":
 		args = []string{"-c:v", encoder, "-crf", "30"}
-		if softwareScale != "" {
-			args = append(args, "-vf", softwareScale)
-		}
 	default:
 		args = []string{"-c:v", encoder}
 	}
 
-	if format := outputPixelFormat(encoder); format != "" {
+	if len(filters) > 0 {
+		args = append(args, "-vf", strings.Join(filters, ","))
+	}
+	if format := outputPixelFormat(encoder, plan); format != "" {
 		args = append(args, "-pix_fmt", format)
 	}
 	return args
@@ -254,27 +365,74 @@ func encoderOutputArgs(encoder string, targetHeight int, dev encoderDevice) []st
 // choice, and the encoding quality is set by -cq rather than by the preset.
 const nvencPreset = "p4"
 
-// outputPixelFormat pins the encoder's output to a format browsers can decode.
+// outputPixelFormat pins the encoder's output to a format the client can decode.
 //
 // This matters more than it looks. Left alone, ffmpeg preserves the source's
-// bit depth, so a 10-bit HDR source transcodes to 10-bit H.264 "High 10" - which
-// no browser decodes through Media Source Extensions. The stream then attaches,
+// bit depth, so a 10-bit source transcodes to 10-bit H.264 "High 10" - which no
+// browser decodes through Media Source Extensions. The stream then attaches,
 // fetches its segments, and silently never plays: no media error, no console
-// message, just a stalled player.
+// message, just a stalled player. So the default is 8-bit, and 10-bit is asked
+// for only when the plan is deliberately keeping HDR.
 //
 // VAAPI is the exception and returns nothing: its upload filter already pins
-// nv12, and the encoder consumes hardware surfaces, so a -pix_fmt would ask for
-// software frames instead of describing the output.
-func outputPixelFormat(encoder string) string {
+// the surface format, and the encoder consumes hardware surfaces, so a -pix_fmt
+// would ask for software frames instead of describing the output.
+func outputPixelFormat(encoder string, plan videoPlan) string {
 	switch {
 	case strings.HasSuffix(encoder, "_vaapi"):
 		return ""
+	case plan.HDR():
+		return plan.HDRPixelFormat
 	case isHardwareEncoder(encoder):
 		// NVENC, QuickSync, AMF and VideoToolbox all accept nv12 natively.
 		return "nv12"
 	default:
 		return "yuv420p"
 	}
+}
+
+// hdrPixelFormatCandidates lists the 10-bit pixel formats an encoder may accept,
+// most likely first.
+//
+// The order is a guess; the probe is not. Hardware encoders differ in which
+// surface format they will take for 10-bit, and a build without 10-bit support
+// takes neither, so the startup probe tries each and records the one that
+// worked. VAAPI has one candidate because its format is the upload filter's, not
+// a -pix_fmt.
+func hdrPixelFormatCandidates(encoder string) []string {
+	switch {
+	case strings.HasSuffix(encoder, "_vaapi"):
+		return []string{"p010le"}
+	case isHardwareEncoder(encoder):
+		return []string{"p010le", "yuv420p10le"}
+	default:
+		return []string{"yuv420p10le"}
+	}
+}
+
+// EncoderForHDR returns the encoder and pixel format to use for a 10-bit HDR
+// stream of the given codec, and whether this host has one.
+//
+// It reads the list the startup probe filled in by encoding something, so an
+// encoder that is listed by ffmpeg but cannot produce 10-bit here is not
+// offered. Reporting no HDR encoder is a normal outcome: the negotiation then
+// tone maps to SDR and says why.
+func EncoderForHDR(codec string, server ServerCapability) (HDREncoder, bool) {
+	for _, candidate := range videoEncoderCandidates[NormaliseVideoCodec(codec)] {
+		for _, support := range server.HDRVideoEncoders {
+			if support.Encoder == candidate {
+				return support, true
+			}
+		}
+	}
+	return HDREncoder{}, false
+}
+
+// HDREncoder is a video encoder this host was actually able to drive with a
+// 10-bit stream, and the pixel format it accepted.
+type HDREncoder struct {
+	Encoder     string `json:"encoder"`
+	PixelFormat string `json:"pixel_format"`
 }
 
 // encoderProbeHeight is the target height used when verifying an encoder. It is
@@ -294,14 +452,14 @@ const encoderProbeTimeout = 20 * time.Second
 // is the difference between a fixable driver problem and a mystery. An encoder
 // that is silently dropped is the least useful outcome for whoever has to
 // diagnose it.
-func probeEncoder(ctx context.Context, ffmpegBin, encoder string, dev encoderDevice) error {
+func probeEncoder(ctx context.Context, ffmpegBin, encoder string, dev encoderDevice, plan videoPlan) error {
 	probeCtx, cancel := context.WithTimeout(ctx, encoderProbeTimeout)
 	defer cancel()
 
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	args = append(args, encoderInputArgs(encoder, dev)...)
 	args = append(args, "-f", "lavfi", "-i", "testsrc=size=320x240:rate=5:duration=0.2")
-	args = append(args, encoderOutputArgs(encoder, encoderProbeHeight, dev)...)
+	args = append(args, encoderOutputArgs(encoder, plan, dev)...)
 	args = append(args, "-f", "null", "-")
 
 	stderr := &boundedBuffer{limit: probeStderrLimit}
@@ -315,9 +473,33 @@ func probeEncoder(ctx context.Context, ffmpegBin, encoder string, dev encoderDev
 	return nil
 }
 
+// probeEncoderSDR verifies that an encoder can open a session at all.
+func probeEncoderSDR(ctx context.Context, ffmpegBin, encoder string, dev encoderDevice) error {
+	return probeEncoder(ctx, ffmpegBin, encoder, dev, videoPlan{Height: encoderProbeHeight})
+}
+
+// probeHDRSupport reports whether an encoder can produce a 10-bit stream, and
+// with which pixel format. The failure of every candidate is not an error worth
+// surfacing on its own; it means "this encoder is 8-bit here", and the
+// negotiation already explains the consequence.
+func probeHDRSupport(ctx context.Context, ffmpegBin, encoder string, dev encoderDevice) (HDREncoder, error) {
+	var lastErr error
+	for _, format := range hdrPixelFormatCandidates(encoder) {
+		err := probeEncoder(ctx, ffmpegBin, encoder, dev, videoPlan{
+			Height:         encoderProbeHeight,
+			HDRPixelFormat: format,
+		})
+		if err == nil {
+			return HDREncoder{Encoder: encoder, PixelFormat: format}, nil
+		}
+		lastErr = err
+	}
+	return HDREncoder{}, lastErr
+}
+
 // encoderWorks reports whether an encoder can actually open a session.
 func encoderWorks(ctx context.Context, ffmpegBin, encoder string, dev encoderDevice) bool {
-	return probeEncoder(ctx, ffmpegBin, encoder, dev) == nil
+	return probeEncoderSDR(ctx, ffmpegBin, encoder, dev) == nil
 }
 
 // EncoderRejection records a hardware encoder that ffmpeg lists but this host

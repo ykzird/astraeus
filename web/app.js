@@ -454,6 +454,10 @@
       max_bitrate_kbps: 120000,
       max_bit_depth: 8,
       max_audio_channels: 2,
+      // No browser is assumed to render HDR: the server tone maps a PQ source to
+      // SDR for this profile rather than handing a compositor a stream it would
+      // show washed out. Kept explicit to mirror BrowserCapability() exactly.
+      supports_hdr: false,
       supports_hls: true,
       subtitles: true,
     };

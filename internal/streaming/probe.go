@@ -52,6 +52,32 @@ func IsTextSubtitle(codec string) bool {
 	return textSubtitleCodecs[strings.ToLower(strings.TrimSpace(codec))]
 }
 
+// DynamicRange is the transfer characteristic of the video: what a decoder has
+// to do to turn the stored code values into light.
+//
+// It is deliberately about the transfer function alone. Wide gamut is not high
+// dynamic range: a 10-bit BT.2020 SDR master is stored exactly like an SDR one
+// and must not be tone mapped, so primaries do not enter into it.
+type DynamicRange string
+
+const (
+	// RangeSDR is everything with a conventional transfer function, including
+	// BT.2020 and 10-bit SDR material.
+	RangeSDR DynamicRange = "sdr"
+	// RangeHDR10 is PQ (SMPTE ST 2084), the transfer HDR10 and the Dolby Vision
+	// base layer use.
+	RangeHDR10 DynamicRange = "hdr10"
+	// RangeHLG is ARIB STD-B67, the broadcast hybrid log-gamma.
+	RangeHLG DynamicRange = "hlg"
+)
+
+// IsHDR reports whether delivering this video untouched would give an SDR
+// client a picture whose code values it would interpret with the wrong transfer
+// function - which is the whole reason tone mapping exists.
+func (d DynamicRange) IsHDR() bool {
+	return d == RangeHDR10 || d == RangeHLG
+}
+
 // MediaInfo is the subset of technical properties the negotiation needs. It is
 // produced by probing a MediaObject on disk.
 type MediaInfo struct {
@@ -66,11 +92,34 @@ type MediaInfo struct {
 	// PixelFormat and BitDepth describe the decoded video. They matter because
 	// a 10-bit stream is not playable in a browser even when its codec name is
 	// one the browser claims to support.
-	PixelFormat     string          `json:"pixel_format,omitempty"`
-	BitDepth        int             `json:"bit_depth,omitempty"`
-	BitrateKbps     int             `json:"bitrate_kbps,omitempty"`
-	DurationSeconds float64         `json:"duration_seconds,omitempty"`
-	Subtitles       []SubtitleTrack `json:"subtitles,omitempty"`
+	PixelFormat string `json:"pixel_format,omitempty"`
+	BitDepth    int    `json:"bit_depth,omitempty"`
+	// Colour description, as the file declares it. These are what decide
+	// whether a transcode needs tone mapping, so they are reported rather than
+	// inferred from the bit depth.
+	ColorPrimaries string       `json:"color_primaries,omitempty"`
+	ColorTransfer  string       `json:"color_transfer,omitempty"`
+	ColorSpace     string       `json:"color_space,omitempty"`
+	DynamicRange   DynamicRange `json:"dynamic_range,omitempty"`
+	// DolbyVisionProfile is the profile from the stream's DOVI configuration
+	// record, or 0 when the stream carries no Dolby Vision metadata. It is
+	// reported beside the dynamic range rather than folded into it because
+	// profile 8 usually has a PQ base layer that is already HDR10, while a
+	// profile 5 base layer is IPTPQc2 and is not.
+	DolbyVisionProfile int `json:"dolby_vision_profile,omitempty"`
+	// DolbyVisionBaseLayerHDR10 is true when the Dolby Vision base layer is
+	// signalled as HDR10-compatible (dv_bl_signal_compatibility_id >= 1), which
+	// is what makes a re-encode of it honest HDR10 rather than a colour error.
+	DolbyVisionBaseLayerHDR10 bool            `json:"dolby_vision_base_layer_hdr10,omitempty"`
+	BitrateKbps               int             `json:"bitrate_kbps,omitempty"`
+	DurationSeconds           float64         `json:"duration_seconds,omitempty"`
+	Subtitles                 []SubtitleTrack `json:"subtitles,omitempty"`
+}
+
+// IsHDR reports whether the video needs tone mapping before an SDR client can
+// display it correctly.
+func (m *MediaInfo) IsHDR() bool {
+	return m != nil && m.DynamicRange.IsHDR()
 }
 
 // Prober inspects a media file.
@@ -100,24 +149,41 @@ func (p *FFProbe) Available() bool {
 
 // ffprobeStream mirrors one entry of ffprobe's "streams" array.
 type ffprobeStream struct {
-	Index       int    `json:"index"`
-	CodecName   string `json:"codec_name"`
-	CodecType   string `json:"codec_type"`
-	Width       int    `json:"width"`
-	Height      int    `json:"height"`
-	PixFmt      string `json:"pix_fmt"`
-	Channels    int    `json:"channels"`
-	BitRate     string `json:"bit_rate"`
-	Duration    string `json:"duration"`
-	Disposition struct {
+	Index          int    `json:"index"`
+	CodecName      string `json:"codec_name"`
+	CodecType      string `json:"codec_type"`
+	Width          int    `json:"width"`
+	Height         int    `json:"height"`
+	PixFmt         string `json:"pix_fmt"`
+	Channels       int    `json:"channels"`
+	BitRate        string `json:"bit_rate"`
+	Duration       string `json:"duration"`
+	ColorSpace     string `json:"color_space"`
+	ColorTransfer  string `json:"color_transfer"`
+	ColorPrimaries string `json:"color_primaries"`
+	Disposition    struct {
 		AttachedPic int `json:"attached_pic"`
 		Default     int `json:"default"`
 		Forced      int `json:"forced"`
 	} `json:"disposition"`
-	Tags struct {
+	// SideDataList carries stream-level metadata that has no field of its own.
+	// Dolby Vision is the one that matters here: ffprobe reports it as a "DOVI
+	// configuration record" whose compatibility id says whether the base layer
+	// is HDR10.
+	SideDataList []ffprobeSideData `json:"side_data_list"`
+	Tags         struct {
 		Language string `json:"language"`
 		Title    string `json:"title"`
 	} `json:"tags"`
+}
+
+// ffprobeSideData mirrors one entry of a stream's side_data_list. The Dolby
+// Vision record is the only one this project reads, and every field is optional
+// so a record of a different type decodes to its zero value rather than failing.
+type ffprobeSideData struct {
+	SideDataType               string `json:"side_data_type"`
+	DolbyVisionProfile         int    `json:"dv_profile"`
+	DolbyVisionBLCompatibility int    `json:"dv_bl_signal_compatibility_id"`
 }
 
 // ffprobeOutput mirrors the JSON ffprobe emits for -show_format -show_streams.
@@ -163,6 +229,13 @@ func (p *FFProbe) Probe(ctx context.Context, path string) (*MediaInfo, error) {
 		return nil, fmt.Errorf("parsing ffprobe output for %s: %w", path, err)
 	}
 
+	return mediaInfoFromProbe(output, path)
+}
+
+// mediaInfoFromProbe turns ffprobe's JSON into a MediaInfo. It is separate from
+// Probe so the parsing rules - which streams count, what a colour tag means -
+// can be tested without running ffprobe.
+func mediaInfoFromProbe(output ffprobeOutput, path string) (*MediaInfo, error) {
 	info := &MediaInfo{Container: preferredContainer(path, output.Format.FormatName)}
 
 	var videoSeen bool
@@ -182,6 +255,11 @@ func (p *FFProbe) Probe(ctx context.Context, path string) (*MediaInfo, error) {
 				info.Height = stream.Height
 				info.PixelFormat = stream.PixFmt
 				info.BitDepth = bitDepthFromPixelFormat(stream.PixFmt)
+				info.ColorSpace = stream.ColorSpace
+				info.ColorTransfer = stream.ColorTransfer
+				info.ColorPrimaries = stream.ColorPrimaries
+				info.DynamicRange = classifyDynamicRange(stream.ColorTransfer)
+				info.DolbyVisionProfile, info.DolbyVisionBaseLayerHDR10 = dolbyVisionFromSideData(stream.SideDataList)
 				videoSeen = true
 			}
 		case "audio":
@@ -227,6 +305,45 @@ func (p *FFProbe) Probe(ctx context.Context, path string) (*MediaInfo, error) {
 	}
 
 	return info, nil
+}
+
+// classifyDynamicRange maps a transfer characteristic onto the dynamic range a
+// client has to be able to handle.
+//
+// Only the two transfers that actually mean "this is not SDR light" are
+// classified as HDR. An unrecognised or absent transfer is treated as SDR on
+// purpose: guessing HDR from a wide-gamut primaries tag or a 10-bit pixel format
+// would tone map 10-bit BT.2020 SDR material, which is a real (if uncommon)
+// mastering choice, and turning down the contrast of a correct picture is worse
+// than leaving a mis-tagged HDR file to the old behaviour.
+func classifyDynamicRange(transfer string) DynamicRange {
+	switch strings.ToLower(strings.TrimSpace(transfer)) {
+	case "smpte2084", "smpte-st-2084":
+		return RangeHDR10
+	case "arib-std-b67", "arib_std_b67":
+		return RangeHLG
+	default:
+		return RangeSDR
+	}
+}
+
+// dolbyVisionFromSideData extracts the DOVI configuration record, if there is
+// one, and reports the profile and whether the base layer is HDR10-compatible.
+//
+// The compatibility id is the part that changes what the server may honestly
+// do: profile 8 with a non-zero id has an HDR10 base layer that survives a
+// re-encode, while profile 5 stores IPTPQc2 and does not.
+func dolbyVisionFromSideData(entries []ffprobeSideData) (profile int, baseLayerHDR10 bool) {
+	for _, entry := range entries {
+		if !strings.Contains(strings.ToLower(entry.SideDataType), "dovi") {
+			continue
+		}
+		if entry.DolbyVisionProfile <= 0 {
+			continue
+		}
+		return entry.DolbyVisionProfile, entry.DolbyVisionBLCompatibility >= 1
+	}
+	return 0, false
 }
 
 func atoiSafe(s string) int {

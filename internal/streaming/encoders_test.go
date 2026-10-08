@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -72,7 +73,7 @@ func TestEncoderOutputArgs_PerFamily(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			joined := strings.Join(encoderOutputArgs(tt.encoder, 0, encoderDevice{}), " ")
+			joined := strings.Join(encoderOutputArgs(tt.encoder, videoPlan{}, encoderDevice{}), " ")
 			for _, want := range tt.contains {
 				if !strings.Contains(joined, want) {
 					t.Errorf("missing %q:\n%s", want, joined)
@@ -93,12 +94,12 @@ func TestEncoderOutputArgs_PerFamily(t *testing.T) {
 func TestEncoderOutputArgs_ScalesForTheFamily(t *testing.T) {
 	t.Parallel()
 
-	vaapi := strings.Join(encoderOutputArgs("h264_vaapi", 720, encoderDevice{RenderNode: "/dev/dri/renderD128"}), " ")
+	vaapi := strings.Join(encoderOutputArgs("h264_vaapi", videoPlan{Height: 720}, encoderDevice{RenderNode: "/dev/dri/renderD128"}), " ")
 	if !strings.Contains(vaapi, "hwupload,scale_vaapi=w=-2:h=720") {
 		t.Errorf("VAAPI should scale on the device after the upload:\n%s", vaapi)
 	}
 
-	qsv := strings.Join(encoderOutputArgs("h264_qsv", 720, encoderDevice{}), " ")
+	qsv := strings.Join(encoderOutputArgs("h264_qsv", videoPlan{Height: 720}, encoderDevice{}), " ")
 	if !strings.Contains(qsv, "-vf scale=-2:720") {
 		t.Errorf("QuickSync should scale in software before the encoder:\n%s", qsv)
 	}
@@ -412,24 +413,81 @@ exit 0
 
 	// The anti-drift check: what the probe ran must carry the same encoder
 	// options as the session above, or verification proves nothing.
+	//
+	// There are now two probes per encoder - the 8-bit one and the 10-bit one -
+	// so each is matched on its own pixel format rather than on the encoder
+	// name alone.
 	recorded, err := os.ReadFile(argvLog)
 	if err != nil {
 		t.Fatalf("reading the recorded argv: %v", err)
 	}
-	var probeLine string
+	probeLine, hdrProbeLine := "", ""
 	for _, line := range strings.Split(string(recorded), "\n") {
-		if strings.Contains(line, "h264_nvenc") && strings.Contains(line, "testsrc") {
-			probeLine = line
+		if !strings.Contains(line, "h264_nvenc") || !strings.Contains(line, "testsrc") {
+			continue
 		}
+		if strings.Contains(line, "-pix_fmt p010le") {
+			hdrProbeLine = line
+			continue
+		}
+		probeLine = line
 	}
 	if probeLine == "" {
-		t.Fatalf("the stub never ran an nvenc probe; recorded:\n%s", recorded)
+		t.Fatalf("the stub never ran an 8-bit nvenc probe; recorded:\n%s", recorded)
 	}
 	for _, want := range []string{"-preset p4", "-rc vbr", "-cq 22", "-pix_fmt nv12"} {
 		if !strings.Contains(probeLine, want) {
 			t.Errorf("the probe did not use %q, so it verifies something other than what runs:\n%s",
 				want, probeLine)
 		}
+	}
+
+	// The 10-bit probe is what makes HDR offerable, so it must exist and it must
+	// use the same encoder options a real HDR session would.
+	if hdrProbeLine == "" {
+		t.Fatalf("no 10-bit nvenc probe ran, so HDR was never verified; recorded:\n%s", recorded)
+	}
+	for _, want := range []string{"-preset p4", "-rc vbr", "-cq 22", "-pix_fmt p010le"} {
+		if !strings.Contains(hdrProbeLine, want) {
+			t.Errorf("the 10-bit probe did not use %q:\n%s", want, hdrProbeLine)
+		}
+	}
+
+	support, ok := EncoderForHDR("hevc", capability)
+	if !ok {
+		t.Fatalf("hevc_nvenc passed the 10-bit probe but is not offered for HDR: %+v",
+			capability.HDRVideoEncoders)
+	}
+	if support.Encoder != "hevc_nvenc" || support.PixelFormat != "p010le" {
+		t.Errorf("EncoderForHDR(hevc) = %+v, want hevc_nvenc with p010le", support)
+	}
+
+	// A session that keeps HDR is built by the same rule, and it must match the
+	// probe: the point of the probe is that this is what will actually run.
+	hdrArgs, err := BuildFFmpegArgs("/tmp/session", "/media/movie.mkv", Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "hevc", TargetAudioCodec: "aac",
+		TargetDynamicRange: RangeHDR10,
+	}, ManagerConfig{SegmentSeconds: 4, Server: capability})
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgs for HDR: %v", err)
+	}
+	hdrJoined := strings.Join(hdrArgs, " ")
+	for _, want := range []string{
+		"-c:v hevc_nvenc", "-preset p4", "-rc vbr", "-cq 22", "-pix_fmt p010le",
+		// The colour is set on the frames, not through -color_* options: those
+		// were measured not to reach the output. See hdrTagFilter.
+		"setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+	} {
+		if !strings.Contains(hdrJoined, want) {
+			t.Errorf("the HDR session command line is missing %q:\n%s", want, hdrJoined)
+		}
+	}
+	// A tone map would be nonsense here: the client can show HDR and the encoder
+	// can produce it.
+	if strings.Contains(hdrJoined, "zscale") {
+		t.Errorf("an HDR pass-through must not tone map:\n%s", hdrJoined)
 	}
 
 	// The VAAPI probe must have been given its device, before the input.
@@ -444,5 +502,274 @@ exit 0
 		} else if inputAt != -1 && deviceAt > inputAt {
 			t.Errorf("-vaapi_device must precede -i:\n%s", line)
 		}
+	}
+}
+
+// ---- dynamic range ---------------------------------------------------------
+
+// TestVideoFilters_ToneMapIsBuiltForSoftwareAndVAAPI covers the two shapes the
+// chain takes. Both have to set the output colour, because that is what the
+// encoder writes into the stream.
+func TestVideoFilters_ToneMapIsBuiltForSoftwareAndVAAPI(t *testing.T) {
+	t.Parallel()
+
+	software := strings.Join(videoFilters("libx264", videoPlan{Height: 1080, ToneMap: true}), ",")
+	// Scaling first is not cosmetic: the float conversion is the expensive part
+	// and a 1080p frame is a quarter of the work of a 4K one.
+	if !strings.HasPrefix(software, "scale=-2:1080,zscale=t=linear") {
+		t.Errorf("software tone mapping should scale before converting:\n%s", software)
+	}
+	for _, want := range []string{"tonemap=tonemap=hable", "zscale=t=bt709:m=bt709:r=tv", "format=yuv420p"} {
+		if !strings.Contains(software, want) {
+			t.Errorf("the tone map chain is missing %q:\n%s", want, software)
+		}
+	}
+
+	// VAAPI scales on the device after upload, so the tone map runs first and
+	// the upload carries the format the encoder will accept.
+	vaapi := strings.Join(videoFilters("h264_vaapi", videoPlan{Height: 720, ToneMap: true}), ",")
+	toneMapAt := strings.Index(vaapi, "tonemap=tonemap=hable")
+	uploadAt := strings.Index(vaapi, "hwupload")
+	if toneMapAt == -1 || uploadAt == -1 || toneMapAt > uploadAt {
+		t.Errorf("VAAPI must tone map in software before uploading:\n%s", vaapi)
+	}
+	if !strings.Contains(vaapi, "format=nv12,hwupload,scale_vaapi=w=-2:h=720") {
+		t.Errorf("VAAPI should still upload nv12 and scale on the device:\n%s", vaapi)
+	}
+	// A tone-mapped frame is 8-bit; asking for a 10-bit surface would be a
+	// contradiction.
+	if strings.Contains(vaapi, "p010le") {
+		t.Errorf("a tone-mapped VAAPI session must not upload 10-bit surfaces:\n%s", vaapi)
+	}
+}
+
+// TestVideoFilters_HDRStatesItsColourOnTheFrames is the regression test for
+// what was measured rather than assumed: -color_primaries and -color_trc do not
+// reach the output, so the tags have to be set on the frames with setparams.
+func TestVideoFilters_HDRStatesItsColourOnTheFrames(t *testing.T) {
+	t.Parallel()
+
+	joined := strings.Join(videoFilters("libx265", videoPlan{
+		HDRPixelFormat: "yuv420p10le",
+		TargetRange:    RangeHDR10,
+	}), ",")
+
+	want := "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=limited"
+	if !strings.Contains(joined, want) {
+		t.Errorf("an HDR chain must state its colour on the frames:\n%s", joined)
+	}
+	if strings.Contains(joined, "tonemap") {
+		t.Errorf("an HDR chain must not tone map:\n%s", joined)
+	}
+
+	// HLG is a different transfer and has to be named as such: tagging HLG as PQ
+	// would make a player interpret it with the wrong curve.
+	hlg := strings.Join(videoFilters("libx265", videoPlan{
+		HDRPixelFormat: "yuv420p10le",
+		TargetRange:    RangeHLG,
+	}), ",")
+	if !strings.Contains(hlg, "color_trc=arib-std-b67") {
+		t.Errorf("HLG must be tagged as HLG:\n%s", hlg)
+	}
+}
+
+// TestVideoFilters_PlainSDROutputIsUntouched guards the common path: changing
+// nothing about a picture that needs no colour work.
+func TestVideoFilters_PlainSDROutputIsUntouched(t *testing.T) {
+	t.Parallel()
+
+	if got := videoFilters("libx264", videoPlan{Height: 720}); len(got) != 1 || got[0] != "scale=-2:720" {
+		t.Errorf("a plain SDR scale-down = %v, want just the scale filter", got)
+	}
+	if got := videoFilters("libx264", videoPlan{}); len(got) != 0 {
+		t.Errorf("a plain SDR transcode with no scaling = %v, want no filters", got)
+	}
+}
+
+func TestOutputPixelFormat(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		encoder string
+		plan    videoPlan
+		want    string
+	}{
+		{name: "software SDR is 8-bit", encoder: "libx264", plan: videoPlan{}, want: "yuv420p"},
+		{name: "hardware SDR is nv12", encoder: "h264_nvenc", plan: videoPlan{}, want: "nv12"},
+		{name: "VAAPI lets its upload filter decide", encoder: "h264_vaapi", plan: videoPlan{}, want: ""},
+		{
+			name: "HDR keeps the verified 10-bit format", encoder: "libx265",
+			plan: videoPlan{HDRPixelFormat: "yuv420p10le"}, want: "yuv420p10le",
+		},
+		{
+			name: "hardware HDR keeps the format it proved", encoder: "hevc_nvenc",
+			plan: videoPlan{HDRPixelFormat: "p010le"}, want: "p010le",
+		},
+		{
+			name: "VAAPI HDR is the upload format, not a -pix_fmt", encoder: "hevc_vaapi",
+			plan: videoPlan{HDRPixelFormat: "p010le"}, want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := outputPixelFormat(tt.encoder, tt.plan); got != tt.want {
+				t.Errorf("outputPixelFormat(%q, %+v) = %q, want %q", tt.encoder, tt.plan, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEncoderForHDR covers the rule that HDR is only offered by an encoder that
+// was actually driven at 10 bits, in the usual family order when there is more
+// than one.
+func TestEncoderForHDR(t *testing.T) {
+	t.Parallel()
+
+	server := ServerCapability{
+		VideoEncoders: []string{"hevc_nvenc", "hevc_qsv", "libx265"},
+		HDRVideoEncoders: []HDREncoder{
+			{Encoder: "hevc_qsv", PixelFormat: "p010le"},
+			{Encoder: "libx265", PixelFormat: "yuv420p10le"},
+		},
+	}
+
+	// NVENC is preferred but did not prove 10-bit here, so it is not offered.
+	got, ok := EncoderForHDR("hevc", server)
+	if !ok {
+		t.Fatal("hevc_qsv and libx265 both passed the 10-bit probe")
+	}
+	if got.Encoder != "hevc_qsv" || got.PixelFormat != "p010le" {
+		t.Errorf("EncoderForHDR = %+v, want hevc_qsv with p010le", got)
+	}
+
+	// A codec with no verified 10-bit encoder is a normal, reportable outcome.
+	if _, ok := EncoderForHDR("h264", server); ok {
+		t.Error("no H.264 encoder here proved 10-bit, so HDR must not be offered for it")
+	}
+	if _, ok := EncoderForHDR("av1", server); ok {
+		t.Error("no AV1 encoder here proved 10-bit")
+	}
+}
+
+// TestVideoEncoderFor covers the selection that ties a decision to an encoder.
+func TestVideoEncoderFor(t *testing.T) {
+	t.Parallel()
+
+	server := ServerCapability{
+		VideoEncoders:    []string{"hevc_nvenc", "libx265", "libx264"},
+		HDRVideoEncoders: []HDREncoder{{Encoder: "libx265", PixelFormat: "yuv420p10le"}},
+	}
+
+	// An HDR decision must not be served by the hardware encoder that only
+	// proved 8-bit, even though the ordinary preference would pick it.
+	encoder, plan, err := videoEncoderFor(Decision{
+		VideoAction: ActionTranscode, TargetVideoCodec: "hevc",
+		TargetDynamicRange: RangeHDR10, TargetHeight: 1080,
+	}, server)
+	if err != nil {
+		t.Fatalf("videoEncoderFor: %v", err)
+	}
+	if encoder != "libx265" {
+		t.Errorf("encoder = %q, want libx265 - the only one verified at 10-bit", encoder)
+	}
+	if plan.HDRPixelFormat != "yuv420p10le" || plan.TargetRange != RangeHDR10 || plan.Height != 1080 {
+		t.Errorf("plan = %+v, want a 1080p HDR plan at yuv420p10le", plan)
+	}
+
+	// The same decision without HDR keeps the normal preference.
+	encoder, plan, err = videoEncoderFor(Decision{
+		VideoAction: ActionTranscode, TargetVideoCodec: "hevc",
+		TargetDynamicRange: RangeSDR,
+	}, server)
+	if err != nil {
+		t.Fatalf("videoEncoderFor: %v", err)
+	}
+	if encoder != "hevc_nvenc" {
+		t.Errorf("encoder = %q, want hevc_nvenc for an SDR transcode", encoder)
+	}
+	if plan.HDR() {
+		t.Errorf("an SDR plan must not carry an HDR pixel format: %+v", plan)
+	}
+
+	// An HDR decision with no verified encoder is an error the caller reports,
+	// not something to paper over here.
+	if _, _, err := videoEncoderFor(Decision{
+		VideoAction: ActionTranscode, TargetVideoCodec: "h264",
+		TargetDynamicRange: RangeHDR10,
+	}, server); err == nil {
+		t.Error("expected an error when no encoder proved 10-bit for the codec")
+	}
+}
+
+// TestWithoutHardware_AlsoDropsTheHDRList is the regression guard for the
+// retry path: leaving a failed hardware encoder in the 10-bit list would make
+// the software retry pick it again and fail the same way.
+func TestWithoutHardware_AlsoDropsTheHDRList(t *testing.T) {
+	t.Parallel()
+
+	cfg := ManagerConfig{Server: ServerCapability{
+		VideoEncoders:        []string{"hevc_nvenc", "libx265"},
+		HDRVideoEncoders:     []HDREncoder{{Encoder: "hevc_nvenc", PixelFormat: "p010le"}},
+		HardwareAcceleration: []string{"nvenc"},
+		RenderNode:           "/dev/dri/renderD128",
+	}}
+
+	software := withoutHardware(cfg)
+	if containsFold(software.Server.VideoEncoders, "hevc_nvenc") {
+		t.Errorf("the hardware encoder survived: %v", software.Server.VideoEncoders)
+	}
+	if len(software.Server.HDRVideoEncoders) != 0 {
+		t.Errorf("the failed hardware encoder is still offered for HDR: %+v", software.Server.HDRVideoEncoders)
+	}
+	if software.Server.RenderNode != "" || len(software.Server.HardwareAcceleration) != 0 {
+		t.Errorf("the device should be dropped too: %+v", software.Server)
+	}
+}
+
+// TestSoftwareOnlyDecision_ToneMapsWhenHDRCannotSurvive covers the fallback
+// after a hardware failure: an HDR stream that was going to be encoded in
+// hardware has to become tone-mapped SDR if no software encoder can do 10-bit,
+// because failing a request a working encoder could have served is worse.
+func TestSoftwareOnlyDecision_ToneMapsWhenHDRCannotSurvive(t *testing.T) {
+	t.Parallel()
+
+	decision := Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, TargetVideoCodec: "hevc",
+		TargetDynamicRange: RangeHDR10,
+		Reasons:            []string{"original"},
+	}
+
+	// No software 10-bit encoder: fall back to SDR, keeping the reason.
+	softwareOnly := ServerCapability{VideoEncoders: []string{"libx265"}}
+	got := softwareOnlyDecision(decision, softwareOnly)
+	if !got.ToneMap || got.TargetDynamicRange != RangeSDR {
+		t.Errorf("expected a tone-mapped SDR decision, got range %q tonemap %v",
+			got.TargetDynamicRange, got.ToneMap)
+	}
+	if !strings.Contains(strings.Join(got.Reasons, "; "), "hardware encoder failed") {
+		t.Errorf("the retry must say why HDR was dropped: %s", strings.Join(got.Reasons, "; "))
+	}
+
+	// With a software 10-bit encoder the HDR decision stands untouched.
+	withSoftwareHDR := ServerCapability{
+		VideoEncoders:    []string{"libx265"},
+		HDRVideoEncoders: []HDREncoder{{Encoder: "libx265", PixelFormat: "yuv420p10le"}},
+	}
+	unchanged := softwareOnlyDecision(decision, withSoftwareHDR)
+	if unchanged.ToneMap || unchanged.TargetDynamicRange != RangeHDR10 {
+		t.Errorf("libx265 can keep HDR in software, so the decision should stand: %+v", unchanged)
+	}
+
+	// An SDR decision is never rewritten. Negotiate always fills the range in,
+	// but a hand-built decision with none is still not an HDR one, and the retry
+	// must leave it exactly as it found it.
+	sdr := Decision{Mode: ModeTranscode, Deliverable: true, VideoAction: ActionTranscode, TargetVideoCodec: "hevc"}
+	if got := softwareOnlyDecision(sdr, softwareOnly); !reflect.DeepEqual(got, sdr) {
+		t.Errorf("an SDR decision should pass through unchanged:\n got %+v\nwant %+v", got, sdr)
 	}
 }

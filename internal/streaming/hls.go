@@ -275,6 +275,7 @@ func (m *Manager) StartAt(ctx context.Context, entityID, objectPath string, deci
 		"Transcodes that failed on a hardware encoder and were retried in software.", nil)
 
 	cfg = withoutHardware(cfg)
+	decision = softwareOnlyDecision(decision, cfg.Server)
 	return m.startOnce(ctx, entityID, objectPath, decision, cfg, startSeconds)
 }
 
@@ -284,11 +285,13 @@ func wouldUseHardware(decision Decision, cfg ManagerConfig) bool {
 	if decision.Mode == ModeDirectPlay || decision.VideoAction != ActionTranscode {
 		return false
 	}
-	return isHardwareEncoder(EncoderFor(decision.TargetVideoCodec, cfg.Server))
+	encoder, _, err := videoEncoderFor(decision, cfg.Server)
+	return err == nil && isHardwareEncoder(encoder)
 }
 
 // withoutHardware returns a configuration that can only choose software
-// encoders.
+// encoders, including for HDR: leaving a failed hardware encoder in the
+// verified 10-bit list would let the retry pick it again.
 func withoutHardware(cfg ManagerConfig) ManagerConfig {
 	software := make([]string, 0, len(cfg.Server.VideoEncoders))
 	for _, encoder := range cfg.Server.VideoEncoders {
@@ -297,9 +300,39 @@ func withoutHardware(cfg ManagerConfig) ManagerConfig {
 		}
 	}
 	cfg.Server.VideoEncoders = software
+
+	softwareHDR := make([]HDREncoder, 0, len(cfg.Server.HDRVideoEncoders))
+	for _, support := range cfg.Server.HDRVideoEncoders {
+		if !isHardwareEncoder(support.Encoder) {
+			softwareHDR = append(softwareHDR, support)
+		}
+	}
+	cfg.Server.HDRVideoEncoders = softwareHDR
+
 	cfg.Server.HardwareAcceleration = nil
 	cfg.Server.RenderNode = ""
 	return cfg
+}
+
+// softwareOnlyDecision adjusts a decision that was going to be delivered by a
+// hardware encoder so a software encoder can still serve it.
+//
+// The only adjustment needed is HDR. When the failed hardware encoder was the
+// only verified 10-bit one, there is no way to keep HDR, and a tone-mapped SDR
+// stream is a far better answer than an error - the client asked for a film,
+// not for 10 bits.
+func softwareOnlyDecision(decision Decision, server ServerCapability) Decision {
+	if !decision.TargetDynamicRange.IsHDR() {
+		return decision
+	}
+	if _, ok := EncoderForHDR(decision.TargetVideoCodec, server); ok {
+		return decision
+	}
+	decision.ToneMap = true
+	decision.TargetDynamicRange = RangeSDR
+	decision.Reasons = append(decision.Reasons,
+		"the hardware encoder failed and no software encoder here produces 10-bit, so this retry is tone mapped to SDR")
+	return decision
 }
 
 // startOnce prepares and launches one session with the given configuration.
@@ -574,6 +607,15 @@ func (m *Manager) ServeFile(w http.ResponseWriter, r *http.Request, sessionID, n
 	http.ServeFile(w, r, filepath.Join(session.Dir, name))
 }
 
+// hdrTransferName is the ffmpeg name of the transfer function for a dynamic
+// range that keeps HDR.
+func hdrTransferName(dynamicRange DynamicRange) string {
+	if dynamicRange == RangeHLG {
+		return "arib-std-b67"
+	}
+	return "smpte2084"
+}
+
 // BuildFFmpegArgs renders the ffmpeg invocation for a decision from the start
 // of the source. It is exported so the command line can be asserted in tests
 // without running ffmpeg.
@@ -589,14 +631,18 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		return nil, ErrDirectPlayHasNoSession
 	}
 
-	// The encoder is chosen before the argument list is assembled because some
-	// of its options are global and have to precede the input: VAAPI's
-	// -vaapi_device, without which its upload filter has no device.
+	// The encoder and its picture plan are chosen before the argument list is
+	// assembled because some options are global and have to precede the input:
+	// VAAPI's -vaapi_device, without which its upload filter has no device. An
+	// HDR decision must also be encoded by the encoder that was verified to
+	// produce 10-bit, which is not always the one the preference order picks.
 	encoder := ""
+	plan := videoPlan{}
 	if decision.VideoAction == ActionTranscode {
-		encoder = EncoderFor(decision.TargetVideoCodec, cfg.Server)
-		if encoder == "" {
-			return nil, fmt.Errorf("no ffmpeg encoder available for video codec %q", decision.TargetVideoCodec)
+		var err error
+		encoder, plan, err = videoEncoderFor(decision, cfg.Server)
+		if err != nil {
+			return nil, err
 		}
 	}
 	device := encoderDevice{RenderNode: cfg.Server.RenderNode}
@@ -620,7 +666,11 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 	case ActionCopy:
 		args = append(args, "-c:v", "copy")
 	case ActionTranscode:
-		args = append(args, encoderOutputArgs(encoder, decision.TargetHeight, device)...)
+		// The picture plan carries the colour: the tone-map chain tags its
+		// frames BT.709, and an HDR plan tags them BT.2020/PQ, which is what the
+		// encoder writes into the stream. No -color_primaries option is passed
+		// because ffmpeg ignores it in favour of the frame's own properties.
+		args = append(args, encoderOutputArgs(encoder, plan, device)...)
 		// Cut on the requested segment boundary. Without this ffmpeg only cuts
 		// at encoder keyframes - a ~10s default GOP - so -hls_time is advisory
 		// and the first segment, and therefore first playback, arrives far

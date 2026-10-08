@@ -487,3 +487,155 @@ func TestDetectServerCapability_RejectsEncodersThatCannotRun(t *testing.T) {
 		}
 	}
 }
+
+// generateHDRClip renders a short PQ / BT.2020 HEVC clip, which is the shape of
+// the two real 4K films the dynamic-range path was written against.
+//
+// The colour is set through -x265-params rather than -color_primaries because
+// that is what was measured to work; the generic options did not reach the
+// output at all.
+func generateHDRClip(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15:duration=2",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+		"-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+		"-x265-params", "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited",
+		"-c:a", "aac", "-shortest",
+		path,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("this ffmpeg cannot produce a 10-bit PQ fixture: %v\n%s", err, output)
+	}
+	return path
+}
+
+// TestManager_ToneMapsHDRForASDRClient is the end-to-end check of the increment:
+// a PQ source delivered to a client that cannot show HDR must come out as
+// tagged BT.709 8-bit, because an untagged or incorrectly tagged PQ stream is
+// what looks washed out.
+func TestManager_ToneMapsHDRForASDRClient(t *testing.T) {
+	requireFFmpeg(t)
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	source := generateHDRClip(t, dir, "hdr10.mkv")
+
+	prober := NewFFProbe("ffprobe")
+	info, err := prober.Probe(ctx, source)
+	if err != nil {
+		t.Fatalf("probing the fixture: %v", err)
+	}
+	if !info.IsHDR() {
+		t.Fatalf("the fixture is not HDR: range=%q transfer=%q", info.DynamicRange, info.ColorTransfer)
+	}
+	if info.BitDepth != 10 {
+		t.Fatalf("the fixture is %d-bit, want 10", info.BitDepth)
+	}
+
+	decision := NegotiateForServer(info, BrowserCapability(),
+		DetectServerCapability(ctx, "ffmpeg", "ffprobe", ""))
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode", decision.Mode)
+	}
+	if !decision.ToneMap || decision.TargetDynamicRange != RangeSDR {
+		t.Fatalf("a browser must be sent tone-mapped SDR, got tonemap=%v range=%q\nreasons: %s",
+			decision.ToneMap, decision.TargetDynamicRange, strings.Join(decision.Reasons, "; "))
+	}
+
+	manager, session, _ := startSession(t, dir, source, decision)
+	defer manager.Stop(session.ID)
+
+	segment := waitForSegment(t, session.Dir, 60*time.Second)
+	if segment == "" {
+		t.Fatal("no segment was produced")
+	}
+
+	produced, err := prober.Probe(ctx, filepath.Join(session.Dir, segment))
+	if err != nil {
+		t.Fatalf("probing the produced segment: %v", err)
+	}
+	if produced.BitDepth != 8 {
+		t.Errorf("tone-mapped segment is %d-bit (%s), want 8-bit",
+			produced.BitDepth, produced.PixelFormat)
+	}
+	if produced.ColorTransfer != "bt709" || produced.ColorPrimaries != "bt709" {
+		t.Errorf("tone-mapped segment is tagged %q/%q, want bt709/bt709: a player that "+
+			"reads neither shows the picture washed out",
+			produced.ColorTransfer, produced.ColorPrimaries)
+	}
+	if produced.DynamicRange != RangeSDR || produced.IsHDR() {
+		t.Errorf("tone-mapped segment reports range %q, want sdr", produced.DynamicRange)
+	}
+}
+
+// TestManager_KeepsHDRForAClientThatCanShowIt is the other half end to end: the
+// same film, a client that declares HDR, and a host with a verified 10-bit
+// encoder. The delivered segment must still be 10-bit and still be tagged as PQ
+// BT.2020, which is what makes it an HDR stream rather than a washed-out one.
+func TestManager_KeepsHDRForAClientThatCanShowIt(t *testing.T) {
+	requireFFmpeg(t)
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	source := generateHDRClip(t, dir, "hdr10.mkv")
+
+	prober := NewFFProbe("ffprobe")
+	info, err := prober.Probe(ctx, source)
+	if err != nil {
+		t.Fatalf("probing the fixture: %v", err)
+	}
+	if !info.IsHDR() {
+		t.Fatalf("the fixture is not HDR: range=%q transfer=%q", info.DynamicRange, info.ColorTransfer)
+	}
+
+	server := DetectServerCapability(ctx, "ffmpeg", "ffprobe", "")
+	if _, ok := EncoderForHDR("hevc", server); !ok {
+		t.Skipf("no 10-bit HEVC encoder on this host, so HDR cannot be delivered: %+v",
+			server.HDRVideoEncoders)
+	}
+
+	capability := hdrCapability()
+	// Match the fixture's audio and force a re-encode by capping the height
+	// below the source, so this exercises the HDR *encoder* path rather than a
+	// copy.
+	capability.Containers = []string{"hls"}
+	capability.MaxHeight = 120
+
+	decision := NegotiateForServer(info, capability, server)
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode", decision.Mode)
+	}
+	if decision.ToneMap || decision.TargetDynamicRange != RangeHDR10 {
+		t.Fatalf("an HDR-capable client should keep HDR, got tonemap=%v range=%q\nreasons: %s",
+			decision.ToneMap, decision.TargetDynamicRange, strings.Join(decision.Reasons, "; "))
+	}
+
+	manager, session, _ := startSession(t, dir, source, decision)
+	defer manager.Stop(session.ID)
+
+	segment := waitForSegment(t, session.Dir, 60*time.Second)
+	if segment == "" {
+		t.Fatal("no segment was produced")
+	}
+
+	produced, err := prober.Probe(ctx, filepath.Join(session.Dir, segment))
+	if err != nil {
+		t.Fatalf("probing the produced segment: %v", err)
+	}
+	if produced.BitDepth != 10 {
+		t.Errorf("HDR segment is %d-bit (%s), want 10-bit",
+			produced.BitDepth, produced.PixelFormat)
+	}
+	if produced.ColorTransfer != "smpte2084" || produced.ColorPrimaries != "bt2020" {
+		t.Errorf("HDR segment is tagged %q/%q, want smpte2084/bt2020: an untagged PQ stream "+
+			"is shown as if it were SDR",
+			produced.ColorTransfer, produced.ColorPrimaries)
+	}
+	if !produced.IsHDR() {
+		t.Errorf("HDR segment reports range %q, want hdr10", produced.DynamicRange)
+	}
+}

@@ -29,6 +29,14 @@ type ClientCapability struct {
 	// what stops a 10-bit source being direct-played into a stalled player.
 	// Zero means unrestricted.
 	MaxBitDepth int `json:"max_bit_depth"`
+	// SupportsHDR declares that the client can render high dynamic range video:
+	// it will interpret a PQ or HLG transfer correctly and its display can show
+	// more than SDR's ~100 nits. A client that does not say so gets tone-mapped
+	// SDR, because a PQ stream shown as SDR is not merely dimmer, it is wrong.
+	//
+	// HDR output is 10-bit by definition, so declaring this together with
+	// MaxBitDepth < 10 is a contradiction and Validate rejects it.
+	SupportsHDR bool `json:"supports_hdr"`
 	// MaxAudioChannels is the most channels the client can decode. Chromium's
 	// media pipeline refuses a 5.1 AAC SourceBuffer, and browsers output stereo
 	// in practice, so this defaults to 2 for browser clients. Zero means
@@ -49,6 +57,12 @@ type ClientCapability struct {
 // with no useful error. Capping here also avoids re-encoding a 4K source at
 // 4K, which costs roughly four times the CPU of 1080p for content usually
 // shown in a window. A client that wants more can ask for it in its manifest.
+//
+// SupportsHDR is false for the same reason the bit depth is 8: nothing about an
+// arbitrary browser tells us it can render HDR, and claiming it on the client's
+// behalf would hand a PQ stream to a compositor that will show it washed out.
+// A client that really can - a TV app, a browser on an HDR display reporting
+// through its own manifest - says so itself.
 func BrowserCapability() ClientCapability {
 	return ClientCapability{
 		Containers:       []string{"mp4", "webm", "hls"},
@@ -79,6 +93,13 @@ func (c ClientCapability) Validate() error {
 	if c.MaxWidth < 0 || c.MaxHeight < 0 || c.MaxBitrateKbps < 0 ||
 		c.MaxBitDepth < 0 || c.MaxAudioChannels < 0 {
 		return fmt.Errorf("capability limits must not be negative")
+	}
+	// A client that can render HDR can decode 10-bit: PQ and HLG are stored at
+	// 10 bits or more. A manifest that says otherwise contradicts itself, and
+	// guessing which half the client meant would produce either a washed-out
+	// picture or a stalled player.
+	if c.SupportsHDR && c.MaxBitDepth > 0 && c.MaxBitDepth < 10 {
+		return fmt.Errorf("supports_hdr requires max_bit_depth of at least 10, got %d", c.MaxBitDepth)
 	}
 	if unknown := firstUnknown(c.VideoCodecs, knownVideoCodecs, NormaliseVideoCodec); unknown != "" {
 		return fmt.Errorf("unknown video codec %q", unknown)
@@ -115,6 +136,7 @@ func (c ClientCapability) Normalise() ClientCapability {
 		MaxBitrateKbps:   c.MaxBitrateKbps,
 		MaxBitDepth:      c.MaxBitDepth,
 		MaxAudioChannels: c.MaxAudioChannels,
+		SupportsHDR:      c.SupportsHDR,
 		SupportsHLS:      c.SupportsHLS,
 		Subtitles:        c.Subtitles,
 	}
@@ -146,6 +168,12 @@ func (c ClientCapability) SupportsContainer(container string) bool {
 // when it must re-encode. Wide hardware support comes first.
 var videoCodecPreference = []string{"h264", "hevc", "vp9", "av1"}
 
+// hdrVideoCodecPreference is the equivalent order for a stream that has to keep
+// HDR. H.264 is deliberately absent: its High 10 profile can store 10 bits, but
+// no browser or television treats it as an HDR format, so re-encoding PQ content
+// into it produces a stream that plays as washed-out SDR.
+var hdrVideoCodecPreference = []string{"hevc", "av1", "vp9"}
+
 // audioCodecPreference is the equivalent order for audio.
 var audioCodecPreference = []string{"aac", "opus", "mp3", "ac3", "eac3", "flac"}
 
@@ -153,6 +181,22 @@ var audioCodecPreference = []string{"aac", "opus", "mp3", "ac3", "eac3", "flac"}
 // or "" when the client declared none.
 func (c ClientCapability) PreferredVideoCodec() string {
 	return firstPreferred(c.VideoCodecs, videoCodecPreference)
+}
+
+// PreferredVideoCodecForHDR returns the client's most broadly supported codec
+// that can actually carry HDR, or "" when it declared none.
+//
+// It does not fall back to the ordinary preference the way firstPreferred does:
+// "this client accepts H.264" is not an answer to "which HDR codec should this
+// be encoded into", and pretending otherwise is how an HDR film becomes a
+// washed-out H.264 one.
+func (c ClientCapability) PreferredVideoCodecForHDR() string {
+	for _, want := range hdrVideoCodecPreference {
+		if containsFold(c.VideoCodecs, want) {
+			return want
+		}
+	}
+	return ""
 }
 
 // PreferredAudioCodec returns the client's most broadly supported audio codec.

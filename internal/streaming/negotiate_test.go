@@ -889,3 +889,264 @@ func TestValidateRejectsUnknownCodecNames(t *testing.T) {
 		t.Errorf("a real codec the host cannot encode must not be rejected as invalid: %v", err)
 	}
 }
+
+// ---- dynamic range ---------------------------------------------------------
+
+// hdrCapability is a client that can render HDR: ten bits or more, and it says
+// so. It accepts HLS because most of these cases force a re-encode.
+func hdrCapability() ClientCapability {
+	return ClientCapability{
+		Containers:       []string{"mp4", "hls"},
+		VideoCodecs:      []string{"h264", "hevc"},
+		AudioCodecs:      []string{"aac", "eac3"},
+		MaxWidth:         3840,
+		MaxHeight:        2160,
+		MaxBitDepth:      10,
+		MaxAudioChannels: 6,
+		SupportsHDR:      true,
+		SupportsHLS:      true,
+	}
+}
+
+// hdrFilm is one of the real 4K films: 10-bit HEVC, PQ, BT.2020, Dolby Vision
+// profile 8 with an HDR10 base layer, in Matroska.
+func hdrFilm() *MediaInfo {
+	return &MediaInfo{
+		Container: "matroska", VideoCodec: "hevc", AudioCodec: "eac3",
+		Width: 3840, Height: 1640, PixelFormat: "yuv420p10le", BitDepth: 10,
+		ColorSpace: "bt2020nc", ColorTransfer: "smpte2084", ColorPrimaries: "bt2020",
+		DynamicRange:              RangeHDR10,
+		DolbyVisionProfile:        8,
+		DolbyVisionBaseLayerHDR10: true,
+	}
+}
+
+// TestNegotiate_ToneMapsHDRForAnSDRClient is the case the whole increment is
+// about: a 10-bit PQ film and a browser. Before this, the bit-depth rule forced
+// a transcode into 8-bit BT.709 with no transfer conversion, and the picture came
+// out washed out - visibly wrong, not merely low quality.
+func TestNegotiate_ToneMapsHDRForAnSDRClient(t *testing.T) {
+	t.Parallel()
+
+	decision := Negotiate(hdrFilm(), BrowserCapability())
+
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode", decision.Mode)
+	}
+	if !decision.ToneMap {
+		t.Error("an HDR source delivered to a client without HDR support must be tone mapped")
+	}
+	if decision.TargetDynamicRange != RangeSDR {
+		t.Errorf("target dynamic range = %q, want %q", decision.TargetDynamicRange, RangeSDR)
+	}
+
+	reasons := strings.Join(decision.Reasons, "; ")
+	if !strings.Contains(reasons, "HDR") {
+		t.Errorf("the reasons do not mention HDR, so a surprising decision is undebuggable: %s", reasons)
+	}
+	if !strings.Contains(reasons, "tone map") {
+		t.Errorf("the reasons do not say the picture is tone mapped: %s", reasons)
+	}
+	// The Dolby Vision base layer is HDR10, so the honest caveat is the loss of
+	// the dynamic metadata - not a colour error.
+	if !strings.Contains(reasons, "Dolby Vision profile 8") {
+		t.Errorf("the reasons do not name the Dolby Vision profile: %s", reasons)
+	}
+}
+
+// TestNegotiate_SDRDeepColourIsNotToneMapped is the other direction, and the
+// reason dynamic range is classified from the transfer function alone: a 10-bit
+// BT.2020 SDR master needs an 8-bit SDR output, but tone mapping it would reduce
+// the contrast of a picture that was never HDR.
+func TestNegotiate_SDRDeepColourIsNotToneMapped(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, PixelFormat: "yuv420p10le", BitDepth: 10,
+		ColorSpace: "bt2020nc", ColorTransfer: "bt2020-10", ColorPrimaries: "bt2020",
+		DynamicRange: RangeSDR,
+	}
+
+	decision := Negotiate(info, BrowserCapability())
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode for 10-bit into an 8-bit client", decision.Mode)
+	}
+	if decision.ToneMap {
+		t.Error("a 10-bit SDR source must not be tone mapped")
+	}
+	if decision.TargetDynamicRange != RangeSDR {
+		t.Errorf("target dynamic range = %q, want %q", decision.TargetDynamicRange, RangeSDR)
+	}
+}
+
+// TestNegotiate_HDRClientKeepsHDRThroughAReEncode covers a client that can show
+// HDR but cannot take this file as it stands - here the container is not one it
+// opens, and neither is the audio codec accepted, so the video is re-encoded.
+// Converting to SDR would throw away the one thing the client asked for.
+func TestNegotiate_HDRClientKeepsHDRThroughAReEncode(t *testing.T) {
+	t.Parallel()
+
+	capability := hdrCapability()
+	capability.Containers = []string{"hls"}
+
+	info := hdrFilm()
+	info.VideoCodec = "vp9" // not in the client's list, so the video is re-encoded
+	info.AudioCodec = "aac"
+
+	decision := Negotiate(info, capability)
+
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode", decision.Mode)
+	}
+	if decision.VideoAction != ActionTranscode {
+		t.Fatalf("video action = %q, want transcode", decision.VideoAction)
+	}
+	if decision.ToneMap {
+		t.Error("a client that supports HDR must not be handed a tone-mapped picture")
+	}
+	if decision.TargetDynamicRange != RangeHDR10 {
+		t.Errorf("target dynamic range = %q, want %q", decision.TargetDynamicRange, RangeHDR10)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "keeps HDR10") {
+		t.Errorf("the reasons should say HDR is kept: %s", strings.Join(decision.Reasons, "; "))
+	}
+}
+
+// TestNegotiate_HDRClientDirectPlaysTheOriginal checks that an HDR path does not
+// cost a re-encode when nothing else requires one: copying the file preserves
+// both the HDR and the Dolby Vision metadata exactly.
+func TestNegotiate_HDRClientDirectPlaysTheOriginal(t *testing.T) {
+	t.Parallel()
+
+	info := hdrFilm()
+	info.Container = "mp4"
+	info.AudioCodec = "eac3"
+
+	decision := Negotiate(info, hdrCapability())
+
+	if decision.Mode != ModeDirectPlay {
+		t.Fatalf("mode = %q, want direct play: %s", decision.Mode, strings.Join(decision.Reasons, "; "))
+	}
+	if decision.VideoAction != ActionCopy {
+		t.Errorf("video action = %q, want copy", decision.VideoAction)
+	}
+	if decision.ToneMap {
+		t.Error("direct play must not tone map")
+	}
+	if decision.TargetDynamicRange != RangeHDR10 {
+		t.Errorf("target dynamic range = %q, want %q", decision.TargetDynamicRange, RangeHDR10)
+	}
+}
+
+// TestNegotiate_DolbyVisionProfile5IsFlagged covers the stream this server
+// cannot convert correctly. Refusing to play it would be worse than playing it
+// with approximate colour, but the approximation has to be stated.
+func TestNegotiate_DolbyVisionProfile5IsFlagged(t *testing.T) {
+	t.Parallel()
+
+	info := hdrFilm()
+	info.DolbyVisionProfile = 5
+	info.DolbyVisionBaseLayerHDR10 = false
+
+	decision := Negotiate(info, BrowserCapability())
+	if !decision.ToneMap {
+		t.Fatal("a profile 5 source still has to be tone mapped for an SDR client")
+	}
+
+	reasons := strings.Join(decision.Reasons, "; ")
+	if !strings.Contains(reasons, "IPTPQc2") {
+		t.Errorf("the reasons should name what cannot be converted: %s", reasons)
+	}
+	if !strings.Contains(reasons, "approximate") {
+		t.Errorf("the reasons should say the colour will be approximate: %s", reasons)
+	}
+}
+
+// TestNegotiateForServer_FallsBackToToneMappingWithoutAVerifiedHDREncoder is the
+// honest degradation: a client asks for HDR, the host has no 10-bit encoder that
+// was proved to work, and the answer is a playable SDR stream with the reason
+// attached rather than a failure or an HDR stream that dies at the first frame.
+func TestNegotiateForServer_FallsBackToToneMappingWithoutAVerifiedHDREncoder(t *testing.T) {
+	t.Parallel()
+
+	capability := hdrCapability()
+	capability.Containers = []string{"hls"}
+	info := hdrFilm()
+	info.VideoCodec = "vp9"
+	info.AudioCodec = "aac"
+
+	server := ServerCapability{VideoEncoders: []string{"libx264", "libx265"}}
+
+	decision := NegotiateForServer(info, capability, server)
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode", decision.Mode)
+	}
+	if decision.TargetDynamicRange != RangeSDR || !decision.ToneMap {
+		t.Fatalf("without a verified 10-bit encoder the stream must be tone mapped, got range %q tonemap %v",
+			decision.TargetDynamicRange, decision.ToneMap)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "no verified 10-bit encoder") {
+		t.Errorf("the fallback must say why HDR was dropped: %s", strings.Join(decision.Reasons, "; "))
+	}
+	if !decision.Deliverable {
+		t.Errorf("the fallback is playable and must stay deliverable: %s", strings.Join(decision.Reasons, "; "))
+	}
+}
+
+// TestNegotiateForServer_KeepsHDRWhenTheEncoderWasVerified is the other half:
+// with a proved 10-bit encoder, the client's request is honoured.
+func TestNegotiateForServer_KeepsHDRWhenTheEncoderWasVerified(t *testing.T) {
+	t.Parallel()
+
+	capability := hdrCapability()
+	capability.Containers = []string{"hls"}
+	info := hdrFilm()
+	info.VideoCodec = "vp9"
+	info.AudioCodec = "aac"
+
+	server := ServerCapability{
+		VideoEncoders:    []string{"libx264", "libx265"},
+		HDRVideoEncoders: []HDREncoder{{Encoder: "libx265", PixelFormat: "yuv420p10le"}},
+	}
+
+	decision := NegotiateForServer(info, capability, server)
+	if decision.ToneMap || decision.TargetDynamicRange != RangeHDR10 {
+		t.Fatalf("a verified 10-bit encoder should keep HDR, got range %q tonemap %v",
+			decision.TargetDynamicRange, decision.ToneMap)
+	}
+	if decision.TargetVideoCodec != "hevc" {
+		t.Errorf("target codec = %q, want hevc", decision.TargetVideoCodec)
+	}
+}
+
+// TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped covers the dead end
+// in the other direction: the client can show HDR but only decodes H.264, which
+// has no meaningful 10-bit HDR form. The picture is tone mapped to SDR, which is
+// the best that can honestly be delivered.
+func TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped(t *testing.T) {
+	t.Parallel()
+
+	capability := hdrCapability()
+	capability.Containers = []string{"hls"}
+	capability.VideoCodecs = []string{"h264"}
+
+	info := hdrFilm()
+	info.VideoCodec = "vp9"
+	info.AudioCodec = "aac"
+
+	server := ServerCapability{VideoEncoders: []string{"libx264"}}
+
+	decision := NegotiateForServer(info, capability, server)
+	if !decision.Deliverable {
+		t.Fatalf("H.264 SDR is still playable and must be delivered: %s",
+			strings.Join(decision.Reasons, "; "))
+	}
+	if !decision.ToneMap || decision.TargetDynamicRange != RangeSDR {
+		t.Errorf("with only H.264 available the stream must be tone mapped to SDR, got range %q tonemap %v",
+			decision.TargetDynamicRange, decision.ToneMap)
+	}
+	if decision.TargetVideoCodec != "h264" {
+		t.Errorf("target codec = %q, want h264", decision.TargetVideoCodec)
+	}
+}

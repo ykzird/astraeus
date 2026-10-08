@@ -49,6 +49,15 @@ type Decision struct {
 	// TargetAudioChannels is set when the source carries more channels than the
 	// client accepts and the audio is being re-encoded anyway.
 	TargetAudioChannels int `json:"target_audio_channels,omitempty"`
+	// TargetDynamicRange is the dynamic range of the video this decision
+	// delivers: always "sdr" unless an HDR source is being passed through to a
+	// client that declared HDR support.
+	TargetDynamicRange DynamicRange `json:"target_dynamic_range,omitempty"`
+	// ToneMap is set when the video is being re-encoded specifically to convert
+	// HDR to SDR. It is separate from TargetDynamicRange because it selects the
+	// filter chain: a 10-bit HDR source re-encoded for another reason still
+	// needs 10-bit HDR output, not a tone map.
+	ToneMap bool `json:"tone_map,omitempty"`
 
 	// Reasons explains every choice, in order. This is what makes a surprising
 	// decision debuggable instead of mysterious.
@@ -117,8 +126,19 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 				info.BitDepth, capability.MaxBitDepth))
 	}
 
+	// An HDR source handed to a client that has not declared HDR support is not
+	// merely dimmer: PQ and HLG code values interpreted as SDR describe
+	// different light, so the picture comes out washed out or crushed. This is
+	// a transcoding reason of its own, independent of codec and bit depth.
+	hdrMismatch := info.IsHDR() && !capability.SupportsHDR
+	if hdrMismatch {
+		decision.Reasons = append(decision.Reasons,
+			fmt.Sprintf("source is %s but the client does not declare HDR support, so it cannot be shown as it was mastered",
+				dynamicRangeLabel(info)))
+	}
+
 	switch {
-	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany:
+	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany || hdrMismatch:
 		decision.Mode = ModeTranscode
 	case containerCompatible:
 		decision.Mode = ModeDirectPlay
@@ -127,9 +147,22 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	}
 
 	// Video action.
-	if !videoCompatible || needsDownscale || tooDeep {
+	if !videoCompatible || needsDownscale || tooDeep || hdrMismatch {
 		decision.VideoAction = ActionTranscode
 		decision.TargetVideoCodec = capability.PreferredVideoCodec()
+		// An HDR source that has to be re-encoded should land in a codec that can
+		// carry HDR. The ordinary preference puts H.264 first because it is the
+		// most widely decodable, but 10-bit H.264 is not an HDR delivery format:
+		// no browser or television treats it as one, so a client that asked for
+		// HDR would get washed-out SDR with a profile name it cannot use.
+		if info.IsHDR() && capability.SupportsHDR {
+			if hdrCodec := capability.PreferredVideoCodecForHDR(); hdrCodec != "" && hdrCodec != decision.TargetVideoCodec {
+				decision.Reasons = append(decision.Reasons,
+					fmt.Sprintf("%q cannot carry HDR, so the re-encode targets %q instead",
+						decision.TargetVideoCodec, hdrCodec))
+				decision.TargetVideoCodec = hdrCodec
+			}
+		}
 		if decision.TargetVideoCodec == "" {
 			decision.Deliverable = false
 			decision.Reasons = append(decision.Reasons, "client declared no video codecs to transcode into")
@@ -137,6 +170,24 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		if needsDownscale {
 			decision.TargetHeight = targetHeight
 		}
+		if hdrMismatch {
+			decision.ToneMap = true
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("%s is tone mapped to SDR for this client", dynamicRangeLabel(info)))
+		}
+	}
+	decision.TargetDynamicRange = deliveryRangeFor(info.DynamicRange, decision.ToneMap)
+
+	// Say which way the dynamic range went, whichever branch produced it. A
+	// decision to re-encode an HDR film into HDR and a decision to copy it
+	// untouched look identical in the response otherwise.
+	if info.IsHDR() && !hdrMismatch {
+		decision.Reasons = append(decision.Reasons,
+			fmt.Sprintf("the client supports HDR, so the stream keeps %s", dynamicRangeLabel(info)))
+	}
+
+	if decision.VideoAction == ActionTranscode && info.DolbyVisionProfile > 0 {
+		decision.Reasons = append(decision.Reasons, dolbyVisionReencodeNote(info))
 	}
 
 	// Audio action.
@@ -234,6 +285,52 @@ func describeBox(capability ClientCapability) string {
 	}
 }
 
+// dynamicRangeLabel names a source's dynamic range for a human, including the
+// Dolby Vision profile when the stream carries one.
+func dynamicRangeLabel(info *MediaInfo) string {
+	if info == nil {
+		return "unknown dynamic range"
+	}
+	label := "SDR"
+	switch info.DynamicRange {
+	case RangeHDR10:
+		label = "HDR10 (PQ)"
+	case RangeHLG:
+		label = "HLG"
+	}
+	if info.DolbyVisionProfile > 0 {
+		label += fmt.Sprintf(" with Dolby Vision profile %d", info.DolbyVisionProfile)
+	}
+	return label
+}
+
+// deliveryRangeFor reports the dynamic range the delivered video will have.
+// Anything that is not a pass-through of an HDR source is SDR, including an
+// unknown range, so the field is never empty.
+func deliveryRangeFor(source DynamicRange, toneMap bool) DynamicRange {
+	if toneMap || !source.IsHDR() {
+		return RangeSDR
+	}
+	return source
+}
+
+// dolbyVisionReencodeNote explains what re-encoding does to Dolby Vision.
+//
+// This is the difference between a caveat and a colour error. A profile 8 base
+// layer is HDR10, so dropping the dynamic metadata costs the extra highlights
+// Dolby Vision would have added and nothing else. A profile 5 base layer is
+// IPTPQc2, a different colour encoding entirely, so a tone mapper told to treat
+// it as PQ is reading the wrong numbers - and saying so is the only honest
+// thing to do when the alternative is refusing to play the file at all.
+func dolbyVisionReencodeNote(info *MediaInfo) string {
+	if info.DolbyVisionBaseLayerHDR10 {
+		return fmt.Sprintf("re-encoding does not carry the Dolby Vision profile %d dynamic metadata, "+
+			"only its HDR10 base layer", info.DolbyVisionProfile)
+	}
+	return fmt.Sprintf("Dolby Vision profile %d stores IPTPQc2 rather than PQ, which this server cannot "+
+		"convert; the tone-mapped colour will be approximate", info.DolbyVisionProfile)
+}
+
 // clientSupportsVideo treats an unknown source codec as incompatible rather
 // than optimistically assuming the client can play it.
 func clientSupportsVideo(capability ClientCapability, codec string) bool {
@@ -255,6 +352,13 @@ type ServerCapability struct {
 	// family cannot be offered that the hardware check rejected.
 	HardwareAcceleration []string `json:"hardware_acceleration,omitempty"`
 	VideoEncoders        []string `json:"video_encoders,omitempty"`
+	// HDRVideoEncoders lists the video encoders that produced a 10-bit stream
+	// here, each with the pixel format it accepted. A video encoder that works
+	// at 8 bits may still refuse 10, and an HDR transcode that is offered on
+	// the strength of the 8-bit result would fail at the first frame - so this
+	// is a separate, separately proved list rather than a boolean on the list
+	// above.
+	HDRVideoEncoders []HDREncoder `json:"hdr_video_encoders,omitempty"`
 	// RenderNode is the DRM render node VAAPI needs, empty when there is none.
 	RenderNode string `json:"render_node,omitempty"`
 	// RejectedEncoders lists the hardware encoders ffmpeg offers but this host
@@ -325,16 +429,23 @@ func DetectServerCapability(ctx context.Context, ffmpegBin, ffprobeBin, deviceDi
 	for _, encoder := range videoEncodersOnly(compiled) {
 		if !isHardwareEncoder(encoder) {
 			capability.VideoEncoders = append(capability.VideoEncoders, encoder)
-			continue
+		} else {
+			if err := probeEncoderSDR(ctx, ffmpegBin, encoder, device); err != nil {
+				capability.RejectedEncoders = append(capability.RejectedEncoders, EncoderRejection{
+					Encoder: encoder,
+					Reason:  err.Error(),
+				})
+				continue
+			}
+			capability.VideoEncoders = append(capability.VideoEncoders, encoder)
 		}
-		if err := probeEncoder(ctx, ffmpegBin, encoder, device); err != nil {
-			capability.RejectedEncoders = append(capability.RejectedEncoders, EncoderRejection{
-				Encoder: encoder,
-				Reason:  err.Error(),
-			})
-			continue
+
+		// An encoder that works at 8 bits is a candidate for HDR, not proof of
+		// it: 10-bit surfaces are a separate capability, and on one host the
+		// hardware encoder lacks it while the software one has it.
+		if support, err := probeHDRSupport(ctx, ffmpegBin, encoder, device); err == nil {
+			capability.HDRVideoEncoders = append(capability.HDRVideoEncoders, support)
 		}
-		capability.VideoEncoders = append(capability.VideoEncoders, encoder)
 	}
 
 	capability.HardwareAcceleration = hardwareFamilies(capability.VideoEncoders)
@@ -393,6 +504,21 @@ func NegotiateForServer(info *MediaInfo, capability ClientCapability, server Ser
 	decision := Negotiate(info, capability)
 	if !decision.Deliverable || decision.Mode != ModeTranscode {
 		return decision
+	}
+
+	// Keeping HDR needs an encoder that was verified to produce 10-bit here. If
+	// there is none, the honest fallback is the one a client that cannot do HDR
+	// would get anyway: tone map to SDR, which every client that lists an 8-bit
+	// codec can play. Refusing instead would make the file unplayable on a
+	// machine that is perfectly able to show it in SDR.
+	if decision.VideoAction == ActionTranscode && decision.TargetDynamicRange.IsHDR() {
+		if _, ok := EncoderForHDR(decision.TargetVideoCodec, server); !ok {
+			decision.ToneMap = true
+			decision.TargetDynamicRange = deliveryRangeFor(info.DynamicRange, true)
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("this server has no verified 10-bit encoder for %q, so %s is tone mapped to SDR instead",
+					decision.TargetVideoCodec, dynamicRangeLabel(info)))
+		}
 	}
 
 	if decision.VideoAction == ActionTranscode && EncoderFor(decision.TargetVideoCodec, server) == "" {
