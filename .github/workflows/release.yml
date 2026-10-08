@@ -36,8 +36,8 @@ jobs:
     name: Gate on the unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -72,19 +72,19 @@ jobs:
     needs: [gate, version]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
       - name: Build
         run: scripts/build-release.sh "${{ needs.version.outputs.value }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-archives
           path: dist/*.tar.gz
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-checksums
           path: dist/checksums.txt
@@ -96,7 +96,7 @@ jobs:
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -114,7 +114,7 @@ jobs:
     needs: [gate, version]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # GHCR requires a lower-case repository path.
       - name: Image name
         id: image
