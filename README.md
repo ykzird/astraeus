@@ -16,7 +16,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 
 | Area | State |
 | --- | --- |
-| Filesystem scanning | Done. Movies and shows; idempotent re-scans; **periodic background scanning** with a manual override |
+| Filesystem scanning | Done. Movies and shows; idempotent re-scans; **periodic background scanning** with a manual override; files removed from disk are pruned, unless the scan could not see the whole library |
 | Series / Season / Episode hierarchy | Done, derived from the directory layout |
 | Persistence | Done. SQLite via `sqlx`, versioned in-code migrations |
 | Metadata providers | TMDB (real HTTP) and a synthetic fallback; chainable |
@@ -28,7 +28,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | Hardware acceleration | Verified at startup (QuickSync / VAAPI); software fallback |
 | Subtitles | Done. Text tracks extracted to WebVTT, cached and served |
 | Observability | Done. The KPI registry is exposed in Prometheus format at `/metrics` |
-| Web UI | Three-column spatial layout, served by the binary; HLS via a vendored hls.js |
+| Web UI | Three-column spatial layout, served by the binary; HLS via a vendored hls.js; player controls overlaid on the video (transport, seek, subtitles, volume, quality, fullscreen) |
 | Authentication | Optional gate: trusted-proxy identity (Tailscale / Cloudflare Access) or a bearer token |
 
 ### Playback compatibility

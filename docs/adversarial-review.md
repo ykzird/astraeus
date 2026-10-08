@@ -8,8 +8,12 @@ code path myself, **[reported]** means it comes from a review pass and was not i
 reproduced.
 
 > **Status note (added later).** Fix-list items 1–5 of §7 have been implemented, in commit
-> `8ff0b03`. The body below is preserved unchanged as the record of the state at the reviewed
-> commit, with the two detailed source reports alongside it in `docs/review/`.
+> `8ff0b03`, and the remaining §7 items since: the project now has an MIT `LICENSE` and a
+> third-party notices file, and `internal/library` has been split so that persistence sits in
+> `internal/library/sqlite`, metadata retrieval in `internal/metadata`, and the filename rules in
+> `internal/library/naming`. The body below is preserved unchanged as the record of the state at
+> the reviewed commit, with the two detailed source reports alongside it in `docs/review/`, each
+> carrying its own point-in-time header.
 
 ---
 

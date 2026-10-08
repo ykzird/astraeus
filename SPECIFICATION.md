@@ -82,7 +82,8 @@ To ensure maximum efficiency and minimal latency, the server implements a **Proa
 The UI is organized into three distinct functional zones:
 *   **Left Sidebar (Navigation):** High-level navigation, library selection, collections, and application settings.
 *   **Main Content Canvas (The Environment):** A spacious, cinematic area where the selected `MediaEntity` becomes the visual anchor. This area uses large-scale imagery and video to create an immersive atmosphere.
-*   **Right Sidebar (Contextual Intelligence):** A translucent panel providing metadata, playback controls, related content, and queue management for the currently selected media.
+*   **Right Sidebar (Contextual Intelligence):** A translucent panel providing metadata and the reasons behind a delivery decision, related content, and queue management for the currently selected media. It is informational: it does not carry the transport.
+*   **Player (overlaid on the canvas):** Once playback starts, the transport is drawn over the video itself — play/pause, restart, skip, stop, the seek bar with a time readout, subtitle selection, volume and mute, quality selection, and fullscreen. The bar fades out while playing and returns on interaction or focus, and is `inert` while hidden so a keyboard user cannot land in an invisible trap.
 
 ### 5.2 Visual Language
 *   **Atmosphere (Glassmorphism):** Contextual panels, metadata overlays, and player controls utilize translucent, blurred surfaces to allow the background media to bleed through, maintaining immersion.

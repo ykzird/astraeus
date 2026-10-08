@@ -1,5 +1,14 @@
 # Adversarial review — astraeus-media Go backend
 
+> **Point in time.** This is the report as delivered, against commit `aad2cb1`. Line
+> numbers and type names refer to the tree at that commit and have since moved:
+> the metadata provider types are now `internal/metadata` (`Provider`, `Chain`,
+> `Mock`, `TMDB`), and the SQLite repository is `internal/library/sqlite`.
+> For what has been fixed since, and what has not, see
+> [`../adversarial-review.md`](../adversarial-review.md). The body below is
+> deliberately unedited.
+
+
 Scope: all production `*.go` under `cmd/` and `internal/` (~6.4k lines), plus `go.mod`; `web/` excluded.
 Method: full read; `mise exec -- go vet ./...` (clean); `mise exec -- go test -tags=integration -race -count=1 ./...` (all green);
 throwaway tests written **in a scratch copy** of the repo (original untouched) to confirm or falsify suspicions.

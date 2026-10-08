@@ -17,6 +17,9 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Periodic library scanning on an interval (`--scan-interval`) with the CLI
       and `POST /api/scan` as the manual override
 - [x] Artwork: TMDB posters and backdrops proxied through the server and cached
+- [x] Pruning: a file removed from disk stops being listed and entities left with
+      nothing are removed upwards, refused outright when a scan could not read
+      every path or saw no files at all
 - [x] Migration path for databases written by the earlier prototype
 - [x] Movie and show libraries (`--kind movies|shows`)
 
@@ -31,7 +34,11 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Session lifecycle: TTL reaping, graceful shutdown, cleanup
 - [x] Path-traversal-safe segment serving
 - [x] Direct play with HTTP range support (seeking)
-- [x] Server capability detection: encoder list and QuickSync/VAAPI availability
+- [x] Server capability detection: encoders **verified by running one**, not inferred
+      from the compiled-in list, plus the audio encoder list
+- [x] Seeking past what the transcoder has produced re-negotiates at an offset
+      (`start_seconds`), so any point in a film is reachable without restarting from zero
+- [x] Concurrent stream cap (`--max-sessions`), answered with `429`
 - [x] Subtitle tracks probed (codec, language, title, default/forced, text vs
       bitmap), text tracks extracted to WebVTT on demand and cached
 - [x] Subtitle *rendering* in the player (track selection UI)
@@ -41,6 +48,9 @@ Status as of the current build. Evidence for each claim is the test suite
 
 ## Phase 3: API & Security — API complete, security outstanding
 
+- [x] Capability manifests validated: an unknown codec name is refused with `400`
+      before it can reach ffmpeg, and a codec this host cannot encode is a `409` with
+      a reason rather than a `500` later
 - [x] REST API over the library, scanner, metadata, playback, artwork and subtitles
 - [x] Structured request logging (`slog`), graceful shutdown
 - [x] Prometheus metrics endpoint with the specification's KPI registry
@@ -57,7 +67,7 @@ Status as of the current build. Evidence for each claim is the test suite
 
 - [x] Base three-column layout (navigation | canvas | context)
 - [x] Media canvas with the selected entity as the visual anchor
-- [x] Contextual sidebar (metadata, playback transport, reasons, queue)
+- [x] Contextual sidebar (metadata, decision reasons, produced window, queue)
 - [x] Navigation sidebar (libraries, scan, enrich, incomplete filter)
 - [x] Glassmorphism panels + neobrutalist interaction elements
 - [x] Served by the binary from `--web-dir`, same origin as the API
@@ -66,7 +76,13 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Segmented playback in Chromium and Firefox via a locally vendored hls.js
       (1.7.3, lazy-loaded), verified in a real browser
 - [x] Subtitle tracks rendered and selectable in the player, defaulting to Off
-      unless the server marks a default; image-based tracks shown but disabled
+      unless the server marks a default; image-based tracks shown but disabled; the
+      choice survives a quality change or a seek
+- [x] Transport overlaid on the video rather than in the sidebar, with fullscreen on
+      the player container, volume and mute (remembered), and a quality menu that
+      re-negotiates at the current position
+- [x] Controls that fade while playing and return on interaction, never hiding while
+      paused, while focused, or while the pointer rests on them
 - [ ] Subtitle appearance controls (size, colour, background)
 - [ ] Poster/backdrop artwork: TMDB artwork is proxied and cached server-side
       and every entity payload carries `poster_url`/`backdrop_url`, but the UI
@@ -83,6 +99,10 @@ Status as of the current build. Evidence for each claim is the test suite
   keyframe-aligned, so it can be a second or two early.
 - Playback position is not stored, so there is no resume across sessions or
   devices; the offset machinery it needs now exists.
+- HDR and Dolby Vision are not handled. Only bit depth is probed, and output is
+  pinned to 8-bit, so a 10-bit BT.2020/PQ source is converted to SDR naively and
+  looks washed out or dark. There is no tone mapping and no colour metadata, and
+  a client that could handle HDR is not told the source has it.
 - Hardware encoders are QSV and VAAPI only — no NVENC, AMF or VideoToolbox.
 - Image-based subtitles (PGS, VobSub) are detected and reported but not
   delivered — that needs OCR or bitmap overlay support.
@@ -109,6 +129,18 @@ Status as of the current build. Evidence for each claim is the test suite
 - The hls.js fatal-error recovery path and the native-HLS (Safari) branch are
   implemented but have not been observed firing — no Safari was available, and a
   stream failure could not be forced on a live server.
+- Nothing is packaged: no `Dockerfile`, no systemd unit, no CI. There is a
+  `LICENSE` (MIT) and a third-party notices file, but running this anywhere means
+  building it yourself.
+- The web UI has no unit tests. It is one large file with no module seam, so its
+  logic is only covered by the CDP harnesses in `scripts/ui-verify/`, which need a
+  browser and a running server.
+- No `Content-Security-Policy` or other security headers are sent. The absence of
+  any HTML-injection sink in the UI is currently the only defence, and it is a
+  discipline rather than an enforced boundary.
+- Artwork from a metadata provider is fetched by the browser directly when the
+  entity carries an absolute URL, which tells that third party the viewer's IP.
+  The server-side image proxy exists but is not used for those URLs.
 - OpenTelemetry tracing is not implemented; beyond the four specified metrics,
   the registry holds counters and histograms for HTTP, scanning, streaming
   sessions, playback decisions, probe errors, transcoder fallbacks and the

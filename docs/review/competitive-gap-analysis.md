@@ -1,5 +1,13 @@
 # Astraeus Media — Competitive Gap Analysis
 
+> **Point in time.** This is the analysis as delivered, against commit `aad2cb1`. Its
+> feature inventory has been overtaken in places by work since: `LICENSE` and the
+> third-party notices exist, playback now resumes at an offset, `max_bitrates_kbps`
+> is still unused, and the package layout has been reorganised. The body below is
+> deliberately unedited, because a comparison is only useful if it records what was
+> true when it was made.
+
+
 **Question:** what is missing before anyone could call this a "Jellyfin killer"?
 
 **Method.** I read `README.md`, `SPECIFICATION.md`, `CONTEXT.md`, `TODO.md`, `go.mod`, the git
