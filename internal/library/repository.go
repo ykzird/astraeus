@@ -42,19 +42,26 @@ type Repository interface {
 
 	// Playback progress: where a viewer got to, so playback can resume.
 	//
+	// Every method takes the viewer it is about. SaveProgress carries it on the
+	// record, because a save is a whole position; the lookups take it as a key,
+	// because an entity id alone no longer identifies a row. An empty viewer is
+	// read and written as DefaultViewerID, so a caller with no gate identity
+	// does not have to spell it out.
+	//
 	// SaveProgress records a position, replacing any earlier one for the same
-	// entity - a viewer who rewinds and watches again has one position, not a
-	// history. GetProgress reports (nil, nil) when the entity has never been
-	// played, because having no progress is the normal case rather than an
-	// error. DeleteProgress forgets it, which is what "start over" means.
+	// viewer and entity - a viewer who rewinds and watches again has one
+	// position, not a history. GetProgress reports (nil, nil) when this viewer
+	// has never played the entity, because having no progress is the normal case
+	// rather than an error. DeleteProgress forgets the caller's position and
+	// leaves every other viewer's alone, which is what "start over" means.
 	SaveProgress(ctx context.Context, progress *PlaybackProgress) error
-	GetProgress(ctx context.Context, entityID string) (*PlaybackProgress, error)
-	DeleteProgress(ctx context.Context, entityID string) error
-	// ListProgress reports what is worth resuming, most recently watched first,
-	// with the entity each position belongs to. Positions in the closing
-	// fraction of an entity are left out even if a row survives: the answer to
-	// "what was I watching" should not be a film that is over.
-	ListProgress(ctx context.Context, limit int) ([]ProgressEntry, error)
+	GetProgress(ctx context.Context, viewerID, entityID string) (*PlaybackProgress, error)
+	DeleteProgress(ctx context.Context, viewerID, entityID string) error
+	// ListProgress reports one viewer's positions that are worth resuming, most
+	// recently watched first, with the entity each position belongs to. Positions
+	// in the closing fraction of an entity are left out even if a row survives:
+	// the answer to "what was I watching" should not be a film that is over.
+	ListProgress(ctx context.Context, viewerID string, limit int) ([]ProgressEntry, error)
 
 	// WithTx runs fn inside a transaction. The Repository handed to fn is bound
 	// to that transaction; returning an error rolls the whole thing back.

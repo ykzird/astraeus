@@ -136,11 +136,16 @@ func (r *Repository) Migrate(ctx context.Context) error {
 		// Resumable playback. The foreign key cascades so progress cannot
 		// outlive the entity it describes, which is what happens when a file is
 		// pruned: a row left behind would be progress in a film that is gone.
+		// The key is (viewer, entity), because two viewers of one film each
+		// have their own place; a database written before that is rebuilt by
+		// rebuildProgressPerViewer below.
 		`CREATE TABLE IF NOT EXISTS playback_progress (
-			entity_id TEXT PRIMARY KEY,
+			viewer_id TEXT NOT NULL,
+			entity_id TEXT NOT NULL,
 			position_seconds REAL NOT NULL,
 			duration_seconds REAL NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL,
+			PRIMARY KEY (viewer_id, entity_id),
 			FOREIGN KEY (entity_id) REFERENCES media_entities(id) ON DELETE CASCADE
 		)`,
 	}
@@ -148,6 +153,13 @@ func (r *Repository) Migrate(ctx context.Context) error {
 		if _, err := r.exec().ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("migration statement failed: %w", err)
 		}
+	}
+
+	// Progress became per-viewer after the baseline above was first written, so
+	// a database from before that has the table without the viewer column and
+	// has to be rebuilt before anything queries it.
+	if err := r.rebuildProgressPerViewer(ctx); err != nil {
+		return err
 	}
 
 	// Databases created before libraries existed are missing these columns.
@@ -193,6 +205,9 @@ func (r *Repository) Migrate(ctx context.Context) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_media_entities_identity
 			ON media_entities(library_id, COALESCE(parent_id, ''), type, name)`,
 		`CREATE INDEX IF NOT EXISTS idx_media_entities_library ON media_entities(library_id)`,
+		// The continue-watching query filters by viewer and orders by recency,
+		// which is exactly this index.
+		`CREATE INDEX IF NOT EXISTS idx_playback_progress_viewer ON playback_progress(viewer_id, updated_at DESC)`,
 	}
 	for _, stmt := range post {
 		if _, err := r.exec().ExecContext(ctx, stmt); err != nil {
@@ -224,6 +239,75 @@ func (r *Repository) ensureColumn(ctx context.Context, table, column, ddl string
 	}
 	if _, err := r.exec().ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("adding %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+// rebuildProgressPerViewer widens playback_progress's primary key from
+// (entity_id) to (viewer_id, entity_id).
+//
+// SQLite cannot widen a primary key in place - the column is part of the table's
+// definition, not an index that can be replaced - so the table is rebuilt:
+// renamed aside, recreated from the baseline, and copied. The rows it held were
+// written when the server could not tell viewers apart, so they are claimed by
+// DefaultViewerID. The whole rebuild is one transaction, because a crash
+// halfway through a rename-and-copy would otherwise leave the data in the
+// renamed table and an empty one in its place.
+//
+// It is a no-op on a database the baseline created, which has the column
+// already, and on every run after the first.
+func (r *Repository) rebuildProgressPerViewer(ctx context.Context) error {
+	var columns []struct {
+		Name string `db:"name"`
+	}
+	if err := r.exec().SelectContext(ctx, &columns, `SELECT name FROM pragma_table_info('playback_progress')`); err != nil {
+		return fmt.Errorf("inspecting playback_progress: %w", err)
+	}
+	for _, c := range columns {
+		if c.Name == "viewer_id" {
+			return nil
+		}
+	}
+
+	const legacy = "playback_progress_pre_viewer"
+	steps := []struct {
+		statement string
+		args      []any
+	}{
+		{statement: `ALTER TABLE playback_progress RENAME TO ` + legacy},
+		{statement: `CREATE TABLE playback_progress (
+			viewer_id TEXT NOT NULL,
+			entity_id TEXT NOT NULL,
+			position_seconds REAL NOT NULL,
+			duration_seconds REAL NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (viewer_id, entity_id),
+			FOREIGN KEY (entity_id) REFERENCES media_entities(id) ON DELETE CASCADE
+		)`},
+		// The single viewer those rows belonged to is the one with no gate
+		// identity. A gated install keeps its old positions under that name too;
+		// they cannot be attributed to an identity the server never recorded.
+		{
+			statement: `INSERT INTO playback_progress (viewer_id, entity_id, position_seconds, duration_seconds, updated_at)
+			 SELECT ?, entity_id, position_seconds, duration_seconds, updated_at FROM ` + legacy,
+			args: []any{library.DefaultViewerID},
+		},
+		{statement: `DROP TABLE ` + legacy},
+	}
+
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning playback_progress rebuild: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, step := range steps {
+		if _, err := tx.ExecContext(ctx, step.statement, step.args...); err != nil {
+			return fmt.Errorf("rebuilding playback_progress for per-viewer progress: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing playback_progress rebuild: %w", err)
 	}
 	return nil
 }
@@ -740,10 +824,22 @@ func (r *Repository) GetObjectsByEntity(ctx context.Context, entityID string) ([
 
 // ---- playback progress -----------------------------------------------------
 
+// normaliseViewer names the viewer a position belongs to. An empty identity is
+// the ungated single viewer, which has a name in the domain so that a stored row
+// can say whose place it is.
+func normaliseViewer(viewerID string) string {
+	if viewerID == "" {
+		return library.DefaultViewerID
+	}
+	return viewerID
+}
+
 // SaveProgress records where a viewer got to, replacing any earlier position for
-// the same entity. An upsert rather than an insert-or-update pair because the
-// common case is a position that already exists, and doing it in one statement
-// is what keeps two concurrent players from racing to insert the same row.
+// the same viewer and entity. An upsert rather than an insert-or-update pair
+// because the common case is a position that already exists, and doing it in one
+// statement is what keeps two concurrent players from racing to insert the same
+// row. The conflict target names both key columns: two viewers reporting the
+// same film are two rows, not a conflict.
 func (r *Repository) SaveProgress(ctx context.Context, progress *library.PlaybackProgress) error {
 	if progress == nil {
 		return errors.New("nil playback progress")
@@ -752,29 +848,32 @@ func (r *Repository) SaveProgress(ctx context.Context, progress *library.Playbac
 		return errors.New("playback progress needs an entity id")
 	}
 	_, err := r.exec().ExecContext(ctx,
-		`INSERT INTO playback_progress (entity_id, position_seconds, duration_seconds, updated_at)
-		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT(entity_id) DO UPDATE SET
+		`INSERT INTO playback_progress (viewer_id, entity_id, position_seconds, duration_seconds, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(viewer_id, entity_id) DO UPDATE SET
 			position_seconds = excluded.position_seconds,
 			duration_seconds = excluded.duration_seconds,
 			updated_at = excluded.updated_at`,
-		progress.EntityID, progress.PositionSeconds, progress.DurationSeconds, formatTime(time.Now()))
+		normaliseViewer(progress.ViewerID), progress.EntityID,
+		progress.PositionSeconds, progress.DurationSeconds, formatTime(time.Now()))
 	if err != nil {
 		return fmt.Errorf("saving playback progress for %s: %w", progress.EntityID, err)
 	}
 	return nil
 }
 
-// GetProgress returns an entity's position, or (nil, nil) when it has none.
+// GetProgress returns one viewer's position in an entity, or (nil, nil) when
+// they have none.
 //
 // Absence is not an error here: almost every entity in a library has never been
 // played, and a caller that had to distinguish "no progress" from "lookup
 // failed" for every listing would be worse off for it.
-func (r *Repository) GetProgress(ctx context.Context, entityID string) (*library.PlaybackProgress, error) {
+func (r *Repository) GetProgress(ctx context.Context, viewerID, entityID string) (*library.PlaybackProgress, error) {
 	var rows []progressRow
 	if err := r.exec().SelectContext(ctx, &rows,
-		`SELECT entity_id, position_seconds, duration_seconds, updated_at
-		 FROM playback_progress WHERE entity_id = ?`, entityID); err != nil {
+		`SELECT viewer_id, entity_id, position_seconds, duration_seconds, updated_at
+		 FROM playback_progress WHERE viewer_id = ? AND entity_id = ?`,
+		normaliseViewer(viewerID), entityID); err != nil {
 		return nil, fmt.Errorf("getting playback progress for %s: %w", entityID, err)
 	}
 	if len(rows) == 0 {
@@ -787,11 +886,11 @@ func (r *Repository) GetProgress(ctx context.Context, entityID string) (*library
 	return progress, nil
 }
 
-// ListProgress reports the positions worth resuming, most recent first.
+// ListProgress reports one viewer's positions worth resuming, most recent first.
 //
 // The join is what makes this one query rather than N+1: a continue-watching
 // list is a list of *entities*, so the entity travels with its position.
-func (r *Repository) ListProgress(ctx context.Context, limit int) ([]library.ProgressEntry, error) {
+func (r *Repository) ListProgress(ctx context.Context, viewerID string, limit int) ([]library.ProgressEntry, error) {
 	if limit <= 0 {
 		limit = defaultProgressLimit
 	}
@@ -811,9 +910,10 @@ func (r *Repository) ListProgress(ctx context.Context, limit int) ([]library.Pro
 			p.position_seconds, p.duration_seconds, p.updated_at AS progress_updated_at
 		 FROM playback_progress p
 		 JOIN media_entities e ON e.id = p.entity_id
-		 WHERE p.duration_seconds <= 0 OR p.position_seconds < p.duration_seconds * ?
+		 WHERE p.viewer_id = ?
+		   AND (p.duration_seconds <= 0 OR p.position_seconds < p.duration_seconds * ?)
 		 ORDER BY p.updated_at DESC
-		 LIMIT ?`, library.FinishedFraction, limit); err != nil {
+		 LIMIT ?`, normaliseViewer(viewerID), library.FinishedFraction, limit); err != nil {
 		return nil, fmt.Errorf("listing playback progress: %w", err)
 	}
 
@@ -828,6 +928,7 @@ func (r *Repository) ListProgress(ctx context.Context, limit int) ([]library.Pro
 			return nil, err
 		}
 		progress := library.PlaybackProgress{
+			ViewerID:        normaliseViewer(viewerID),
 			EntityID:        entity.ID,
 			PositionSeconds: row.PositionSeconds,
 			DurationSeconds: row.DurationSeconds,
@@ -842,11 +943,12 @@ func (r *Repository) ListProgress(ctx context.Context, limit int) ([]library.Pro
 // continue-watching list is for picking something up, not for paging a library.
 const defaultProgressLimit = 20
 
-// DeleteProgress forgets an entity's position, which is what starting over
-// means.
-func (r *Repository) DeleteProgress(ctx context.Context, entityID string) error {
+// DeleteProgress forgets one viewer's position in an entity, which is what
+// starting over means. Every other viewer's position is left where it is.
+func (r *Repository) DeleteProgress(ctx context.Context, viewerID, entityID string) error {
 	if _, err := r.exec().ExecContext(ctx,
-		`DELETE FROM playback_progress WHERE entity_id = ?`, entityID); err != nil {
+		`DELETE FROM playback_progress WHERE viewer_id = ? AND entity_id = ?`,
+		normaliseViewer(viewerID), entityID); err != nil {
 		return fmt.Errorf("deleting playback progress for %s: %w", entityID, err)
 	}
 	return nil
@@ -855,6 +957,7 @@ func (r *Repository) DeleteProgress(ctx context.Context, entityID string) error 
 // progressRow is the table's shape, kept separate from the domain type so the
 // time format stays where the rest of the adapter's conversions live.
 type progressRow struct {
+	ViewerID        string  `db:"viewer_id"`
 	EntityID        string  `db:"entity_id"`
 	PositionSeconds float64 `db:"position_seconds"`
 	DurationSeconds float64 `db:"duration_seconds"`
@@ -867,6 +970,7 @@ func (row progressRow) toProgress() (*library.PlaybackProgress, error) {
 		return nil, err
 	}
 	return &library.PlaybackProgress{
+		ViewerID:        row.ViewerID,
 		EntityID:        row.EntityID,
 		PositionSeconds: row.PositionSeconds,
 		DurationSeconds: row.DurationSeconds,

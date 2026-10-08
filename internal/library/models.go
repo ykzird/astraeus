@@ -115,15 +115,24 @@ type MediaObject struct {
 	CreatedAt     time.Time `json:"created_at" db:"created_at"`
 }
 
+// DefaultViewerID is the viewer a position belongs to when the server has no
+// way to tell viewers apart - a local install with the access gate disabled, so
+// there is exactly one. It is a name rather than the empty string so that it can
+// never collide with an identity a gate forwards, and so a stored row says who
+// it belongs to.
+const DefaultViewerID = "local"
+
 // PlaybackProgress is where a viewer got to in an entity. It is what makes
 // playback resumable: without it, every play starts at zero and a film watched
 // over three evenings is never finished.
 //
-// It is per *entity*, not per user, because access is a single instance-wide
-// gate: there is one viewer as far as this server is concerned. A multi-user
-// version would key on the identity the access gate already puts on each
-// request, which is why nothing else here assumes there is only one.
+// It is keyed by viewer *and* entity. The viewer is the identity the access gate
+// attaches to a request, or DefaultViewerID when no gate is configured; without
+// it a second viewer of the same film would overwrite the first one's place.
 type PlaybackProgress struct {
+	// ViewerID is whose place this is. Empty is normalised to DefaultViewerID
+	// by the storage layer, so callers that cannot name a viewer do not have to.
+	ViewerID string `json:"viewer_id" db:"viewer_id"`
 	EntityID string `json:"entity_id" db:"entity_id"`
 	// PositionSeconds is how far into the media the viewer was.
 	PositionSeconds float64 `json:"position_seconds" db:"position_seconds"`

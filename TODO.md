@@ -80,6 +80,10 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Resumable playback over the API: `PUT`/`DELETE /api/entities/{id}/progress`,
       the stored position on the entity detail, and `GET /api/progress` for what is
       worth continuing
+- [x] Progress is per viewer: keyed on the identity the access gate attaches to
+      the request, so two viewers of one film keep separate places, listings are
+      scoped to the caller, and a pre-existing database keeps its rows under the
+      named local viewer
 - [x] Security headers and a content security policy with no `unsafe-inline` or
       `unsafe-eval`, driven by what the UI actually needs; verified in a browser
       (third-party image and inline script refused, 32/32 harness checks pass)
@@ -159,10 +163,13 @@ Status as of the current build. Evidence for each claim is the test suite
   re-negotiates with `start_seconds` and ffmpeg seeks the input, so any point
   in the film is reachable in a couple of seconds. The landing point is
   keyframe-aligned, so it can be a second or two early.
-- Playback position is stored per entity, resumed on play, and listed as a
-  **Continue watching** section, but progress is instance-wide rather than per
-  user: the access gate identifies a request, and nothing yet keys progress on
-  that identity, so a second viewer would overwrite the first one's place.
+- Playback position is stored per viewer, resumed on play, and listed as a
+  **Continue watching** section. The viewer is whatever identity the access gate
+  attached to the request, so the guarantee is only as strong as the gate: in
+  `token` mode every API client is reported as `token` and shares one place, and
+  with the gate disabled there is a single `local` viewer. Rows written before
+  the key was widened are kept under `local`, because who wrote them was never
+  recorded.
 - HDR is handled, with caveats that are all reported in the negotiation reasons
   rather than hidden:
   - **Dolby Vision profile 5** stores IPTPQc2, not PQ. Tone mapping it with the

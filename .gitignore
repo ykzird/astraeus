@@ -10,3 +10,9 @@
 
 # Transient HLS session output
 /streams/
+
+# Scratch directories the handoff's own environment setup creates inside the
+# workspace: the Go build cache, a TMPDIR, and a stream root for verification.
+/.gocache/
+/.tmp/
+/.streams/

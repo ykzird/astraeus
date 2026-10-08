@@ -1,10 +1,10 @@
 # Handoff
 
-**As of the round-2 work of 2026-10-08 — HDR and Dolby Vision, packaging, the
-bitrate ceiling, the adaptive bitrate ladder, audio track selection, resumable
-playback, a continue-watching list, and response hardening. Version 0.9.0. 93
-tracked files.** (`git log` names the commits; the previous handoff was
-`b76a14f`.)
+**As of the round-3 work of 2026-10-08 — per-viewer playback progress. Version
+0.10.0. 95 tracked files.** (`git log` names the commits; the previous handoff was
+`6a5cf89`, and below that round 2 landed HDR/Dolby Vision, packaging, the
+bitrate ceiling, the adaptive ladder, audio track selection, resumable playback,
+the continue-watching list and response hardening.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -112,11 +112,21 @@ mise exec -- go test -tags=integration -run TestManager_DeliversTheChosenAudioTr
 # position, read it back, overrun it (400), finish it (cleared), force it.
 mise exec -- go test -run 'TestPlaybackProgress|TestListProgress' ./internal/api/ ./internal/library/sqlite/
 
+# Per-viewer progress: two identities through the real access gate keep separate
+# positions, separate continue-watching listings, and finishing or clearing one
+# leaves the other alone. The sqlite half also covers the rebuild that widens a
+# pre-viewer table and keeps its rows under the local viewer.
+mise exec -- go test -v -run 'PerViewer|LocalOne|WidensProgress|UngatedServer|FinishingIsOnly' \
+  ./internal/api/ ./internal/library/sqlite/
+
 # Both resume paths in a real browser - direct play seeks the element itself,
 # segmented delivery is started at the offset by the server - plus the
-# continue-watching list gaining and dropping the entry.
-CDP_PORT=9413 node scripts/ui-verify/resume-verify.mjs http://127.0.0.1:8922 <directPlayEntityId> 300
-CDP_PORT=9413 node scripts/ui-verify/resume-verify.mjs http://127.0.0.1:8921 <segmentedEntityId> 600
+# continue-watching list gaining and dropping the entry. Use a fixture longer
+# than the resume position plus a minute; the harness README has a recipe for a
+# three-minute clip whose mp4 and mkv remux exercise the two paths. The 4K films
+# do not: their HDR ladder starts slower than the harness waits.
+CDP_PORT=9413 timeout 200 node scripts/ui-verify/resume-verify.mjs http://127.0.0.1:8923 <directPlayEntityId> 30
+CDP_PORT=9413 timeout 200 node scripts/ui-verify/resume-verify.mjs http://127.0.0.1:8923 <segmentedEntityId> 30
 
 # The real thing, against the 17 GB film: a browser profile gets bt709/bt709,
 # an HDR manifest gets 10-bit bt2020/PQ. Copy real.db first; *.db is local state.
@@ -312,13 +322,37 @@ well as in the report path — applied after the `LIMIT`, a finished row consume
 one of the slots and a listing of one comes back empty, which is the bug the
 adapter test caught.
 
+**Per-viewer progress** landed as of 0.10.0, which closes the largest
+simplification the product had left. `PlaybackProgress` gained a `ViewerID`, the
+`playback_progress` table's primary key widened from `(entity_id)` to
+`(viewer_id, entity_id)`, and every read, write, clear and listing is scoped to
+one viewer. The viewer is the identity the access gate already put on the
+request; nothing reads an identity header in a handler, because with no gate a
+header is a string the client made up, and believing it would let one viewer
+name themselves another. With no gate there is a single viewer, `local`, so an
+ungated install behaves exactly as before. Two honest consequences: `token` mode
+reports every API client as `token`, so they share a place (per-viewer state is a
+`proxy`-mode property), and a database written before the key widened keeps its
+rows under `local`, because the identity that wrote them was never recorded.
+SQLite cannot widen a primary key in place, so that upgrade rebuilds the table
+inside one transaction; the migration is idempotent and a test drives it from a
+hand-built pre-viewer schema. Verified mechanically with three API tests through
+the real gate middleware (two viewers, finishing, ungated) and three adapter
+tests (two viewers, the empty-to-`local` naming rule, the rebuild and re-run),
+and in a real browser with `resume-verify.mjs` at **9/9 on each resume path** —
+a synthetic three-minute H.264 clip for direct play and the same stream remuxed
+to Matroska for the segmented path — including the continue-watching list
+gaining the entity and dropping it when the position is cleared. (The 4K films
+are a poor fixture for that harness: their three-rung HDR ladder takes longer to
+start than the harness waits, so it reports no frame. The harness README now
+carries the fixture recipe.)
+
 **Resumable playback** landed as of 0.7.0: a `playback_progress` table keyed by
-entity with a cascading delete, `PUT`/`DELETE /api/entities/{id}/progress`, and a
-`progress` object on the entity detail. Two rules carry the honesty: a position
-in the closing 5% clears the row because that entity is watched through, and a
-position past the end is a `400` rather than something the next resume would
-trust. Progress is per entity, not per user - the gate is instance-wide, and the
-storage does not assume that, it simply has no user key yet.
+viewer and entity with a cascading delete, `PUT`/`DELETE
+/api/entities/{id}/progress`, and a `progress` object on the entity detail. Two
+rules carry the honesty: a position in the closing 5% clears the row because that
+viewer is watched through, and a position past the end is a `400` rather than
+something the next resume would trust.
 
 **Audio track selection** landed as of 0.6.0. Every audio stream is probed into
 `media_info.audio_tracks` (index, codec, channels, bitrate, language, title,
@@ -369,22 +403,21 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **Per-user progress**, keyed on the identity the access gate already attaches
-   to every request, once there is more than one viewer to tell apart. Until then
-   a second viewer overwrites the first one's place, which is the largest
-   simplification left in the product.
-2. **Image subtitles** (PGS/VobSub are detected, reported and refused): OCR or a
+1. **Image subtitles** (PGS/VobSub are detected, reported and refused): OCR or a
    bitmap overlay, and the only subtitle gap left.
-3. **Rate limiting and OpenTelemetry**, then **UI unit tests** (the front end is
+2. **Rate limiting and OpenTelemetry**, then **UI unit tests** (the front end is
    one 133 KB file with no seam — `web/core.js` for the pure timeline maths is the
    cheapest first cut). CSP, security headers and the artwork leak are done as of
-   0.9.0.
-4. **A ladder a client can pin the top of.** Today pinning a height means one
+   0.9.0, and per-user progress as of 0.10.0.
+3. **A ladder a client can pin the top of.** Today pinning a height means one
    rendition, so the quality menu caps quality rather than expressing a preference
    within a ladder — the negotiation model is thinner than it looks there.
-5. **Release automation and a TLS example.** Packaging landed (see §6), but
+4. **Release automation and a TLS example.** Packaging landed (see §6), but
    nothing is tagged or published, the CI workflow has never run, and there is no
    reverse-proxy configuration beside the unit.
+5. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
+   the gate remains instance-wide: it admits a request, it does not decide what
+   the request may see, so every admitted viewer sees the whole library.
 6. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
@@ -431,12 +464,22 @@ Priority order, with the reasoning. Take it top-down.
   the captured tail, and two immediate re-runs passed 32/32 on the same code.
   Treat a single failure there as worth re-running before chasing it — but do
   capture the whole output, because `tail` is what lost the name of the check.
-- **Resume is per entity, not per user, and there is now a "continue watching"
-  listing but no per-user dimension.** The storage is keyed by entity id rather than by the identity the
-  access gate attaches to a request, because with one instance-wide gate there is
-  only one viewer to record. A second viewer would overwrite the first one's
-  position, and nothing yet lists what is half-watched, so a viewer has to find
-  the film again to resume it.
+- **Progress is per viewer, but the viewer is only as real as the gate.** In
+  `proxy` mode it is a forwarded identity and two people keep separate places; in
+  `token` mode the gate names every API client `token`, so those clients share
+  one; with the gate off there is a single `local` viewer. The API tests drive
+  two identities through the real gate middleware, but that is a test double for
+  a proxy, not Tailscale or Cloudflare Access on a real network, and no browser
+  has made requests as two identities: the CDP harnesses run against an ungated
+  server, so they exercise the `local` path only.
+- **The pre-viewer migration attributes old rows to `local`.** A database from
+  0.9.0 or earlier is rebuilt (SQLite cannot widen a primary key in place) and
+  its rows are claimed by the single viewer, because the identity that wrote them
+  was never recorded. On an install that already ran an identity-aware gate, a
+  viewer will not find their older positions under their own identity; they are
+  under `local` and are not lost. The rebuild is covered by a test that starts
+  from a hand-built pre-viewer schema, but it has not been run against a copy of
+  `real.db` or of a production database.
 - **A progress report is only as good as the player's clock.** The stored
   position comes from the client; the server validates its range and clears a
   finished one, but it cannot tell a real position from a plausible wrong one.

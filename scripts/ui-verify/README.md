@@ -117,3 +117,21 @@ entity is too short.
 The bundled demo clips are about three seconds long, so assertions are written
 to tolerate playback reaching the end during a wait; seek checks pause first.
 That is a property of the fixtures, not a workaround for the app.
+
+A harness prints its checks and then keeps running, because the CDP socket stays
+open and nothing calls `process.exit` on success. Wrap a run in `timeout`, or
+read the printed summary and kill it — the summary is written before the socket
+matters.
+
+`resume-verify.mjs` needs an entity longer than its resume position plus a
+minute, which the three-second demo clips are not. A cheap fixture is a
+three-minute synthetic clip, which direct plays if it is H.264/mp4 and takes the
+segmented path if the same stream is remuxed to Matroska:
+
+```sh
+ffmpeg -f lavfi -i "testsrc2=size=1280x720:rate=24" \
+       -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+       -t 180 -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac \
+       -movflags +faststart "fixture.mp4"
+ffmpeg -i "fixture.mp4" -c copy "fixture.mkv"
+```

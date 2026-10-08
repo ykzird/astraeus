@@ -15,6 +15,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/jok/astraeus-media/internal/access"
 	"github.com/jok/astraeus-media/internal/images"
 	"github.com/jok/astraeus-media/internal/library"
 	"github.com/jok/astraeus-media/internal/library/sqlite"
@@ -26,6 +27,10 @@ import (
 type testEnv struct {
 	server *Server
 	repo   library.Repository
+	// gate is nil by default. A test that needs to tell viewers apart installs
+	// the same middleware the binary uses, because identity lives in the gate
+	// and not in the API server.
+	gate *access.Gate
 }
 
 // envOption customises the dependencies of a test server.
@@ -96,7 +101,32 @@ func newTestEnv(t *testing.T, opts ...envOption) *testEnv {
 	return &testEnv{server: NewServer(deps), repo: repo}
 }
 
+// useGate wraps the test server in an access gate, which is how a request gets
+// an identity: the gate puts it in the request context after checking the
+// source. It is wired here rather than in newTestEnv because the real binary
+// builds the gate outside the API server and most tests care about the ungated
+// case.
+func (e *testEnv) useGate(gate *access.Gate) { e.gate = gate }
+
+// defaultTestIdentity is who a plain env.do request is when a gate is
+// installed: the gate refuses an identity-less request, and seeding a library
+// is not the thing under test. A test that cares which viewer is asking calls
+// doAs.
+const defaultTestIdentity = "tester@example.com"
+
 func (e *testEnv) do(t *testing.T, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	identity := ""
+	if e.gate != nil {
+		identity = defaultTestIdentity
+	}
+	return e.doAs(t, identity, method, path, body)
+}
+
+// doAs makes a request as an authenticated viewer. A non-empty identity is sent
+// in the header the gate reads, exactly as a trusted proxy would forward it; an
+// empty one sends no header, which is the ungated single-viewer case.
+func (e *testEnv) doAs(t *testing.T, identity, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 
 	var reader io.Reader
@@ -107,8 +137,16 @@ func (e *testEnv) do(t *testing.T, method, path, body string) *httptest.Response
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	if identity != "" {
+		req.Header.Set(access.DefaultIdentityHeaders[0], identity)
+	}
 	recorder := httptest.NewRecorder()
-	e.server.Handler().ServeHTTP(recorder, req)
+
+	handler := e.server.Handler()
+	if e.gate != nil {
+		handler = e.gate.Middleware(handler)
+	}
+	handler.ServeHTTP(recorder, req)
 	return recorder
 }
 

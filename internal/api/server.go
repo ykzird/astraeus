@@ -512,7 +512,7 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	progress, err := s.repo.GetProgress(ctx, entity.ID)
+	progress, err := s.repo.GetProgress(ctx, viewerID(r), entity.ID)
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting playback progress")
 		return
@@ -734,6 +734,24 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+// viewerID reports whose playback progress a request is about.
+//
+// It is the identity the access gate verified and attached to the request
+// context - never an identity header read here, because with no gate a header
+// is a string the client made up, and believing it would let one viewer read or
+// overwrite another's place. When there is no gate there is a single viewer,
+// which library.DefaultViewerID names.
+//
+// Token mode is the one case where this is not a person: the gate reports every
+// bearer-token client as "token", so they share a place. That is honest for an
+// API credential and is said in the README.
+func viewerID(r *http.Request) string {
+	if identity := access.IdentityFromContext(r.Context()); identity != "" {
+		return identity
+	}
+	return library.DefaultViewerID
+}
+
 // progressEntryResource is a stored position with the entity it belongs to,
 // which is what a "continue watching" row renders from.
 type progressEntryResource struct {
@@ -741,11 +759,14 @@ type progressEntryResource struct {
 	Progress *progressResource `json:"progress"`
 }
 
-// handleListProgress lists what is worth resuming, most recently watched first.
+// handleListProgress lists one viewer's positions worth resuming, most recently
+// watched first.
 //
 // It is one endpoint rather than a field on every entity because the question it
 // answers - "what was I in the middle of" - is a query over positions, not over
 // the library, and answering it from the client would mean fetching everything.
+// The viewer is whoever the request belongs to, so it is also scoped to them
+// without the client having to name itself.
 func (s *Server) handleListProgress(w http.ResponseWriter, r *http.Request) {
 	limit := 0
 	if raw := r.URL.Query().Get("limit"); raw != "" {
@@ -761,7 +782,7 @@ func (s *Server) handleListProgress(w http.ResponseWriter, r *http.Request) {
 		limit = maxProgressLimit
 	}
 
-	entries, err := s.repo.ListProgress(r.Context(), limit)
+	entries, err := s.repo.ListProgress(r.Context(), viewerID(r), limit)
 	if err != nil {
 		s.writeRepoError(w, r, err, "listing playback progress")
 		return
@@ -827,14 +848,18 @@ func (s *Server) handleSaveProgress(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Progress past the closing credits is cleared rather than stored: resuming
-	// three seconds from the end is worse than starting the next thing.
+	// three seconds from the end is worse than starting the next thing. Both the
+	// save and the clear are scoped to the reporting viewer, so one viewer
+	// finishing a film cannot erase another's place in it.
+	viewer := viewerID(r)
 	progress := &library.PlaybackProgress{
+		ViewerID:        viewer,
 		EntityID:        entity.ID,
 		PositionSeconds: request.PositionSeconds,
 		DurationSeconds: request.DurationSeconds,
 	}
 	if progress.IsFinished() {
-		if err := s.repo.DeleteProgress(ctx, entity.ID); err != nil {
+		if err := s.repo.DeleteProgress(ctx, viewer, entity.ID); err != nil {
 			s.writeRepoError(w, r, err, "clearing finished playback progress")
 			return
 		}
@@ -848,9 +873,11 @@ func (s *Server) handleSaveProgress(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleDeleteProgress forgets a position, which is what starting over means.
+// handleDeleteProgress forgets the caller's position, which is what starting
+// over means. It is the caller's and nobody else's: the viewer comes from the
+// request, so a client cannot clear another viewer's place even by guessing.
 func (s *Server) handleDeleteProgress(w http.ResponseWriter, r *http.Request) {
-	if err := s.repo.DeleteProgress(r.Context(), r.PathValue("id")); err != nil {
+	if err := s.repo.DeleteProgress(r.Context(), viewerID(r), r.PathValue("id")); err != nil {
 		s.writeRepoError(w, r, err, "deleting playback progress")
 		return
 	}

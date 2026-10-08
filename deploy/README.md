@@ -19,7 +19,7 @@ Whatever you pick, three facts decide whether the install is sound:
 ## Container
 
 ```sh
-docker build -t astraeus-media:0.9.0 .
+docker build -t astraeus-media:0.10.0 .
 
 # The image's default command serves on :8642 with every writable path inside
 # /data. This one has no access gate, so keep it on loopback.
@@ -27,7 +27,7 @@ docker run -d --name astraeus \
   -p 127.0.0.1:8642:8642 \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.9.0
+  astraeus-media:0.10.0
 ```
 
 Flags are passed through the entrypoint, so the server's own options can be
@@ -57,7 +57,7 @@ docker run -d --name astraeus \
   -e ASTRAEUS_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.9.0 \
+  astraeus-media:0.10.0 \
   serve --addr 0.0.0.0:8642 --web-dir /app/web \
         --db /data/astraeus.db --stream-root /data/streams \
         --image-cache /data/images --subtitle-cache /data/subtitles \
@@ -67,6 +67,13 @@ docker run -d --name astraeus \
 Publishing on `127.0.0.1` and putting a reverse proxy in front is the intended
 shape; `-p 8642:8642` publishes it to every interface, which without
 `--auth-mode` hands anyone who can reach the port the whole library.
+
+**Which gate mode you choose changes what "per viewer" means.** Playback progress
+is keyed on the identity the gate attaches, so `--auth-mode proxy` (Tailscale or
+Cloudflare Access forwarding an identity header) gives each person their own
+place. `--auth-mode token` reports every API client as `token`, which is right
+for a script and means they share one place; `none` has a single `local` viewer
+and is the correct choice only where there is one viewer.
 
 **Hardware acceleration.** A container does not see the GPU unless it is passed
 in: add `--device /dev/dri` for VAAPI, and the container's ffmpeg must be able to
@@ -157,17 +164,26 @@ sqlite3 /var/lib/astraeus/astraeus.db ".backup /var/backups/astraeus-$(date +%F)
 ```
 
 Schema migrations live in the binary and run at startup; a database written by an
-older build is upgraded in place, and the server keeps a
-`*.db.bak-preupgrade` copy the first time it does. Upgrading is: replace the
-binary and the `web` directory, restart. Nothing under `/var/cache` needs to be
-preserved.
+older build is upgraded in place. **The server does not keep a backup before it
+does**, so take one first if the database matters — the command above is the one
+to run. Upgrading is then: replace the binary and the `web` directory, restart.
+Nothing under `/var/cache` needs to be preserved.
+
+One upgrade changes shape rather than adding tables: playback progress became
+per viewer, which SQLite cannot do in place, so the table is rebuilt in a
+transaction and the rows written before it are kept under the single `local`
+viewer. Nothing is lost, but a viewer who used to resume through an identity-aware
+gate will not find those older positions under their own identity, because the
+identity that wrote them was never recorded.
 
 ---
 
 ## Not covered yet
 
 - **TLS.** Put Caddy, nginx or Tailscale in front; the server speaks plain HTTP.
-- **Multiple users or per-user libraries.** The gate is instance-wide.
+- **Multiple users or per-user libraries.** The gate is instance-wide: it decides
+  whether a request is admitted, not what it may see, so every admitted user sees
+  the whole library. Playback progress is per viewer, but access is not.
 - **Kubernetes manifests, Windows or macOS packaging.**
 - **CI.** The workflow in `.github/workflows/ci.yml` runs the same checks that
   pass locally, but the repository has no remote yet, so it has never executed on

@@ -419,7 +419,7 @@ func TestPlaybackProgress(t *testing.T) {
 	entity := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Arrival (2016)")
 
 	// Nothing played yet is not an error, and not a row.
-	progress, err := repo.GetProgress(ctx, entity.ID)
+	progress, err := repo.GetProgress(ctx, library.DefaultViewerID, entity.ID)
 	if err != nil {
 		t.Fatalf("GetProgress on an unplayed entity: %v", err)
 	}
@@ -432,7 +432,7 @@ func TestPlaybackProgress(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("SaveProgress: %v", err)
 	}
-	progress, err = repo.GetProgress(ctx, entity.ID)
+	progress, err = repo.GetProgress(ctx, library.DefaultViewerID, entity.ID)
 	if err != nil {
 		t.Fatalf("GetProgress: %v", err)
 	}
@@ -450,7 +450,7 @@ func TestPlaybackProgress(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("SaveProgress (second report): %v", err)
 	}
-	progress, err = repo.GetProgress(ctx, entity.ID)
+	progress, err = repo.GetProgress(ctx, library.DefaultViewerID, entity.ID)
 	if err != nil {
 		t.Fatalf("GetProgress after the second report: %v", err)
 	}
@@ -459,10 +459,10 @@ func TestPlaybackProgress(t *testing.T) {
 	}
 
 	// Starting over forgets it entirely.
-	if err := repo.DeleteProgress(ctx, entity.ID); err != nil {
+	if err := repo.DeleteProgress(ctx, library.DefaultViewerID, entity.ID); err != nil {
 		t.Fatalf("DeleteProgress: %v", err)
 	}
-	if progress, err := repo.GetProgress(ctx, entity.ID); err != nil || progress != nil {
+	if progress, err := repo.GetProgress(ctx, library.DefaultViewerID, entity.ID); err != nil || progress != nil {
 		t.Errorf("after DeleteProgress: progress=%+v err=%v, want none", progress, err)
 	}
 }
@@ -524,7 +524,7 @@ func TestListProgress(t *testing.T) {
 	second := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Watched Later")
 	finished := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Finished")
 
-	if entries, err := repo.ListProgress(ctx, 0); err != nil || len(entries) != 0 {
+	if entries, err := repo.ListProgress(ctx, library.DefaultViewerID, 0); err != nil || len(entries) != 0 {
 		t.Fatalf("nothing played should list nothing, got %+v err=%v", entries, err)
 	}
 
@@ -546,13 +546,13 @@ func TestListProgress(t *testing.T) {
 	// A finished position is excluded even though the row exists, because the
 	// listing must apply the same rule the report path clears rows with.
 	if _, err := repo.db.ExecContext(ctx,
-		`INSERT INTO playback_progress (entity_id, position_seconds, duration_seconds, updated_at)
-		 VALUES (?, ?, ?, ?)`,
-		finished.ID, 599.0, 600.0, formatTime(time.Now())); err != nil {
+		`INSERT INTO playback_progress (viewer_id, entity_id, position_seconds, duration_seconds, updated_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		library.DefaultViewerID, finished.ID, 599.0, 600.0, formatTime(time.Now())); err != nil {
 		t.Fatalf("inserting a finished position: %v", err)
 	}
 
-	entries, err := repo.ListProgress(ctx, 0)
+	entries, err := repo.ListProgress(ctx, library.DefaultViewerID, 0)
 	if err != nil {
 		t.Fatalf("ListProgress: %v", err)
 	}
@@ -573,11 +573,193 @@ func TestListProgress(t *testing.T) {
 		t.Errorf("the joined entity is incomplete: %+v", entries[0].Entity)
 	}
 
-	limited, err := repo.ListProgress(ctx, 1)
+	limited, err := repo.ListProgress(ctx, library.DefaultViewerID, 1)
 	if err != nil {
 		t.Fatalf("ListProgress with a limit: %v", err)
 	}
 	if len(limited) != 1 || limited[0].Entity.ID != second.ID {
 		t.Errorf("limited listing = %+v, want just the most recent", limited)
+	}
+}
+
+// TestPlaybackProgress_IsPerViewer is the storage half of the per-viewer rule:
+// two viewers of one film hold two rows, and everything that touches progress
+// touches one viewer's.
+func TestPlaybackProgress_IsPerViewer(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	lib := mustCreateLibrary(t, repo, "Progress", library.MoviesLibrary)
+	entity := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Watched By Two People")
+
+	const alice, bob = "alice@example.com", "bob@example.com"
+
+	for viewer, position := range map[string]float64{alice: 100, bob: 200} {
+		if err := repo.SaveProgress(ctx, &library.PlaybackProgress{
+			ViewerID: viewer, EntityID: entity.ID, PositionSeconds: position, DurationSeconds: 600,
+		}); err != nil {
+			t.Fatalf("SaveProgress for %s: %v", viewer, err)
+		}
+	}
+
+	// Neither viewer's report moved the other's place.
+	for viewer, want := range map[string]float64{alice: 100, bob: 200} {
+		progress, err := repo.GetProgress(ctx, viewer, entity.ID)
+		if err != nil {
+			t.Fatalf("GetProgress for %s: %v", viewer, err)
+		}
+		if progress == nil || progress.PositionSeconds != want || progress.ViewerID != viewer {
+			t.Errorf("%s's progress = %+v, want %v owned by %s", viewer, progress, want, viewer)
+		}
+	}
+
+	// Re-reporting replaces that viewer's row rather than adding one.
+	if err := repo.SaveProgress(ctx, &library.PlaybackProgress{
+		ViewerID: alice, EntityID: entity.ID, PositionSeconds: 300, DurationSeconds: 600,
+	}); err != nil {
+		t.Fatalf("SaveProgress (second report): %v", err)
+	}
+	if progress, _ := repo.GetProgress(ctx, alice, entity.ID); progress.PositionSeconds != 300 {
+		t.Errorf("alice's second report did not replace her first: %+v", progress)
+	}
+	if progress, _ := repo.GetProgress(ctx, bob, entity.ID); progress.PositionSeconds != 200 {
+		t.Errorf("alice's second report moved bob: %+v", progress)
+	}
+
+	// The continue-watching listing is one viewer's question.
+	entries, err := repo.ListProgress(ctx, alice, 0)
+	if err != nil {
+		t.Fatalf("ListProgress: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Progress.PositionSeconds != 300 {
+		t.Errorf("alice's listing = %+v, want only her row", entries)
+	}
+
+	// Starting over clears the caller's row and leaves the other.
+	if err := repo.DeleteProgress(ctx, alice, entity.ID); err != nil {
+		t.Fatalf("DeleteProgress: %v", err)
+	}
+	if progress, _ := repo.GetProgress(ctx, bob, entity.ID); progress == nil {
+		t.Error("deleting alice's progress deleted bob's row too")
+	}
+	if entries, _ := repo.ListProgress(ctx, alice, 0); len(entries) != 0 {
+		t.Errorf("alice's listing after starting over = %+v, want none", entries)
+	}
+}
+
+// TestPlaybackProgress_EmptyViewerIsTheLocalOne pins the naming rule: a caller
+// with no identity reads and writes under the named default viewer, so an
+// ungated server has a viewer id rather than a nameless row.
+func TestPlaybackProgress_EmptyViewerIsTheLocalOne(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	lib := mustCreateLibrary(t, repo, "Progress", library.MoviesLibrary)
+	entity := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "A Local Film")
+
+	if err := repo.SaveProgress(ctx, &library.PlaybackProgress{
+		EntityID: entity.ID, PositionSeconds: 60, DurationSeconds: 600,
+	}); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+
+	progress, err := repo.GetProgress(ctx, library.DefaultViewerID, entity.ID)
+	if err != nil {
+		t.Fatalf("GetProgress: %v", err)
+	}
+	if progress == nil || progress.PositionSeconds != 60 {
+		t.Fatalf("the default viewer's progress = %+v, want the unnamed report", progress)
+	}
+	if progress.ViewerID != library.DefaultViewerID {
+		t.Errorf("stored viewer = %q, want %q", progress.ViewerID, library.DefaultViewerID)
+	}
+}
+
+// TestMigrate_WidensProgressToPerViewer is the regression test for the upgrade
+// path: a database whose playback_progress predates the viewer column keeps its
+// rows, claimed by the default viewer, and gains the wider key.
+func TestMigrate_WidensProgressToPerViewer(t *testing.T) {
+	t.Parallel()
+
+	db, err := sqlx.Connect("sqlite", DSN(filepath.Join(t.TempDir(), "progress-legacy.db")))
+	if err != nil {
+		t.Fatalf("connecting to legacy database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// The old table exactly as the previous version created it, with a row.
+	db.MustExec(`
+		CREATE TABLE media_entities (
+			id TEXT PRIMARY KEY,
+			library_id TEXT NOT NULL DEFAULT '',
+			parent_id TEXT,
+			type TEXT NOT NULL,
+			name TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			metadata TEXT
+		);
+		CREATE TABLE playback_progress (
+			entity_id TEXT PRIMARY KEY,
+			position_seconds REAL NOT NULL,
+			duration_seconds REAL NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL,
+			FOREIGN KEY (entity_id) REFERENCES media_entities(id) ON DELETE CASCADE
+		);
+	`)
+	db.MustExec(
+		`INSERT INTO media_entities (id, library_id, type, name, status, created_at, updated_at)
+		 VALUES (?, '', ?, ?, ?, ?, ?)`,
+		"entity-1", string(library.MovieEntity), "Half Watched",
+		string(library.StatusIncomplete), legacyTimestamp, legacyTimestamp)
+	db.MustExec(
+		`INSERT INTO playback_progress (entity_id, position_seconds, duration_seconds, updated_at)
+		 VALUES (?, ?, ?, ?)`,
+		"entity-1", 1234.0, 7000.0, legacyTimestamp)
+
+	repo := New(db)
+	ctx := context.Background()
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatalf("migrating the pre-viewer database: %v", err)
+	}
+
+	// The row survived and belongs to the single pre-viewer viewer.
+	progress, err := repo.GetProgress(ctx, library.DefaultViewerID, "entity-1")
+	if err != nil {
+		t.Fatalf("GetProgress after the rebuild: %v", err)
+	}
+	if progress == nil || progress.PositionSeconds != 1234 || progress.DurationSeconds != 7000 {
+		t.Fatalf("progress after the rebuild = %+v, want the old row kept", progress)
+	}
+
+	// And the key is now wide enough for a second viewer beside it.
+	if err := repo.SaveProgress(ctx, &library.PlaybackProgress{
+		ViewerID: "alice@example.com", EntityID: "entity-1", PositionSeconds: 10, DurationSeconds: 7000,
+	}); err != nil {
+		t.Fatalf("SaveProgress for a second viewer after the rebuild: %v", err)
+	}
+	if progress, _ := repo.GetProgress(ctx, library.DefaultViewerID, "entity-1"); progress.PositionSeconds != 1234 {
+		t.Errorf("the second viewer's report moved the first's: %+v", progress)
+	}
+
+	// The legacy table is gone, not left behind as a second copy.
+	var leftover int
+	if err := db.GetContext(ctx, &leftover,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'playback_progress_pre_viewer'`); err != nil {
+		t.Fatalf("looking for the pre-rebuild table: %v", err)
+	}
+	if leftover != 0 {
+		t.Error("the pre-viewer table was left behind by the rebuild")
+	}
+
+	// Running it again is a no-op rather than a second rebuild.
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatalf("re-running Migrate: %v", err)
+	}
+	if progress, _ := repo.GetProgress(ctx, library.DefaultViewerID, "entity-1"); progress == nil {
+		t.Error("the second Migrate lost the migrated row")
 	}
 }

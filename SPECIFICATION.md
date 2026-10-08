@@ -300,16 +300,19 @@ segmented streams — each is an ffmpeg process — and a refusal is a `429
 too_many_sessions`, while `DELETE /api/streams/{id}` stops one immediately
 rather than waiting for the idle reaper.
 
-The resumable positions are also a query - what is worth continuing, most
-recently watched first - so the stored state is discoverable rather than
-something a viewer has to remember their way back to.
+The resumable positions are also a query - one viewer's, most recently watched
+first - so the stored state is discoverable rather than something a viewer has to
+remember their way back to.
 
-Playback position is persisted per entity and resumable: a report replaces the
-stored position, a position in the closing 5% clears it because that entity is
-watched through, and progress is keyed by entity with a cascading delete so a
-pruned film cannot leave a bookmark behind. Per-user progress would key on the
-identity the access gate already attaches to each request; the storage does not
-assume there is only one viewer, the current gate simply does.
+Playback position is persisted per **viewer** and entity and resumable: a report
+replaces that viewer's stored position, a position in the closing 5% clears it
+because that viewer watched the entity through, and the row cascades when the
+entity is pruned, so a pruned film cannot leave a bookmark behind. The viewer is
+the identity the access gate attaches to the request; with no gate there is one
+viewer, named by the domain, and the gate's `token` mode names every API client
+the same, so per-viewer state is a `proxy`-mode property. No handler reads an
+identity header itself: the only source of a viewer is the context the verified
+gate fills, which is what stops one viewer from naming themselves another.
 
 Audio tracks are probed as a list and selected by stream index. Every audio
 decision follows the chosen track rather than the first one, and a file's own

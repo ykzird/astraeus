@@ -21,8 +21,9 @@ This document defines the ubiquitous language for the Spatial Media Environment 
 * **TranscodeJob**: A background task managed by the server to convert a `MediaObject` from its original format into a format that satisfies a `StreamSession`'s requirements. A `StreamSession` may be mediated by a `TranscodeJob` if the `MediaObject` cannot be played directly.
 
 ### Playback
-* **PlaybackProgress**: the position a `User` reached in a `LeafEntity`, recorded per entity so a `StreamSession` can resume there. A `LeafEntity` whose `PlaybackProgress` reaches the closing fraction of its duration is **Finished**, and its progress is cleared rather than kept.
+* **PlaybackProgress**: the position a `User` reached in a `LeafEntity`, recorded per user and entity so a `StreamSession` can resume there. A `LeafEntity` whose `PlaybackProgress` reaches the closing fraction of its duration is **Finished**, and its progress is cleared rather than kept.
 
 ### Access
 * **User**: An authenticated individual with access to the application.
 * **AccessPolicy**: The set of rules governing access to the application. Currently implemented as a global gate for the entire instance, determining whether a `User` can access the `Library`.
+* **Viewer**: The identity a `PlaybackProgress` belongs to. It is the identity the `AccessPolicy` attaches to a request; when the gate is disabled the instance has a single Viewer, named by the domain as the local viewer.
