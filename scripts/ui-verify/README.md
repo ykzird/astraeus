@@ -63,10 +63,17 @@ node real-media-verify.mjs    http://127.0.0.1:8810 <entityId> [timeoutSeconds]
   movement brings it back;
 - a seek past produced content and a quality switch both re-negotiate at the
   offset — playback resumes near where the viewer was, and the viewer's subtitle
-  choice survives the switch.
+  and audio choices survive the switch;
+- the audio menu appears when the entity really has more than one audio track,
+  and switching it keeps playing and resumes at the offset. When it is absent,
+  the harness asks the server how many tracks the entity has, so a control that
+  silently disappeared cannot pass for a film with one track.
 
-28 checks in total; the seek and quality-switch checks are skipped with a note
-when the session is `direct_play` and no quality menu is offered.
+Up to 32 checks; the count depends on the entity. A `direct_play` session has no
+quality menu, so the seek, quality and audio-switch checks are skipped with a
+note, and the audio-menu check is skipped for an entity with one audio track —
+which is why the menu's absence is asserted against the server's own track list
+rather than simply accepted.
 
 Controls are located semantically — a fullscreen control is whatever is
 labelled like one — so these checks survive renaming.
