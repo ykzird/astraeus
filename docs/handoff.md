@@ -1,15 +1,16 @@
 # Handoff
 
-**As of the round-13 work of 2026-10-09 — the documentation sweep and the cut of
-`v0.18.0`. 127 tracked files; `v0.17.0` is released and `v0.18.0` is the next tag,
-so the in-tree version is `dev`.** (`git log` names the commits. Round 12 ran the
-release workflow for real and started the systemd unit on a clean VM, finding two
-defects in the packaging and one in the release job, all since fixed (§6). Round
-13 removed the point-in-time reviews from the tree, narrowed the release archive
-to the pages a user actually needs, and made every relative link inside that
-archive resolve — `docs/development.md` and `web/vendor/icons.md` now point at
-`scripts/` on GitHub, because the archive ships the server and the pages but none
-of the development tooling. Round 11 was the documentation restructure, which
+**As of the round-13 work of 2026-10-09 — the documentation sweep, released as
+`v0.18.0`. 128 tracked files; `v0.17.0` and `v0.18.0` are released, so the
+in-tree version is `dev` and the next tag would be `v0.18.1`.** (`git log` names
+the commits. Round 12 ran the release workflow for real and started the systemd
+unit on a clean VM, finding two defects in the packaging and one in the release
+job, all since fixed (§6). Round 13 removed the point-in-time reviews from the
+tree, narrowed the release archive to the pages a user actually needs, and made
+every relative link inside that archive resolve — `docs/development.md` and
+`web/vendor/icons.md` now point at `scripts/` on GitHub, because the archive
+ships the server and the pages but none of the development tooling. Round 11 was
+the documentation restructure, which
 added §10 — a QEMU VM for the systemd unit and the release run. Round 10 was
 release automation and going public, which found a ladder defect the development
 host's ffmpeg had been hiding; round 9 made a quality choice cap a ladder; round
@@ -642,6 +643,16 @@ never existed, so nothing outside GHCR had been published under that number. A
 tag runs the workflow *as it stood at that tag's commit*, so a fix to the
 workflow cannot reach an already-pushed tag — the choice was to move it or to
 release the number again as `v0.17.1`.
+
+**`v0.18.0` is the second release** (round 13), cut from the documentation-sweep
+commit. Its run was green on the first attempt, including the publish job that
+failed on the first release: that fix held, and the version examples in the docs
+now name it. The release carries an archive whose `docs/` is exactly the five
+reference pages — no `handoff.md`, no reviews — and `scripts/check-doc-links.py`
+proved from CI that every relative link inside it resolves. The image is a
+multi-arch index over `linux/amd64` and `linux/arm64` with an SBOM and a
+provenance attestation per platform, and its labels carry `version=0.18.0` and
+`revision=4603d07`.
 
 **A quality choice that caps a ladder** landed as of 0.16.0, which fixes a
 negotiation model that was thinner than its field name. Until now
