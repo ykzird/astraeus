@@ -93,11 +93,10 @@ jobs:
         run: node --test web/*.test.js
 
       # deploy/README.md's systemd runbook is followed from an extracted release
-      # archive: it copies the project's documents into /usr/local/share/doc and
-      # installs the unit out of deploy/. That makes the archive's layout part of
-      # the release contract, and a tag is a late place to discover it broke.
-      # Build one for the runner's own platform and check every path the runbook
-      # names is inside, so a change that drops one fails here instead.
+      # archive: it copies the documents into /usr/local/share/doc and installs
+      # the unit out of deploy/. That makes the archive's layout part of the
+      # release contract, and a tag is a late place to discover it broke. Build
+      # one for the runner's own platform and check it here instead.
       - name: Check the release layout
         run: |
           scripts/build-release.sh 0.0.0-layout-check linux/amd64
@@ -107,10 +106,21 @@ jobs:
           layout="$(mktemp)"
           tar tzf "$archive" | sed 's|^[^/]*/||; s|/$||' | sort -u > "$layout"
           status=0
+          # Everything the runbook installs has to be there.
           for f in astraeus-server web README.md SPECIFICATION.md TODO.md \
                    CONTEXT.md CONTRIBUTING.md SECURITY.md LICENSE \
-                   THIRD_PARTY_NOTICES.md docs deploy deploy/astraeus.service; do
+                   THIRD_PARTY_NOTICES.md deploy deploy/astraeus.service \
+                   docs/index.md docs/playback.md docs/configuration.md \
+                   docs/api.md docs/development.md; do
             grep -qx "$f" "$layout" || { echo "missing from the release archive: $f"; status=1; }
+          done
+          # And the project's working documents must not be, or a release starts
+          # shipping an internal audit to people who only wanted a media server.
+          for f in docs/handoff.md docs/adversarial-review.md docs/review; do
+            if grep -qx "$f" "$layout"; then
+              echo "must not be in the release archive: $f"
+              status=1
+            fi
           done
           exit "$status"
 

@@ -28,4 +28,3 @@ running, or are about to.
 | Document | What it covers |
 | --- | --- |
 | [handoff.md](handoff.md) | Where the project is, written for whoever picks it up next — person or agent: working agreements, environment traps, how to verify each claim, and what is known to be unverified |
-| [adversarial-review.md](adversarial-review.md) | A point-in-time review of the codebase and its competition, with the raw reports in [review/](review/) |
