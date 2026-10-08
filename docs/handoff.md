@@ -1,11 +1,13 @@
 # Handoff
 
-**As of the round-7 work of 2026-10-08 — front-end unit tests. Version 0.14.0.
-107 tracked files.** (`git log` names the commits; the previous handoff was
-`ca241ab`, which added trace export. Round 5 was API rate limiting, round 4 image
-subtitles by burn-in, round 3 per-viewer progress, and round 2 HDR/Dolby Vision,
-packaging, the bitrate ceiling, the adaptive ladder, audio track selection,
-resumable playback, the continue-watching list and response hardening.)
+**As of the round-8 work of 2026-10-08 — OCR for PGS image subtitles. Version
+0.15.0. 114 tracked files.** (`git log` names the commits; the previous handoff
+was `7f18ac3`, which swept the docs and recorded where the harness compacts.
+Round 7 was front-end unit tests, round 6 trace export, round 5 API rate
+limiting, round 4 image subtitles by burn-in, round 3 per-viewer progress, and
+round 2 HDR/Dolby Vision, packaging, the bitrate ceiling, the adaptive ladder,
+audio track selection, resumable playback, the continue-watching list and
+response hardening.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -136,6 +138,20 @@ mise exec -- go test -v -run 'PerViewer|LocalOne|WidensProgress|UngatedServer|Fi
 mise exec -- go test -tags=integration -run BurnIn -v ./internal/streaming/
 mise exec -- go test -run 'BurnsAnImageSubtitle|DoesNotBurnATextSubtitle|BurnIndexThatDoesNotExist' ./internal/streaming/ ./internal/api/
 
+# OCR for PGS. The parser is unit-tested against a generated fixture, pixel for
+# pixel; the OCR path is integration-tagged and asserts the *words*, through real
+# ffmpeg and a real tesseract - it skips when tesseract is absent, and a separate
+# always-run unit test pins the refusal that an install without it keeps. The API
+# routing (image track -> ConvertImage, VobSub stays burn-only) is unit-tested.
+mise exec -- go test -count=1 -run 'ParsePGS|OCR|ConvertImage' ./internal/subtitles/
+mise exec -- go test -tags=integration -run OCR -v ./internal/subtitles/
+mise exec -- go test -run 'SubtitleEndpoint|AdvertisesImageTrack' ./internal/api/
+# And the whole path against a running server: an image track is advertised with
+# a URL and fetching it returns the recognised words.
+curl -s -X POST localhost:8921/api/entities/<id>/playback -H 'Content-Type: application/json' \
+  -d '{"subtitles":true,"containers":["matroska"],"video_codecs":["h264"],"audio_codecs":["aac"],"max_height":1080,"max_bit_depth":8}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["subtitles"])'
+
 # Rate limiting: the bucket's behaviour is unit-tested with an injected clock,
 # and the wiring is checked against the running binary - a burst is allowed, the
 # next call is a 429 with Retry-After, /api/health and the UI are untouched, and
@@ -170,12 +186,21 @@ docker rm -f astraeus-jaeger
 CDP_PORT=9413 timeout 200 node scripts/ui-verify/resume-verify.mjs http://127.0.0.1:8923 <directPlayEntityId> 30
 CDP_PORT=9413 timeout 200 node scripts/ui-verify/resume-verify.mjs http://127.0.0.1:8923 <segmentedEntityId> 30
 
-# Image subtitles in a real browser: the menu offers the image track, choosing it
-# re-negotiates with burn_subtitle_index, and the decision comes back with
-# burned_subtitle_index. Needs an entity with a PGS track; scripts/pgsgen and the
-# harness README build one. What is composited into the picture is the Go
-# integration test's job, not this harness's.
+# Image subtitles in a real browser, burn path: the menu offers the image track,
+# choosing it re-negotiates with burn_subtitle_index, and the decision comes back
+# with burned_subtitle_index. Needs an entity with a PGS track; scripts/pgsgen and
+# the harness README build one. This now needs a server with NO OCR engine,
+# because a track the server can read is offered as text instead: start it with
+# --tesseract-bin /nonexistent/tesseract. What is composited into the picture is
+# the Go integration test's job, not this harness's.
 CDP_PORT=9413 timeout 200 node scripts/ui-verify/burn-verify.mjs http://127.0.0.1:8924 <imageSubtitleEntityId>
+
+# Image subtitles in a real browser, OCR path: the menu offers the PGS track as an
+# ordinary track (no "(burned in)"), choosing it attaches a <track> with no
+# re-negotiation at all, and the caption on screen is the text the fixture drew.
+# Needs a server with tesseract and an entity whose PGS track carries letters
+# (scripts/pgsgen -text; the harness README has the recipe).
+CDP_PORT=9413 timeout 200 node scripts/ui-verify/ocr-verify.mjs http://127.0.0.1:8925 <imageSubtitleEntityId> "ASTRAEUS MEDIA"
 
 # The real thing, against the 17 GB film: a browser profile gets bt709/bt709,
 # an HDR manifest gets 10-bit bt2020/PQ. Copy real.db first; *.db is local state.
@@ -228,7 +253,7 @@ internal/library/naming pure filename/path rules — imports nothing
 internal/library/sqlite the SQLite adapter for that port, schema and migrations
 internal/metadata       provider interface, TMDB, mock, enrichment worker
 internal/streaming      capability negotiation, encoder selection, HLS sessions
-internal/subtitles      WebVTT extraction and caching
+internal/subtitles      WebVTT extraction and caching, a PGS decoder and OCR
 internal/images         artwork proxy and cache
 internal/access         the access gate
 internal/api            HTTP layer
@@ -377,6 +402,52 @@ Verified in a real browser against real 4K content in the round-2 work: 28/28
 chrome, 13/13 player, 10/10 subtitles. Full Go suite green with race and
 integration. Those numbers belong to that content: the bundled demo clips score
 lower on the auto-hide checks for fixture reasons (§8).
+
+**OCR for PGS image subtitles** landed as of 0.15.0, which turns the last
+picture-only subtitle format into text a browser can toggle, restyle and search.
+`internal/subtitles` gained a hand-written PGS decoder (`pgs.go`: PCS/ODS/PDS
+segments, run-length-encoded objects, the BT.709 YCbCr palette, fragments
+reassembled, palette-update display sets not mistaken for clears) and an OCR
+pipeline (`ocr.go`). An image track is demuxed to a raw `.sup` with ffmpeg, each
+cue's bitmap is composited over black and inverted — which keeps the light glyphs
+and drops the dark outline — and `tesseract --psm 6` reads it. The result is
+cached and served as WebVTT exactly like a text track.
+
+Three decisions carry the work. **The OCR engine is an optional runtime
+dependency, and its absence is not an error**: `OCRReady()` gates it, the track
+keeps its missing URL, the endpoint keeps the `415 subtitle_format_unsupported`
+it always returned, and startup logs "image_subtitles=burned in" with the reason.
+A unit test pins that refusal and the integration test skips when tesseract is
+absent. **Only PGS is read**: VobSub and DVB keep the refusal and the burn,
+because the `sup` muxer the extractor uses takes PGS only and advertising a track
+that then fails inside the extractor would be worse than not offering it. **The
+front end decides from the URL, not from `text`**: `subtitleDeliverable` and
+`subtitleNeedsBurn` are now pure functions in `web/core.js` with Node tests, so
+an image track the server has read is offered as an ordinary `<track>` and one it
+cannot read is still offered as "(burned in)".
+
+Verified at the artefact level, not the command line. The parser test decodes a
+generated fixture and compares the bitmap against the fixture's own index plane
+pixel for pixel. The integration test muxes a fixture carrying real letters into
+Matroska, runs the whole pipeline through real ffmpeg and a real tesseract, and
+asserts the WebVTT contains **"ASTRAEUS MEDIA"** — the words the fixture drew. A
+further unit test drives the "OCR found nothing" path with stub tools and pins
+`ErrNoCues`. The browser was checked both ways: `ocr-verify.mjs` is **10/10** on a
+server with tesseract (the image track is offered without "(burned in)", choosing
+it attaches a `<track>` with **zero** playback requests, and the active cue text
+on screen is the caption), and `burn-verify.mjs` is **10/10** on the same entity
+against a server started with `--tesseract-bin /nonexistent/tesseract`, so the
+burn fallback still works. `subtitle-verify.mjs` is **10/10** (text tracks
+unregressed) and `player-chrome-verify.mjs` is 20/21 on the demo clips, its
+documented auto-hide baseline for three-second fixtures.
+
+The fixture side had to grow: `internal/testfixtures/pgs` gained a 5x7 bitmap
+font and a `-text` mode in `scripts/pgsgen`, and its run-length encoder had a
+real bug — runs of one or two coloured pixels were written as a bare byte, which
+is not a valid run — found because the new test drove run lengths the rectangle
+fixture never reached. The glyph size is chosen for the recogniser rather than the
+eye (capitals about 28 pixels tall); at twice that the blocky font read "ASTRAEUS"
+as "ASTRAELS".
 
 **Front-end unit tests** landed as of 0.14.0, which closes the largest remaining
 untested surface. The player's timeline arithmetic — the source↔media time
@@ -565,8 +636,10 @@ Packaging landed after that, in the commits following `f489fa4`: a multi-stage
 `/api/health`, scans a mounted library read-only, and delivered direct play, an
 HDR tone map and an HDR remux *and* an HDR re-encode using the image's own
 **ffmpeg 5.1.9** (the host has 9.0, so this was a real second data point for the
-filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
-`systemd-analyze security`. See §8 for what that does *not* cover.
+filter chain). Round 8 added **tesseract** to the image and verified OCR there
+with its own **tesseract 5.3.0**: a mounted PGS fixture served WebVTT carrying
+the fixture's caption. The unit passes `systemd-analyze verify` and scores 1.6
+(OK) on `systemd-analyze security`. See §8 for what that does *not* cover.
 
 ---
 
@@ -574,19 +647,19 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **OCR for image subtitles, if the burn-in cost is unwanted.** A burn is exact
-   but needs a re-encode, cannot be toggled without one, and cannot be searched or
-   restyled. OCR (tesseract is already installed on the development host) would
-   deliver text that survives all three, at the cost of a runtime dependency and
-   OCR errors. `internal/testfixtures/pgs` and `scripts/pgsgen` now make the
-   fixture side of that work cheap; a PGS parser does not exist yet.
-2. **A ladder a client can pin the top of.** Today pinning a height means one
+1. **A ladder a client can pin the top of.** Today pinning a height means one
    rendition, so the quality menu caps quality rather than expressing a preference
    within a ladder — the negotiation model is thinner than it looks there. A burn
    deliberately pins one rendition, so the two interact.
-3. **Release automation and a TLS example.** Packaging landed (see §6), but
+2. **Release automation and a TLS example.** Packaging landed (see §6), but
    nothing is tagged or published, the CI workflow has never run, and there is no
    reverse-proxy configuration beside the unit.
+3. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
+   VobSub (or DVB) track keeps its refusal and its burn because it lives in a
+   different container with a different palette, and no such sample exists here.
+   This is the natural continuation of round 8 and is smaller than it was: the
+   pipeline, the routing and the fixture font all exist, so the work is one more
+   decoder plus a fixture. See the OCR bullet in §8 for what is unverified.
 4. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
    the gate remains instance-wide: it admits a request, it does not decide what
    the request may see, so every admitted viewer sees the whole library.
@@ -632,12 +705,14 @@ Priority order, with the reasoning. Take it top-down.
   the point of the policy, but it means a front-end change that adds one will
   fail verification rather than merely being flagged.
 - **Only `web/core.js` has unit tests; the rest of the UI is still covered by
-  hand-run browser harnesses.** The testable seam stopped at the pure timeline
-  arithmetic. The render functions, the player controls and the burn-in menu have
-  no seam a Node test can reach, and the CDP harnesses that do cover them need
-  Chromium and a running server: they are run by hand on this host, are
-  Chromium-only (Firefox is not installed), and CI runs `node --test web/` but
-  not them.
+  hand-run browser harnesses.** The testable seam grew in round 8 — it now also
+  holds the subtitle-track classification (`subtitleDeliverable`,
+  `subtitleNeedsBurn`), which is what decides whether an image track is offered
+  as a `<track>` or as a burn — but the render functions, the player controls and
+  the menu nodes themselves have no seam a Node test can reach, and the CDP
+  harnesses that do cover them need Chromium and a running server: they are run
+  by hand on this host, are Chromium-only (Firefox is not installed), and CI runs
+  `node --test web/` but not them.
 - **Tracing is verified for traces over OTLP/HTTP against one backend.** The
   encoder was accepted by Jaeger all-in-one (pulled and run here), but no other
   OTLP backend has been tried, and only the attribute types this code emits were
@@ -674,6 +749,35 @@ Priority order, with the reasoning. Take it top-down.
   segment well inside it. The burn path does not depend on that, but a test that
   asserted exact cue boundaries would fail for a reason that is the fixture's, not
   the server's.
+- **OCR is verified against handwritten fixtures, not real disc subtitles.** The
+  PGS reader was written from the format's own field layout, and the only streams
+  it has decoded are the ones `internal/testfixtures/pgs` writes. The fixture
+  carries one object per cue, one palette, no cropping, no partial-object updates
+  and no epoch reuse; a real Blu-ray subtitle brings all of those, plus
+  anti-aliased edges and a black outline. ffmpeg's decoder agreeing with the
+  fixture (checked by overlaying the fixture on black and reading it with
+  tesseract) is evidence the fixture is well-formed, not evidence the reader
+  handles a real disc. The reader ignores window definitions and treats any
+  display set with no composition objects as a clear unless it is a palette
+  update; that is right for the fixture and probably right for a disc, but it is
+  reasoning rather than observation.
+- **Recognition can be wrong, and the fixture was tuned until it was not.** The
+  integration test asserts the exact caption because the fixture's glyph size was
+  chosen so tesseract reads it; at a different size the same font read
+  "ASTRAEUS" as "ASTRAELS", so OCR accuracy is a property of the picture, not a
+  guarantee. A bitmap that is not text can be read as some — a solid rectangle
+  came back as a mark — which means a PGS track of a shape may yield a spurious
+  cue rather than none. The words OCR produces should be treated as approximate.
+- **OCR covers PGS only**, and the extraction step is PGS-specific: it copies the
+  stream with `-f sup`, which the `sup` muxer accepts only for
+  `hdmv_pgs_subtitle`. VobSub (`dvd_subtitle`) and DVB subtitles therefore keep
+  the `415` refusal and the burn, even with an engine installed, and no VobSub
+  sample exists on this host to change that. `--ocr-language` is passed through
+  to tesseract but only `eng` is installed here, and no non-English caption has
+  been recognised.
+- **The OCR path has not been exercised with a hardware encoder or a ladder**,
+  for the same reason the burn path has not: the burn and the OCR path both apply
+  to the single-rendition case, and only software encoders exist on this host.
 - **Progress is per viewer, but the viewer is only as real as the gate.** In
   `proxy` mode it is a forwarded identity and two people keep separate places; in
   `token` mode the gate names every API client `token`, so those clients share

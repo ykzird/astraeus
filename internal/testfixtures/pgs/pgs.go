@@ -37,9 +37,47 @@ type Cue struct {
 	Height int
 }
 
+// BitmapCue is one cue whose object carries an explicit indexed bitmap rather
+// than a solid rectangle. It is what a text fixture needs: the OCR work can
+// only be verified against a picture that actually contains letters.
+type BitmapCue struct {
+	// StartMS and EndMS are in milliseconds of presentation time.
+	StartMS int
+	EndMS   int
+	// X and Y are the object's position in the video's frame.
+	X int
+	Y int
+	// Width and Height are the bitmap's size.
+	Width  int
+	Height int
+	// Indexes selects a palette entry per pixel, row major, Width*Height long.
+	// Entry 0 is transparent and entries 1-3 are opaque white, so a fixture
+	// that wants visible ink sets 1 and everything else 0.
+	Indexes []byte
+}
+
 // Subtitle renders a .sup for a video of the given size, with one display set
 // showing each cue and an empty display set clearing it at the cue's end.
 func Subtitle(videoWidth, videoHeight int, cues []Cue) []byte {
+	bitmaps := make([]BitmapCue, 0, len(cues))
+	for _, cue := range cues {
+		indexes := make([]byte, cue.Width*cue.Height)
+		for i := range indexes {
+			indexes[i] = 1
+		}
+		bitmaps = append(bitmaps, BitmapCue{
+			StartMS: cue.StartMS, EndMS: cue.EndMS,
+			X: cue.X, Y: cue.Y, Width: cue.Width, Height: cue.Height,
+			Indexes: indexes,
+		})
+	}
+	return Bitmaps(videoWidth, videoHeight, bitmaps)
+}
+
+// Bitmaps renders a .sup for a video of the given size from explicit bitmaps,
+// with one display set showing each cue and an empty display set clearing it at
+// the cue's end. Subtitle is this function with a solid rectangle per cue.
+func Bitmaps(videoWidth, videoHeight int, cues []BitmapCue) []byte {
 	var out []byte
 	composition := uint16(0)
 	for _, cue := range cues {
@@ -66,7 +104,7 @@ func segment(segmentType byte, pts uint32, payload []byte) []byte {
 
 // displaySet writes the five segments of one presentation. A set with no object
 // clears the screen, which is how a cue ends.
-func displaySet(pts uint32, videoWidth, videoHeight int, composition uint16, cue Cue, withObject bool) []byte {
+func displaySet(pts uint32, videoWidth, videoHeight int, composition uint16, cue BitmapCue, withObject bool) []byte {
 	out := segment(segPCS, pts, pcs(videoWidth, videoHeight, composition, cue, withObject))
 	if withObject {
 		out = append(out, segment(segWDS, pts, wds(cue))...)
@@ -76,7 +114,7 @@ func displaySet(pts uint32, videoWidth, videoHeight int, composition uint16, cue
 	return append(out, segment(segEND, pts, nil)...)
 }
 
-func pcs(videoWidth, videoHeight int, composition uint16, cue Cue, withObject bool) []byte {
+func pcs(videoWidth, videoHeight int, composition uint16, cue BitmapCue, withObject bool) []byte {
 	out := binary.BigEndian.AppendUint16(nil, uint16(videoWidth))
 	out = binary.BigEndian.AppendUint16(out, uint16(videoHeight))
 	out = append(out, 0x10) // 25 fps
@@ -93,7 +131,7 @@ func pcs(videoWidth, videoHeight int, composition uint16, cue Cue, withObject bo
 	return out
 }
 
-func wds(cue Cue) []byte {
+func wds(cue BitmapCue) []byte {
 	out := []byte{0x01, 0x00} // one window, id 0
 	out = binary.BigEndian.AppendUint16(out, uint16(cue.X))
 	out = binary.BigEndian.AppendUint16(out, uint16(cue.Y))
@@ -113,11 +151,19 @@ func pds() []byte {
 	return out
 }
 
-func ods(cue Cue) []byte {
+func ods(cue BitmapCue) []byte {
 	data := binary.BigEndian.AppendUint16(nil, uint16(cue.Width))
 	data = binary.BigEndian.AppendUint16(data, uint16(cue.Height))
 	for line := 0; line < cue.Height; line++ {
-		data = append(data, run(1, cue.Width)...)
+		row := cue.Indexes[line*cue.Width : (line+1)*cue.Width]
+		for start := 0; start < len(row); {
+			end := start + 1
+			for end < len(row) && row[end] == row[start] {
+				end++
+			}
+			data = append(data, run(row[start], end-start)...)
+			start = end
+		}
 		data = append(data, 0x00, 0x00) // end of line
 	}
 
@@ -127,10 +173,11 @@ func ods(cue Cue) []byte {
 	return append(out, data...)
 }
 
-// run encodes one run of n pixels of a palette index. Runs above two pixels use
-// the control forms; one or two are written as literals, which is what the
-// format's own encoders do. A zero low byte with a zero colour is the
-// end-of-line marker, so a run never encodes a zero count.
+// run encodes one run of n pixels of a palette index. A zero index uses the
+// two transparent forms; any other index uses a coloured form. A run of one or
+// two pixels uses the format's shortest coloured form - a count byte and a
+// colour byte - which is what its own encoders write and which is otherwise
+// never exercised.
 func run(color byte, n int) []byte {
 	var out []byte
 	for n > 0 {
@@ -139,16 +186,12 @@ func run(color byte, n int) []byte {
 			chunk = 16383
 		}
 		switch {
+		case color == 0 && chunk <= 63:
+			out = append(out, 0x00, byte(chunk))
 		case color == 0:
-			if chunk <= 63 {
-				out = append(out, 0x00, byte(chunk))
-			} else {
-				out = append(out, 0x00, 0x40|byte(chunk>>8), byte(chunk))
-			}
+			out = append(out, 0x00, 0x40|byte(chunk>>8), byte(chunk))
 		case chunk <= 2:
-			for i := 0; i < chunk; i++ {
-				out = append(out, color)
-			}
+			out = append(out, byte(chunk), color)
 		case chunk <= 63:
 			out = append(out, 0x00, 0x80|byte(chunk), color)
 		default:

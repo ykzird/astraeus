@@ -27,10 +27,12 @@ jobs:
 
       # The integration tests are not mocks: they run ffmpeg and ffprobe and
       # assert the segments that come out, so the runner needs them installed.
-      - name: Install ffmpeg
+      # tesseract is optional to the server but not to the OCR test: without it
+      # that test skips, so installing it is what makes CI cover the path.
+      - name: Install ffmpeg and tesseract
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr
 
       # Formatting is a test here because this project has no other gate on it.
       - name: Check formatting

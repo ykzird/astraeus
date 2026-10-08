@@ -19,7 +19,9 @@ This document defines the ubiquitous language for the Spatial Media Environment 
 * **StreamSession**: An active, stateful connection between a client and the server for delivering a `MediaEntity`.
 * **ClientCapability**: A description of the client's technical capabilities (codecs, resolutions, protocols).
 * **TranscodeJob**: A background task managed by the server to convert a `MediaObject` from its original format into a format that satisfies a `StreamSession`'s requirements. A `StreamSession` may be mediated by a `TranscodeJob` if the `MediaObject` cannot be played directly.
-* **Burn-in**: Compositing an image-based subtitle (a `SubtitleTrack` with `Text` false) into the video, because a browser cannot render a timed bitmap as a subtitle track. A burn-in makes the `StreamSession` a single-rendition re-encode, and it is irreversible for that session.
+* **Burn-in**: Compositing an image-based subtitle (a `SubtitleTrack` with `Text` false) into the video, because a browser cannot render a timed bitmap as a subtitle track. A burn-in makes the `StreamSession` a single-rendition re-encode, and it is irreversible for that session. It is the fallback when OCR cannot read the track.
+* **OCR** (Optical Character Recognition): Reading the words out of an image `SubtitleTrack`'s bitmaps so the track can be delivered as WebVTT and toggled, restyled and searched like a text track. This server does it for PGS with an optional engine (tesseract); the engine's absence is not an error, it just leaves the track to Burn-in.
+* **Image subtitle**: A `SubtitleTrack` whose cues are pictures rather than text (PGS, VobSub), reported with `Text` false. PGS can be read by OCR; VobSub cannot and stays burn-only.
 
 ### Playback
 * **PlaybackProgress**: the position a `User` reached in a `LeafEntity`, recorded per user and entity so a `StreamSession` can resume there. A `LeafEntity` whose `PlaybackProgress` reaches the closing fraction of its duration is **Finished**, and its progress is cleared rather than kept.

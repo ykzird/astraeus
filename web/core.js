@@ -80,11 +80,34 @@
     };
   }
 
+  /**
+   * Whether the browser can show a subtitle track itself. The server hands out
+   * a URL for every track it can deliver as WebVTT - text tracks always, and
+   * image tracks too once it has read them - so a URL is the whole test.
+   */
+  function subtitleDeliverable(track) {
+    return !!track && typeof track.url === "string" && track.url.length > 0;
+  }
+
+  /**
+   * Whether an image-based track has no text path, so compositing it into the
+   * video is the only way to show it. `text === false` says the source carries
+   * pictures; the missing URL says the server cannot turn them into WebVTT.
+   * Both halves matter: a server with subtitle conversion switched off hands
+   * out no URL for text tracks either, and those would be refused rather than
+   * burned.
+   */
+  function subtitleNeedsBurn(track) {
+    return !!track && track.text === false && !subtitleDeliverable(track);
+  }
+
   return {
     formatClock: formatClock,
     mediaTime: mediaTime,
     pad2: pad2,
     producedWindow: producedWindow,
     sourceTime: sourceTime,
+    subtitleDeliverable: subtitleDeliverable,
+    subtitleNeedsBurn: subtitleNeedsBurn,
   };
 });

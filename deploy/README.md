@@ -4,10 +4,16 @@ Two supported shapes: a **container** (everything included, including ffmpeg) an
 a **systemd service** (a binary, ffmpeg from your distribution, and a unit file).
 Both run the same server; pick by how you already run things.
 
-Whatever you pick, three facts decide whether the install is sound:
+Whatever you pick, four facts decide whether the install is sound:
 
 - **ffmpeg and ffprobe are dependencies, not extras.** The server reports their
   absence at startup and refuses playback without them.
+- **tesseract is optional, and its absence changes behaviour rather than breaking
+  anything.** With it, image subtitle tracks (PGS) are read into text a browser
+  can toggle and search; without it they are offered as a burn-in instead, and
+  `/api/system/capabilities` reports `subtitle_ocr_enabled: false`. The container
+  image includes it; a systemd install can add it with
+  `apt-get install tesseract-ocr` (or the distribution's equivalent).
 - **`--auth-mode` defaults to `none`.** That is right for a trusted LAN and wrong
   for anything else. Both shapes below turn the gate on before anything is
   published.
@@ -19,7 +25,7 @@ Whatever you pick, three facts decide whether the install is sound:
 ## Container
 
 ```sh
-docker build -t astraeus-media:0.14.0 .
+docker build -t astraeus-media:0.15.0 .
 
 # The image's default command serves on :8642 with every writable path inside
 # /data. This one has no access gate, so keep it on loopback.
@@ -27,7 +33,7 @@ docker run -d --name astraeus \
   -p 127.0.0.1:8642:8642 \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.14.0
+  astraeus-media:0.15.0
 ```
 
 Flags are passed through the entrypoint, so the server's own options can be
@@ -57,7 +63,7 @@ docker run -d --name astraeus \
   -e ASTRAEUS_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.14.0 \
+  astraeus-media:0.15.0 \
   serve --addr 0.0.0.0:8642 --web-dir /app/web \
         --db /data/astraeus.db --stream-root /data/streams \
         --image-cache /data/images --subtitle-cache /data/subtitles \
@@ -102,6 +108,11 @@ were exercised with the image's own **ffmpeg 5.1.9** — direct play, an HDR sou
 tone mapped to 8-bit `bt709` for a browser profile, an HDR source remuxed at
 10-bit `bt2020`/`smpte2084` for a manifest declaring `supports_hdr`, and an HDR
 *re-encode* (forced by a downscale) at 10-bit `bt2020`/`smpte2084` as well.
+**OCR was verified in the image too**, with its own **tesseract 5.3.0**: startup
+logged `image_subtitles="read as text"`, `subtitle_ocr_enabled` was true, and a
+mounted PGS fixture served `/api/objects/{id}/subtitles/1.vtt` with the caption
+the fixture drew — a second data point beside the host's ffmpeg 9.0 and
+tesseract 5.5.3.
 
 ---
 

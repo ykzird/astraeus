@@ -1,5 +1,6 @@
 // Package subtitles extracts text subtitle tracks from media files as WebVTT,
-// which is the only subtitle format browsers render natively.
+// which is the only subtitle format browsers render natively. Image-based PGS
+// tracks are decoded and read into WebVTT too, with OCR.
 package subtitles
 
 import (
@@ -17,8 +18,8 @@ import (
 )
 
 // ErrUnsupportedFormat is returned for image-based subtitle formats (PGS,
-// VobSub), which carry pictures rather than text and would need optical
-// character recognition to become WebVTT.
+// VobSub) when nothing can turn their pictures into text. OCR makes PGS
+// readable, so this is what an install without an OCR engine still returns.
 var ErrUnsupportedFormat = errors.New("subtitle format is not text-based")
 
 // ErrNoCues is returned when a track produced an empty subtitle file.
@@ -28,6 +29,13 @@ var ErrNoCues = errors.New("subtitle track contained no cues")
 type Config struct {
 	// FFmpegBin is the ffmpeg executable.
 	FFmpegBin string
+	// TesseractBin is the OCR executable used for image-based subtitle tracks.
+	// It is optional: when it is missing the service still converts text
+	// tracks, and an image track keeps its refusal instead of failing.
+	TesseractBin string
+	// OCRLanguage is the tesseract language, e.g. "eng". Empty uses tesseract's
+	// own default.
+	OCRLanguage string
 	// CacheDir stores the extracted WebVTT files.
 	CacheDir string
 	// Timeout bounds a single extraction.
@@ -37,16 +45,21 @@ type Config struct {
 
 // Service extracts and caches WebVTT subtitles.
 type Service struct {
-	ffmpegBin string
-	cacheDir  string
-	timeout   time.Duration
-	logger    *slog.Logger
+	ffmpegBin    string
+	tesseractBin string
+	ocrLanguage  string
+	cacheDir     string
+	timeout      time.Duration
+	logger       *slog.Logger
 }
 
 // New creates a Service and prepares its cache directory.
 func New(cfg Config) (*Service, error) {
 	if cfg.FFmpegBin == "" {
 		cfg.FFmpegBin = "ffmpeg"
+	}
+	if cfg.TesseractBin == "" {
+		cfg.TesseractBin = "tesseract"
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 2 * time.Minute
@@ -62,10 +75,12 @@ func New(cfg Config) (*Service, error) {
 	}
 
 	return &Service{
-		ffmpegBin: cfg.FFmpegBin,
-		cacheDir:  cfg.CacheDir,
-		timeout:   cfg.Timeout,
-		logger:    cfg.Logger,
+		ffmpegBin:    cfg.FFmpegBin,
+		tesseractBin: cfg.TesseractBin,
+		ocrLanguage:  cfg.OCRLanguage,
+		cacheDir:     cfg.CacheDir,
+		timeout:      cfg.Timeout,
+		logger:       cfg.Logger,
 	}, nil
 }
 
@@ -158,11 +173,17 @@ func (s *Service) extract(ctx context.Context, mediaPath string, trackIndex int,
 
 // cacheKey derives a stable file name from the source identity and the track.
 func (s *Service) cacheKey(mediaPath string, info os.FileInfo, trackIndex int) string {
+	return s.cacheKeyFor(mediaPath, info, trackIndex, "text")
+}
+
+// cacheKeyFor folds the conversion mode into the key as well, so an OCR result
+// can never be served for a text extraction of the same track or the reverse.
+func (s *Service) cacheKeyFor(mediaPath string, info os.FileInfo, trackIndex int, mode string) string {
 	abs, err := filepath.Abs(mediaPath)
 	if err != nil {
 		abs = mediaPath
 	}
-	sum := sha256.Sum256(fmt.Appendf(nil, "%s\x00%d\x00%d\x00%d",
-		abs, info.Size(), info.ModTime().UnixNano(), trackIndex))
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s\x00%d\x00%d\x00%d\x00%s",
+		abs, info.Size(), info.ModTime().UnixNano(), trackIndex, mode))
 	return hex.EncodeToString(sum[:16])
 }

@@ -13,11 +13,17 @@ import (
 	"github.com/jok/astraeus-media/internal/subtitles"
 )
 
-// fakeConverter writes a canned WebVTT file instead of running ffmpeg.
+// fakeConverter writes a canned WebVTT file instead of running ffmpeg. It
+// records which entry point the handler chose, which is how the tests tell a
+// text extraction from an OCR pass, and it can claim or deny an OCR engine.
 type fakeConverter struct {
-	lastPath  string
-	lastTrack int
-	err       error
+	lastPath       string
+	lastTrack      int
+	lastImagePath  string
+	lastImageTrack int
+	imageErr       error
+	ocrReady       bool
+	err            error
 }
 
 func (f *fakeConverter) Convert(_ context.Context, mediaPath string, trackIndex int) (string, error) {
@@ -26,7 +32,23 @@ func (f *fakeConverter) Convert(_ context.Context, mediaPath string, trackIndex 
 	}
 	f.lastPath = mediaPath
 	f.lastTrack = trackIndex
+	return writeCannedVTT()
+}
 
+func (f *fakeConverter) ConvertImage(_ context.Context, mediaPath string, trackIndex int) (string, error) {
+	f.lastImagePath = mediaPath
+	f.lastImageTrack = trackIndex
+	if f.imageErr != nil {
+		return "", f.imageErr
+	}
+	return writeCannedVTT()
+}
+
+func (f *fakeConverter) OCRReady() bool { return f.ocrReady }
+
+// writeCannedVTT stands in for the conversion itself, so the tests can tell the
+// two entry points apart by which fields were set rather than by the output.
+func writeCannedVTT() (string, error) {
 	dir, err := os.MkdirTemp("", "astraeus-fake-subs")
 	if err != nil {
 		return "", err
@@ -109,6 +131,42 @@ func TestPlayback_AdvertisesDeliverableSubtitleTracks(t *testing.T) {
 	}
 }
 
+func TestPlayback_AdvertisesImageTrackURLsWhenOCRIsAvailable(t *testing.T) {
+	t.Parallel()
+
+	converter := &fakeConverter{ocrReady: true}
+	env := newTestEnv(t,
+		withProber(stubProber{info: subtitledInfo()}),
+		withStreams(&fakeStreams{}),
+		withSubtitles(converter))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "bytes")
+
+	recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback", "")
+	response := decodeBody[playbackResponse](t, recorder)
+
+	image := response.Subtitles[1]
+	// The source really is a picture, so `text` stays false; what changed is
+	// that the server can now hand the client words for it.
+	if image.Text {
+		t.Error("a PGS track must stay text: false even when OCR can read it")
+	}
+	if image.URL != "/api/objects/"+response.ObjectID+"/subtitles/3.vtt" {
+		t.Errorf("image track url = %q, want the OCR endpoint", image.URL)
+	}
+
+	// The advertised URL must actually serve WebVTT by the OCR path.
+	recorder = env.do(t, http.MethodGet, image.URL, "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("serving OCR subtitles: status = %d (body %s)", recorder.Code, recorder.Body.String())
+	}
+	if converter.lastImageTrack != 3 {
+		t.Errorf("OCR ran for track %d, want 3", converter.lastImageTrack)
+	}
+	if !strings.HasPrefix(recorder.Body.String(), "WEBVTT") {
+		t.Errorf("body is not WebVTT: %q", recorder.Body.String())
+	}
+}
+
 func TestPlayback_OmitsSubtitleURLsWithoutAConverter(t *testing.T) {
 	t.Parallel()
 
@@ -152,8 +210,117 @@ func TestSubtitleEndpoint_RejectsImageBasedTracks(t *testing.T) {
 	if code := decodeBody[errorBody](t, recorder).Code; code != "subtitle_format_unsupported" {
 		t.Errorf("error code = %q, want subtitle_format_unsupported", code)
 	}
+	if converter.lastTrack != 0 || converter.lastImageTrack != 0 {
+		t.Error("conversion must not be attempted for an image-based track without an OCR engine")
+	}
+}
+
+// TestSubtitleEndpoint_OCRsImageTracksWhenAvailable is the routing half of the
+// OCR work: an image track goes through ConvertImage rather than the text
+// extractor, and its words come back as a servable WebVTT track.
+func TestSubtitleEndpoint_OCRsImageTracksWhenAvailable(t *testing.T) {
+	t.Parallel()
+
+	converter := &fakeConverter{ocrReady: true}
+	env := newTestEnv(t,
+		withProber(stubProber{info: subtitledInfo()}),
+		withStreams(&fakeStreams{}),
+		withSubtitles(converter))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "bytes")
+	objects, err := env.repo.GetObjectsByEntity(context.Background(), entity.ID)
+	if err != nil {
+		t.Fatalf("getting objects: %v", err)
+	}
+
+	recorder := env.do(t, http.MethodGet, "/api/objects/"+objects[0].ID+"/subtitles/3.vtt", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/vtt") {
+		t.Errorf("content type = %q, want text/vtt", got)
+	}
+	if converter.lastImageTrack != 3 {
+		t.Errorf("OCR ran for track %d, want 3", converter.lastImageTrack)
+	}
 	if converter.lastTrack != 0 {
-		t.Error("conversion must not be attempted for an image-based track")
+		t.Error("the text extractor must not be used for an image track")
+	}
+}
+
+// TestSubtitleEndpoint_OCRRefusalStillMapsTo415 covers the race where the OCR
+// engine disappears between the capability check and the conversion: the
+// endpoint keeps the explicit refusal instead of reporting a server fault.
+func TestSubtitleEndpoint_OCRRefusalStillMapsTo415(t *testing.T) {
+	t.Parallel()
+
+	converter := &fakeConverter{ocrReady: true, imageErr: subtitles.ErrUnsupportedFormat}
+	env := newTestEnv(t,
+		withProber(stubProber{info: subtitledInfo()}),
+		withStreams(&fakeStreams{}),
+		withSubtitles(converter))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "bytes")
+	objects, err := env.repo.GetObjectsByEntity(context.Background(), entity.ID)
+	if err != nil {
+		t.Fatalf("getting objects: %v", err)
+	}
+
+	recorder := env.do(t, http.MethodGet, "/api/objects/"+objects[0].ID+"/subtitles/3.vtt", "")
+	if recorder.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	if code := decodeBody[errorBody](t, recorder).Code; code != "subtitle_format_unsupported" {
+		t.Errorf("error code = %q, want subtitle_format_unsupported", code)
+	}
+}
+
+// vobsubInfo is a media file whose only subtitle track is a VobSub image track.
+func vobsubInfo() *streaming.MediaInfo {
+	return &streaming.MediaInfo{
+		Container:  "matroska",
+		VideoCodec: "h264",
+		AudioCodec: "aac",
+		Subtitles: []streaming.SubtitleTrack{
+			{Index: 2, Codec: "dvd_subtitle", Language: "en", Text: false},
+		},
+	}
+}
+
+// TestSubtitleEndpoint_KeepsVobSubBurnOnly pins the boundary of the OCR work:
+// the reader decodes PGS, so a VobSub track must keep the old 415 and stay
+// without a URL even when an OCR engine is installed. Advertising it and then
+// failing inside the extractor would be worse than not offering it.
+func TestSubtitleEndpoint_KeepsVobSubBurnOnly(t *testing.T) {
+	t.Parallel()
+
+	converter := &fakeConverter{ocrReady: true}
+	env := newTestEnv(t,
+		withProber(stubProber{info: vobsubInfo()}),
+		withStreams(&fakeStreams{}),
+		withSubtitles(converter))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "bytes")
+
+	recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback", "")
+	response := decodeBody[playbackResponse](t, recorder)
+	if len(response.Subtitles) != 1 {
+		t.Fatalf("got %d subtitle tracks, want 1", len(response.Subtitles))
+	}
+	if response.Subtitles[0].URL != "" {
+		t.Errorf("VobSub track url = %q, want it withheld as burn-only", response.Subtitles[0].URL)
+	}
+
+	objects, err := env.repo.GetObjectsByEntity(context.Background(), entity.ID)
+	if err != nil {
+		t.Fatalf("getting objects: %v", err)
+	}
+	recorder = env.do(t, http.MethodGet, "/api/objects/"+objects[0].ID+"/subtitles/2.vtt", "")
+	if recorder.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	if code := decodeBody[errorBody](t, recorder).Code; code != "subtitle_format_unsupported" {
+		t.Errorf("error code = %q, want subtitle_format_unsupported", code)
+	}
+	if converter.lastImageTrack != 0 {
+		t.Error("OCR must not be attempted for a codec the reader cannot decode")
 	}
 }
 
@@ -293,13 +460,27 @@ func TestSystemCapabilitiesReportsSubtitles(t *testing.T) {
 
 	withConverter := newTestEnv(t, withSubtitles(&fakeConverter{}))
 	recorder := withConverter.do(t, http.MethodGet, "/api/system/capabilities", "")
-	if !decodeBody[systemCapabilitiesResponse](t, recorder).SubtitlesEnabled {
+	capabilities := decodeBody[systemCapabilitiesResponse](t, recorder)
+	if !capabilities.SubtitlesEnabled {
 		t.Error("subtitles_enabled = false, want true when a converter is configured")
+	}
+	if capabilities.SubtitleOCREnabled {
+		t.Error("subtitle_ocr_enabled = true, want false without an OCR engine")
+	}
+
+	withOCR := newTestEnv(t, withSubtitles(&fakeConverter{ocrReady: true}))
+	recorder = withOCR.do(t, http.MethodGet, "/api/system/capabilities", "")
+	if !decodeBody[systemCapabilitiesResponse](t, recorder).SubtitleOCREnabled {
+		t.Error("subtitle_ocr_enabled = false, want true with an OCR engine")
 	}
 
 	without := newTestEnv(t)
 	recorder = without.do(t, http.MethodGet, "/api/system/capabilities", "")
-	if decodeBody[systemCapabilitiesResponse](t, recorder).SubtitlesEnabled {
+	capabilities = decodeBody[systemCapabilitiesResponse](t, recorder)
+	if capabilities.SubtitlesEnabled {
 		t.Error("subtitles_enabled = true, want false without a converter")
+	}
+	if capabilities.SubtitleOCREnabled {
+		t.Error("subtitle_ocr_enabled = true, want false without a converter")
 	}
 }

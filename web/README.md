@@ -9,7 +9,7 @@ locally vendored assets (`vendor/hls.min.js` and the icon paths in `icons.js`).
 | `index.html` | The static shell: topbar + breadcrumbs, the three-column grid (nav / canvas / context), the error banner and the toast region. Every dynamic region is filled by `app.js`. |
 | `styles.css` | The whole visual language. CSS custom properties in `:root` separate the two systems: the **GLASS** tokens (`--glass-*`) for translucent blurred surfaces, and the **BRUTAL** tokens (`--brutal-*`, `--shadow-hard*`) for high-contrast tactile controls. |
 | `icons.js` | The icon registry (**generated**, not hand-edited): the 10 [BoxIcons](https://icon-sets.iconify.design/bx/) this UI uses, as frozen path data, plus `AstraeusIcons.icon(name)` returning an `<svg>`. Fetched from the Iconify API at authoring time and vendored — nothing is requested from a third-party origin at runtime. BoxIcons is MIT; regenerate with `node scripts/fetch-icons.mjs`. See `vendor/icons.md` for provenance and `../THIRD_PARTY_NOTICES.md` for the licence notices. |
-| `core.js` | The pure timeline maths and clock formatting — source↔media time, the produced window, `formatClock` — with no DOM, network or module state. Loaded before `app.js`, which reads it as `window.AstraeusCore`. |
+| `core.js` | The pure timeline maths, clock formatting and subtitle-track classification — source↔media time, the produced window, `formatClock`, `subtitleDeliverable`, `subtitleNeedsBurn` — with no DOM, network or module state. Loaded before `app.js`, which reads it as `window.AstraeusCore`. |
 | `core.test.js` | Unit tests for `core.js`, run with `node --test web/`. Node's own runner and asserts; no npm dependency. |
 | `app.js` | Hash router, API client with per-request timeouts, render functions for the navigation list, breadcrumbs, canvas and context panel, and the player (negotiation, overlay controls, fullscreen, seek binding, subtitles, delivery-decision reporting). |
 
@@ -85,12 +85,18 @@ server decides:
 Subtitle tracks returned by the playback endpoint are served as WebVTT
 (`text/vtt; charset=utf-8`) and attached to the player as `<track>` elements,
 which works on both the native and the MSE path. The player's subtitle menu
-offers an **Off** option plus one per deliverable track; image-based tracks
-(PGS/VobSub) have no URL and are shown disabled with the reason. Nothing is
-selected unless the server marks a track as default — and a choice the viewer
-made sticks: a quality change or a re-negotiating seek rebuilds the tracks from
-a fresh response, so the selection is carried across and only falls back to the
-server's default if that track is no longer there.
+offers an **Off** option plus one per track. A track with a URL is delivered as
+a `<track>` and toggles instantly — text tracks always, and a PGS image track
+too once the server has read it into text. An image track the server *cannot*
+deliver has no URL; it is offered anyway, labelled "(burned in)", and choosing it
+re-negotiates a session that composites the bitmap into the picture. The two
+predicates that decide which case applies — `subtitleDeliverable` and
+`subtitleNeedsBurn` — are pure functions in `core.js`, so `core.test.js` covers
+them without a browser. Nothing is selected unless the server marks a track as
+default — and a choice the viewer made sticks: a quality change or a
+re-negotiating seek rebuilds the tracks from a fresh response, so the selection
+is carried across and only falls back to the server's default if that track is
+no longer there.
 
 A refused autoplay is **not** an error. Every `play()` here happens after an
 `await`, outside the user-gesture task, so a blocked start is the common case:

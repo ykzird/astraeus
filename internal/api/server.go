@@ -51,6 +51,14 @@ type StreamManager interface {
 // handler tests do not need ffmpeg.
 type SubtitleConverter interface {
 	Convert(ctx context.Context, mediaPath string, trackIndex int) (string, error)
+	// ConvertImage renders an image-based track (PGS) as WebVTT by reading the
+	// text out of its bitmaps. Without an OCR engine it returns
+	// subtitles.ErrUnsupportedFormat, which the handler answers as it always
+	// did rather than as a server fault.
+	ConvertImage(ctx context.Context, mediaPath string, trackIndex int) (string, error)
+	// OCRReady reports whether the OCR engine is installed, which decides
+	// whether an image track can be offered as text at all.
+	OCRReady() bool
 }
 
 // Deps are the collaborators the API server needs.
@@ -1132,8 +1140,12 @@ func (s *Server) subtitleResources(objectID string, tracks []streaming.SubtitleT
 			Forced:   track.Forced,
 			Text:     track.Text,
 		}
-		// Only advertise a URL when the track can actually be delivered.
-		if track.Text && s.subtitles != nil {
+		// Only advertise a URL when the track can actually be delivered: a text
+		// track always, and an image track only when an OCR engine is installed
+		// *and* the codec is one the reader understands. Otherwise the URL stays
+		// withheld and the client is offered a burn-in instead.
+		if s.subtitles != nil &&
+			(track.Text || (s.subtitles.OCRReady() && subtitles.OCRSupportsCodec(track.Codec))) {
 			resource.URL = "/api/objects/" + objectID + "/subtitles/" + strconv.Itoa(track.Index) + ".vtt"
 		}
 		resources = append(resources, resource)
@@ -1167,7 +1179,9 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Confirm the track exists and is text-based before invoking ffmpeg.
+	// Confirm the track exists, and route an image-based one through OCR when
+	// this server can do it.
+	imageBased := false
 	if s.prober != nil {
 		info, err := s.prober.Probe(r.Context(), object.FilePath)
 		if err != nil {
@@ -1183,14 +1197,32 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !track.Text {
-			writeError(w, http.StatusUnsupportedMediaType, "subtitle_format_unsupported",
-				"subtitle track "+indexPart+" is image-based ("+track.Codec+
-					") and would need optical character recognition to become text")
-			return
+			// An image track needs OCR to become text, and the reader only
+			// understands PGS. Anything else - no engine installed, or VobSub,
+			// which it cannot read - keeps the explicit 415 naming the format
+			// rather than failing inside the extractor.
+			if !s.subtitles.OCRReady() {
+				writeError(w, http.StatusUnsupportedMediaType, "subtitle_format_unsupported",
+					"subtitle track "+indexPart+" is image-based ("+track.Codec+
+						") and this server has no OCR engine installed to read it")
+				return
+			}
+			if !subtitles.OCRSupportsCodec(track.Codec) {
+				writeError(w, http.StatusUnsupportedMediaType, "subtitle_format_unsupported",
+					"subtitle track "+indexPart+" is image-based ("+track.Codec+
+						") and the OCR reader only understands PGS ("+track.Codec+" is burn-only)")
+				return
+			}
+			imageBased = true
 		}
 	}
 
-	path, err := s.subtitles.Convert(r.Context(), object.FilePath, trackIndex)
+	var path string
+	if imageBased {
+		path, err = s.subtitles.ConvertImage(r.Context(), object.FilePath, trackIndex)
+	} else {
+		path, err = s.subtitles.Convert(r.Context(), object.FilePath, trackIndex)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, subtitles.ErrNoCues):
@@ -1227,6 +1259,9 @@ type systemCapabilitiesResponse struct {
 	SegmentingEnabled  bool `json:"segmenting_enabled"`
 	ArtworkEnabled     bool `json:"artwork_enabled"`
 	SubtitlesEnabled   bool `json:"subtitles_enabled"`
+	// SubtitleOCREnabled reports whether an image-based track can be served as
+	// text. When it is false the client is offered a burn-in instead.
+	SubtitleOCREnabled bool `json:"subtitle_ocr_enabled"`
 }
 
 func (s *Server) handleSystemCapabilities(w http.ResponseWriter, _ *http.Request) {
@@ -1236,6 +1271,7 @@ func (s *Server) handleSystemCapabilities(w http.ResponseWriter, _ *http.Request
 		SegmentingEnabled:  s.streams != nil,
 		ArtworkEnabled:     s.images != nil,
 		SubtitlesEnabled:   s.subtitles != nil,
+		SubtitleOCREnabled: s.subtitles != nil && s.subtitles.OCRReady(),
 	})
 }
 

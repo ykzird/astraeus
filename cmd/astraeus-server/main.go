@@ -44,7 +44,7 @@ import (
 )
 
 // version is the build identifier reported by `astraeus-server version`.
-const version = "0.14.0"
+const version = "0.15.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -208,6 +208,10 @@ func runServe(args []string) error {
 		"upstream root for artwork images")
 	subtitleCache := fs.String("subtitle-cache", filepath.Join(os.TempDir(), "astraeus-subtitles"),
 		"directory caching subtitle tracks converted to WebVTT")
+	tesseractBin := fs.String("tesseract-bin", "tesseract",
+		"OCR executable used to read image subtitles (PGS) into text; a missing one leaves them burn-only")
+	ocrLanguage := fs.String("ocr-language", "",
+		"language passed to the OCR executable, for example eng; empty uses its own default")
 
 	authMode := fs.String("auth-mode", string(access.ModeNone),
 		"access gate: none, proxy (trust an identity header from the access proxy) or token")
@@ -401,16 +405,28 @@ func runServe(args []string) error {
 		go manager.ReapLoop(ctx)
 
 		// Subtitles need ffmpeg, so they are only offered when it is present.
+		// OCR is a second, optional dependency: without it image tracks keep
+		// their burn-in path, and this is said at startup rather than
+		// discovered when a client asks for one.
 		subtitleService, err := subtitles.New(subtitles.Config{
-			FFmpegBin: *ffmpegBin,
-			CacheDir:  *subtitleCache,
-			Logger:    app.logger,
+			FFmpegBin:    *ffmpegBin,
+			TesseractBin: *tesseractBin,
+			OCRLanguage:  *ocrLanguage,
+			CacheDir:     *subtitleCache,
+			Logger:       app.logger,
 		})
 		if err != nil {
 			app.logger.Warn("subtitle conversion is disabled", "error", err)
 		} else {
 			deps.Subtitles = subtitleService
-			app.logger.Info("subtitle conversion enabled", "cache", *subtitleCache)
+			if subtitleService.OCRReady() {
+				app.logger.Info("subtitle conversion enabled",
+					"cache", *subtitleCache, "ocr", *tesseractBin, "image_subtitles", "read as text")
+			} else {
+				app.logger.Info("subtitle conversion enabled",
+					"cache", *subtitleCache, "image_subtitles", "burned in",
+					"reason", *tesseractBin+" is not installed")
+			}
 		}
 	} else {
 		app.logger.Warn("ffmpeg not found; only direct play will be available")

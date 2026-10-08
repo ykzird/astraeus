@@ -321,11 +321,26 @@ chosen track forces at least a remux, because direct play hands the player the
 whole file and the player would pick its own track; the picture is copied, so the
 cost is repackaging rather than re-encoding.
 
-Image-based subtitles (PGS, VobSub) are delivered by **burning them into the
-picture**. Text is not the only subtitle format, and a browser has no way to
-render a timed bitmap, so the only way to show one is to composite it into the
-video while re-encoding. A client asks for it with `burn_subtitle_index` on the
-playback request; the decision then reports `burned_subtitle_index`, forces a
+Image-based subtitles (PGS, VobSub) carry pictures rather than text, and a
+browser has no way to render a timed bitmap. Two delivery paths exist, and the
+server offers the better one it can actually perform.
+
+**OCR, for PGS, when an engine is installed.** `internal/subtitles` decodes the
+HDMV PGS stream (PCS/ODS/PDS segments, run-length-encoded objects, the YCbCr
+palette) into bitmaps, renders each cue as dark glyphs on a white page, and hands
+it to `tesseract`, whose output becomes the WebVTT body. The resulting track is
+delivered, cached and served exactly like a text track, so it can be toggled,
+restyled and searched and costs a fetch rather than a re-encode. The OCR engine
+is an **optional runtime dependency**: when it is absent the server keeps the
+previous behaviour - no URL is advertised for an image track and the endpoint
+answers `415 subtitle_format_unsupported` - rather than failing. The reader
+covers PGS only; VobSub and DVB subtitles live in different containers with
+different palettes and stay burn-only, and the refusal names the format rather
+than failing inside the extractor. `subtitle_ocr_enabled` in
+`/api/system/capabilities` reports the host's answer.
+
+**Burn-in, as the fallback.** A client asks for it with `burn_subtitle_index` on
+the playback request; the decision then reports `burned_subtitle_index`, forces a
 transcode, and pins one rendition, because the bitmap is composited once in one
 filter graph rather than per ladder rung. A text track named for burning is not
 burned - it is delivered as a selectable track, which is better in every way -
@@ -410,8 +425,11 @@ Three capabilities were added after the phases above were written:
     `ffmpeg` on demand, cached against the source file's size and modification
     time, and served at `/api/objects/{id}/subtitles/{track}.vtt`. The playback
     response lists every track and only advertises a URL for the ones that can
-    actually be delivered; image-based tracks (PGS, VobSub) are reported as
-    `text: false` and delivered by **burn-in** instead (§9.3): the picture is
+    actually be delivered. Text tracks always can; an image-based PGS track can
+    when an OCR engine is installed, in which case it is decoded by the PGS
+    reader in `internal/subtitles` and read by `tesseract` into WebVTT. An image
+    track with no text path - no engine, or a codec the reader does not decode
+    (VobSub, DVB) - is delivered by **burn-in** instead (§9.3): the picture is
     re-encoded with the bitmap composited into it. The subtitle is decoded from a
     second opening of the input, scaled to the picture with `scale2ref` so a
     downscaled re-encode places it correctly, and overlaid after the plan's own

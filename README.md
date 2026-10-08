@@ -30,7 +30,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | Adaptive bitrate | Done. A manifest that omits `max_height` gets a master playlist with up to three rungs, each with its own ceiling; naming a height gets one rendition |
 | HDR and Dolby Vision | Detected from the source's colour tags; **tone mapped to SDR** for clients that cannot show it, and passed through at 10 bits for those that can. Dolby Vision profile 8 keeps its HDR10 base layer; profile 5 is flagged as approximate |
 | Hardware acceleration | NVENC, QuickSync, VideoToolbox, VAAPI and AMF, each **verified by running it with the real options** at startup; rejected encoders report why; software fallback |
-| Subtitles | Done. Text tracks extracted to WebVTT, cached and served; image tracks (PGS, VobSub) burned into the picture on request |
+| Subtitles | Done. Text tracks extracted to WebVTT, cached and served; **PGS image tracks read into text by OCR** when tesseract is installed (toggleable and searchable), and burned into the picture otherwise; VobSub stays burn-only |
 | Observability | Done. The KPI registry is exposed in Prometheus format at `/metrics`, and traces can be exported over OTLP/HTTP (`--otel-endpoint`, opt-in) with `trace_id` on the request log line |
 | Web UI | Three-column spatial layout, served by the binary; HLS via a vendored hls.js; player controls overlaid on the video (transport, seek, subtitles, volume, quality, fullscreen) |
 | Authentication | Optional gate: trusted-proxy identity (Tailscale / Cloudflare Access) or a bearer token |
@@ -175,7 +175,9 @@ rather than failing the request when a working software path exists.
 `GET /api/system/capabilities` reports what survived that check, including the
 `video_encoders` and `audio_encoders` this host can actually offer, and
 `hdr_video_encoders`, which lists the encoders that also produced a **10-bit**
-stream — each with the pixel format it accepted.
+stream — each with the pixel format it accepted. `subtitle_ocr_enabled` reports
+whether image subtitles can be read into text on this host (see
+[Image subtitles](#image-subtitles)).
 
 ### HDR and dynamic range
 
@@ -258,7 +260,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.14.0`).
+identifier (currently `0.15.0`).
 
 `serve` flags that are easy to miss because they are named in the sections below
 rather than here:
@@ -272,6 +274,7 @@ rather than here:
 | `--segment-seconds` | 6 | HLS target segment duration |
 | `--max-sessions` | 8 | Concurrent segmented streams |
 | `--image-cache`, `--subtitle-cache` | temp | Artwork and WebVTT caches |
+| `--tesseract-bin`, `--ocr-language` | `tesseract`, tesseract's own | OCR of image subtitles; a missing binary leaves them burn-only |
 | `--tmdb-image-base` | TMDB's own root | Upstream artwork root |
 | `--enrich-interval`, `--scan-interval` | — | Background passes; `0` disables |
 | `--auth-mode`, `--auth-header`, `--trusted-proxy`, `--auth-token`, `--auth-exempt` | see [Access gate](#access-gate) | Gate configuration |
@@ -518,36 +521,63 @@ therefore offer the choice without probing anything itself.
 
 Text tracks are served to the browser as WebVTT. Image-based tracks (PGS, VobSub)
 carry pictures rather than text, so no browser can render one as a subtitle
-track; the only way to show them is to composite the bitmap into the video while
-re-encoding. `burn_subtitle_index` in the playback request names the ffmpeg
-stream index to burn in (`media_info.subtitles` reports each track, with
-`text: false` marking the image ones). The decision then carries
-`burned_subtitle_index`, forces a transcode and pins **one** rendition: the
-bitmap is composited once in a single filter graph, so a ladder would mean
-burning only one rung.
+track. There are two ways to show one, and the server chooses the better one it
+can actually do.
 
-The composite scales the subtitle to the picture with `scale2ref`, so a
-downscaled re-encode places and sizes it correctly, and it is applied *after* the
-plan's own filters — which is what makes it right for a tone map, since a
-subtitle bitmap is SDR white and must be laid over the finished SDR picture
-rather than converted with it. The subtitle is decoded from a second opening of
-the input, because asking one input for both the video and the subtitle stream in
-the same graph does not deliver subtitle frames.
+**OCR reads PGS into text.** When `tesseract` is installed (that is, when
+`subtitle_ocr_enabled` is true), an image track is advertised with a URL like a
+text track and served as WebVTT: the subtitle stream is demuxed with ffmpeg, the
+PGS bitmaps are decoded by `internal/subtitles`, each cue's picture is turned
+into dark glyphs on a white page, and tesseract returns the words. The result is
+an ordinary `<track>` — the viewer can toggle it, restyle it and search it, and
+switching it on costs nothing but a fetch. That is the whole point: a burn can do
+none of those things.
 
-Three honest limitations:
+The runtime dependency is treated as optional, not assumed. Without tesseract the
+server does not fail: it logs that image subtitles will be burned in, withholds
+the URL, and answers `GET /api/objects/{id}/subtitles/{track}.vtt` with the same
+`415 subtitle_format_unsupported` it always did. `--tesseract-bin` names the
+executable and `--ocr-language` passes a language (unset means tesseract's own
+default, which is `eng` when only the base package is installed).
 
-- **Burning is irreversible for the session.** Turning the subtitles off asks the
+**A burn is the fallback.** When there is no OCR engine, or the track is a codec
+the reader does not decode, `burn_subtitle_index` in the playback request names
+the ffmpeg stream index to composite into the video (`media_info.subtitles`
+reports each track, with `text: false` marking the image ones). The decision then
+carries `burned_subtitle_index`, forces a transcode and pins **one** rendition:
+the bitmap is composited once in a single filter graph, so a ladder would mean
+burning only one rung. The composite scales the subtitle to the picture with
+`scale2ref`, so a downscaled re-encode places and sizes it correctly, and it is
+applied *after* the plan's own filters — which is what makes it right for a tone
+map, since a subtitle bitmap is SDR white and must be laid over the finished SDR
+picture rather than converted with it. The subtitle is decoded from a second
+opening of the input, because asking one input for both the video and the
+subtitle stream in the same graph does not deliver subtitle frames.
+
+What OCR covers, honestly:
+
+- **PGS only.** The reader is an HDMV PGS decoder. VobSub (`dvd_subtitle`) and
+  DVB subtitles are different containers with different palettes; they keep the
+  `415` refusal and are offered as a burn, rather than being advertised and then
+  failing inside the extractor. The message names the format.
+- **It is OCR, so it can be wrong.** Recognition of a small or unusual font can
+  misread a word, and a picture that is not text can be read as some. The
+  fixtures are sized so the recogniser reads them exactly; a real disc's subtitles
+  have not been tried here.
+- **A burn is irreversible for the session.** Turning the subtitles off asks the
   server for a session without the burn, which is another re-encode, not a
-  toggle. The player does this at the current position.
+  toggle. The player does this at the current position. An OCR'd track turns off
+  instantly.
 - **A text track named for burning is not burned.** It is delivered as a
   selectable track instead — better in every way — and the reasons say so.
 - **A stream index the file does not have is a `400`** listing the tracks it
   does, and a text track named for burning is a `400` too, because that is a
   category error rather than an unsupported one.
 
-`internal/testfixtures/pgs` writes the PGS fixture the tests use, because no
+`internal/testfixtures/pgs` writes the PGS fixtures the tests use, because no
 image-subtitle sample ships with the project and ffmpeg cannot encode a bitmap
-subtitle from text; `scripts/pgsgen` exposes it for browser fixtures.
+subtitle from text; `scripts/pgsgen` exposes it for browser fixtures, and
+`-text` makes it draw real letters so the OCR path has something to read.
 
 ### Adaptive bitrate
 
@@ -730,6 +760,14 @@ go test -tags=integration ./...          # also runs real ffmpeg/ffprobe
 
 The integration tests generate their own clips, run ffprobe against them, and
 drive a real HLS session end to end. They skip themselves when ffmpeg is absent.
+The OCR path is one of them, and it skips when `tesseract` is absent rather than
+failing a host that does not have it:
+
+```sh
+# Decodes a handwritten PGS fixture and asserts the words it yields, through
+# real ffmpeg and a real tesseract.
+go test -tags=integration -run OCR ./internal/subtitles/
+```
 
 ```sh
 node --test web/                         # the front end's pure core
@@ -756,7 +794,7 @@ internal/library/naming/  pure filename and path rules (no dependencies)
 internal/library/sqlite/  the SQLite adapter for that port
 internal/metadata/      provider interface, TMDB client, mock, enrichment worker
 internal/streaming/     capability negotiation, probing, HLS session manager
-internal/subtitles/     WebVTT extraction and caching
+internal/subtitles/     WebVTT extraction and caching, a PGS decoder and OCR
 internal/testfixtures/pgs/  a PGS (.sup) writer for image-subtitle fixtures
 internal/images/        artwork proxy and cache
 internal/observability/ KPI registry and Prometheus exposition

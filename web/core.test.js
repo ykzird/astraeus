@@ -76,3 +76,24 @@ test("producedWindow is null when nothing is reachable", () => {
   assert.equal(core.producedWindow(null, 100), null);
   assert.equal(core.producedWindow(undefined, 100), null);
 });
+
+test("subtitleDeliverable needs a URL from the server", () => {
+  assert.equal(core.subtitleDeliverable({ index: 2, text: true, url: "/x.vtt" }), true);
+  assert.equal(core.subtitleDeliverable({ index: 2, text: true, url: "" }), false);
+  assert.equal(core.subtitleDeliverable({ index: 3, text: false }), false);
+  assert.equal(core.subtitleDeliverable(null), false);
+  assert.equal(core.subtitleDeliverable(undefined), false);
+});
+
+test("subtitleNeedsBurn is an image track the server could not read", () => {
+  // A PGS track with no URL: the only way to show it is a burn.
+  assert.equal(core.subtitleNeedsBurn({ index: 3, text: false }), true);
+  // The same track once the server has OCR'd it: a URL means <track>, no burn.
+  assert.equal(core.subtitleNeedsBurn({ index: 3, text: false, url: "/3.vtt" }), false);
+  // A text track is delivered as a track, URL or not.
+  assert.equal(core.subtitleNeedsBurn({ index: 2, text: true }), false);
+  assert.equal(core.subtitleNeedsBurn({ index: 2, text: true, url: "/2.vtt" }), false);
+  // "Off" is not a track.
+  assert.equal(core.subtitleNeedsBurn(null), false);
+  assert.equal(core.subtitleNeedsBurn(undefined), false);
+});

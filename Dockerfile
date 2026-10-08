@@ -31,11 +31,14 @@ FROM debian:bookworm-slim
 
 # ffmpeg is a hard dependency, not a convenience: without it the server can still
 # list a library but cannot probe a file, so it reports that at startup and
-# refuses playback. ca-certificates is for the TMDB metadata provider over HTTPS;
-# curl exists only for the container health check.
+# refuses playback. tesseract is the opposite - an optional one: with it, image
+# subtitle tracks (PGS) are read into text a browser can toggle and search;
+# without it they keep the burn-in path. It is included so the packaged server
+# offers the better of the two. ca-certificates is for the TMDB metadata provider
+# over HTTPS; curl exists only for the container health check.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        ffmpeg ca-certificates curl \
+        ffmpeg tesseract-ocr ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
 # A fixed uid so a bind-mounted volume can be owned predictably from the host.

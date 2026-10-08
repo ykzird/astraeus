@@ -29,6 +29,7 @@ node player-chrome-verify.mjs http://127.0.0.1:8810 <entityId>
 node real-media-verify.mjs    http://127.0.0.1:8810 <entityId> [timeoutSeconds]
 node resume-verify.mjs        http://127.0.0.1:8810 <entityId> [resumeSeconds]
 node burn-verify.mjs          http://127.0.0.1:8810 <imageSubtitleEntityId>
+node ocr-verify.mjs           http://127.0.0.1:8810 <imageSubtitleEntityId> [caption]
 ```
 
 `CDP_PORT` overrides the debugging port (default 9333).
@@ -131,6 +132,32 @@ response, because a repainted radio cannot distinguish a real re-negotiation fro
 a stuck menu. What is composited into the picture is asserted by the Go
 integration test instead — a browser cannot be asked what is baked into a frame.
 
+**It needs a server with no OCR engine**, because an image track the server can
+read is offered as an ordinary text track, not a burn. Point the server at a
+binary that does not exist to exercise the burn path:
+
+```sh
+./astraeus-server serve --db burn.db --web-dir web --addr 127.0.0.1:8810 \
+  --tesseract-bin /nonexistent/tesseract
+```
+
+`ocr-verify.mjs`
+
+- asks the server for `subtitle_ocr_enabled` first, and says so rather than
+  failing if the engine is not installed;
+- the entity really has an image subtitle track (`text: false`) according to the
+  server's own `subtitles[]`, and that track now carries a URL;
+- the menu offers it as an ordinary track — no "(burned in)" suffix;
+- choosing it attaches the served `<track>` and makes **no** playback request at
+  all, because there is nothing to re-encode;
+- the browser loads cues from the OCR output and the caption on screen contains
+  the text the fixture drew, which is the only place the recognised words can be
+  observed as a viewer would;
+- no console errors.
+
+It needs a server with tesseract installed, and an entity with a PGS track
+carrying real text (the `-text` fixture below).
+
 ## Notes
 
 The bundled demo clips are about three seconds long, so assertions are written
@@ -170,3 +197,22 @@ ffmpeg -i base.mp4 -i fixture.sup -map 0:v -map 1:s -c:v copy -c:s copy \
 
 A dark picture is deliberate: the fixture draws a white rectangle, so a burned
 segment is unmistakable in a frame.
+
+`ocr-verify.mjs` needs the same shape of entity, but with real letters in the
+track, which is what `-text` draws. The default glyph size is chosen for
+tesseract, so leave `-text-scale` alone unless the caption reads wrong:
+
+```sh
+go run ./scripts/pgsgen -text "ASTRAEUS MEDIA" -x 70 -y 150 \
+       -start-ms 500 -end-ms 55000 -out caption.sup
+ffmpeg -f lavfi -i "color=c=0x202020:s=640x360:r=15" -t 60 \
+       -c:v libx264 -preset ultrafast -pix_fmt yuv420p base.mp4
+ffmpeg -i base.mp4 -i caption.sup -map 0:v -map 1:s -c:v copy -c:s copy \
+       "OCR Subtitles (2026).mkv"
+./astraeus-server scan --db ocr.db --path "$PWD" --kind movies --name OCR
+```
+
+Run it against a server with tesseract (`--tesseract-bin` defaults to
+`tesseract`), and pass the caption if it is not the default above. The harness
+asserts the words the fixture drew; if the server's `subtitle_ocr_enabled` is
+false it stops and says so rather than reporting front-end failures.

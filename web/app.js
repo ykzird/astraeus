@@ -18,10 +18,14 @@
 (function () {
   "use strict";
 
-  /* The pure timeline maths and clock formatting live in core.js so they can be
-     unit-tested without a browser (web/core.test.js). Aliasing them here keeps
-     every call site below reading exactly as it did when they were local. */
-  const { formatClock, mediaTime, pad2, producedWindow, sourceTime } = window.AstraeusCore;
+  /* The pure timeline maths, clock formatting and subtitle track classification
+     live in core.js so they can be unit-tested without a browser
+     (web/core.test.js). Aliasing them here keeps every call site below reading
+     exactly as it did when they were local. */
+  const {
+    formatClock, mediaTime, pad2, producedWindow, sourceTime,
+    subtitleDeliverable, subtitleNeedsBurn,
+  } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */
 
@@ -1596,11 +1600,12 @@
 
     for (const sub of list) {
       const key = subtitleKey(sub);
-      /* An image track has no URL to hand a <track>, so the only way it can be
-         shown is burned into the picture. Offer it anyway and say so in the
-         label: the choice is real, it just costs a server-side re-encode rather
-         than an instant toggle. */
-      const label = subtitleBurnable(sub)
+      /* An image track with no URL has no way to reach a <track>, so the only
+         way it can be shown is burned into the picture. Offer it anyway and say
+         so in the label: the choice is real, it just costs a server-side
+         re-encode rather than an instant toggle. An image track the server has
+         read into text carries a URL and is offered like any other. */
+      const label = subtitleNeedsBurn(sub)
         ? subtitleLabel(sub) + " (burned in)"
         : subtitleLabel(sub);
       options.push(
@@ -2730,24 +2735,11 @@
     return String((sub && sub.language) || "") + ":" + String((sub && sub.label) || "");
   }
 
-  /** A track is deliverable only when the server handed us a URL for it. */
-  function subtitleDeliverable(sub) {
-    return !!sub && typeof sub.url === "string" && sub.url.length > 0;
-  }
-
-  /**
-   * Image-based tracks (PGS/VobSub) arrive without a URL because no browser can
-   * render them from a sidecar; a burn is the only way to show one. That makes
-   * them exactly the tracks `subtitleDeliverable` rejects.
-   */
-  /* An image track is one the server flagged `text: false`. It has no URL to
-     hand a <track>, so the only way it can be shown is burned into the picture -
-     which is why absence of a URL is *not* the test: a server with subtitle
-     conversion switched off also hands out no URLs, and those tracks are text
-     and would be refused rather than burned. */
-  function subtitleBurnable(sub) {
-    return !!sub && sub.text === false;
-  }
+  /* `subtitleDeliverable` and `subtitleNeedsBurn` come from core.js, where
+     web/core.test.js can reach them without a browser. Deliverable means the
+     server handed us a URL, so the browser can play it as a <track>;
+     needs-burn means the track is an image the server could not read, which is
+     the only case that costs a re-encode. */
 
   /** The server track the menu's key names, or null when it is gone. */
   function subtitleFor(pb, key) {
@@ -2871,7 +2863,7 @@
     /* The menu never produces an unknown key; treat one like the old guard. */
     if (next !== "off" && !track) return;
 
-    if (subtitleBurnable(track)) {
+    if (subtitleNeedsBurn(track)) {
       const index = Number(track.index);
       if (!isFinite(index) || index <= 0) return;
       if (!pb.url || pb.qualityBusy) return;
