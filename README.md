@@ -112,8 +112,9 @@ what stops a loop of playback requests from forking the host to death.
 Requesting one over the limit answers `429 too_many_sessions`. Session
 directories carry a `.astraeus-session` marker, and the reaper removes only
 marked directories, so a shared or mistyped `--stream-root` cannot lose data.
-`--device-dir` (default `/dev/dri`) is where hardware transcoding devices are
-looked for.
+`--device-dir` (default `/dev/dri`) is where a VAAPI render node is looked for.
+It is the only family that needs one: NVENC, QuickSync, VideoToolbox and AMF find
+their own devices, and each is verified by running it regardless (see below).
 
 ### Hardware acceleration
 
@@ -442,3 +443,7 @@ components and their notices are listed in
 An adversarial review of the codebase, its known gaps and the competitive
 landscape lives in [`docs/adversarial-review.md`](docs/adversarial-review.md),
 with the two detailed source reports alongside it in `docs/review/`.
+
+If you are picking this project up — architecture, the conventions that matter,
+how to verify, what is unverified, and the traps in this environment — start with
+[`docs/handoff.md`](docs/handoff.md).
