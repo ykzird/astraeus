@@ -1680,9 +1680,9 @@
         "Segmented delivery via " +
         engine +
         ". The server runs ffmpeg when playback starts and produces segments in order, so this" +
-        " stream is being generated while it plays: the seek bar covers only what has been" +
-        " produced so far and grows as more arrives. Seeking backwards is instant; seeking" +
-        " forward is limited to the produced part."
+        " stream is generated while it plays. Seeking within what has already been produced is" +
+        " instant; seeking further ahead restarts ffmpeg at that point, which takes a moment" +
+        " but reaches anywhere in the film."
       );
     }
     return (
@@ -3469,10 +3469,9 @@
    * Re-negotiate the current entity — a seek past what has been produced, or a
    * quality change — and carry on from where the viewer is.
    *
-   * The old session is torn down before the request goes out. There is no
-   * server endpoint to stop a streaming session, so dropping it is what tells
-   * the server nobody is watching: it stops being asked for segments and the
-   * reaper collects its ffmpeg once the session TTL expires.
+   * The old session is stopped before the request goes out, so its ffmpeg is
+   * not left encoding frames nobody will watch while the new one spins up.
+   * Any failure to stop it is ignored: the idle reaper is the backstop.
    */
   async function resumeSession(options) {
     const opts = options || {};

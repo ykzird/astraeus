@@ -7,6 +7,10 @@ hand. The two detailed source reports are kept alongside this one in `docs/revie
 code path myself, **[reported]** means it comes from a review pass and was not independently
 reproduced.
 
+> **Status note (added later).** Fix-list items 1–5 of §7 have been implemented, in commit
+> `8ff0b03`. The body below is preserved unchanged as the record of the state at the reviewed
+> commit, with the two detailed source reports alongside it in `docs/review/`.
+
 ---
 
 ## 1. Verdict

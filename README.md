@@ -25,7 +25,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | REST API | Done. Libraries, entities, scanning, enrichment, playback, artwork, subtitles |
 | Capability negotiation | Done. Direct play / remux / transcode, with reasons |
 | Segmented streaming | Done. HLS via ffmpeg, passthrough or transcode |
-| Hardware acceleration | Detected (QuickSync / VAAPI); software fallback |
+| Hardware acceleration | Verified at startup (QuickSync / VAAPI); software fallback |
 | Subtitles | Done. Text tracks extracted to WebVTT, cached and served |
 | Observability | Done. The KPI registry is exposed in Prometheus format at `/metrics` |
 | Web UI | Three-column spatial layout, served by the binary; HLS via a vendored hls.js |
@@ -37,14 +37,6 @@ served by the binary and plays both direct and segmented streams. Concretely:
 play when the codecs are ones it supports (typically mp4/H.264/AAC).
 
 `remux` and `transcode` produce **HLS**. Safari demuxes HLS natively; Chromium
-Astraeus Media is released under the [MIT Licence](LICENSE). An adversarial review of the
-codebase, its known gaps and the competitive landscape lives in
-[`docs/adversarial-review.md`](docs/adversarial-review.md).
-
-Astraeus Media is released under the [MIT Licence](LICENSE). Vendored
-third-party components and their notices are listed in
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-
 and Firefox do not, so the UI loads the vendored **hls.js** (MSE) for those
 browsers. See [`web/vendor/README.md`](web/vendor/README.md) for the pinned
 version, licence and provenance, and
@@ -52,9 +44,11 @@ version, licence and provenance, and
 must travel with any redistribution. No shipped page depends on a third-party origin
 at runtime.
 
-Seek behaviour on a segmented stream is limited by how far the transcoder has
-produced; the player reflects the growing seekable range rather than pretending
-the whole title is available.
+Seek behaviour on a segmented stream is not limited to what has been produced:
+the player's seek bar spans the whole film, and a seek beyond the produced
+window re-negotiates the session at that offset rather than clamping. The
+landing point is keyframe-aligned, so a resumed stream can begin a second or two
+earlier than requested.
 
 ## Requirements
 
@@ -103,12 +97,23 @@ Set `TMDB_API_KEY` (or pass `--tmdb-key`) to use real metadata. With a key, a
 title TMDB cannot find stays `Incomplete` so it shows up as work for an
 administrator, rather than being quietly filled in with a placeholder.
 
+The database is SQLite, opened with `busy_timeout(5000)`, `journal_mode(WAL)`,
+`synchronous(NORMAL)` and `foreign_keys(1)`. WAL means recent writes live in
+`<db>-wal` (with a `<db>-shm` index) until SQLite checkpoints them into the main
+file, so moving or backing up a library must copy all three files together — or
+stop the server first, which checkpoints on a clean shutdown. Copying `<db>`
+alone loses recent writes. Foreign keys are genuinely enforced, so an insert
+that would dangle is refused rather than stored silently.
+
 `--stream-root` controls where HLS session output is written (default:
 `$TMPDIR/astraeus-streams`) and `--max-sessions` (default `8`) caps how many
 segmented streams may run at once — each is an ffmpeg process, so the cap is
 what stops a loop of playback requests from forking the host to death.
-Requesting one over the limit answers `429 too_many_sessions`. `--device-dir` (default `/dev/dri`) is where
-hardware transcoding devices are looked for.
+Requesting one over the limit answers `429 too_many_sessions`. Session
+directories carry a `.astraeus-session` marker, and the reaper removes only
+marked directories, so a shared or mistyped `--stream-root` cannot lose data.
+`--device-dir` (default `/dev/dri`) is where hardware transcoding devices are
+looked for.
 
 ### Hardware acceleration
 
@@ -124,7 +129,8 @@ If a hardware encoder is chosen and still fails at runtime, the session is
 retried once in software and `astraeus_transcode_fallbacks_total` counts it,
 rather than failing the request when a working software path exists.
 
-`GET /api/system/capabilities` reports what survived that check.
+`GET /api/system/capabilities` reports what survived that check, including the
+`video_encoders` and `audio_encoders` this host can actually offer.
 
 ### Scanning
 
@@ -138,7 +144,8 @@ Pruning deletes data, so it refuses to run whenever the scan's view of the disk
 might be incomplete — if any path was unreadable, or if the scan found zero
 files while the library still holds entities, which is the shape of a drive
 that is not mounted. Silently emptying a library is far worse than leaving a
-ghost entry behind. `--scan-interval` (default `6h`,
+ghost entry behind. The returned `ScanResult` reports what was removed as
+`objects_pruned` and `entities_pruned`. `--scan-interval` (default `6h`,
 `0` disables) re-scans every library for new files; `--enrich-interval` does the
 same for metadata. `--image-cache` and `--subtitle-cache` place the artwork and
 WebVTT caches.
@@ -157,14 +164,16 @@ astraeus-server version
 ```
 
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
-`--log-level`, `--log-format`.
+`--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
+so it has to follow the subcommand. `astraeus-server version` prints the build
+identifier (currently `0.2.0`).
 
 ## HTTP API
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/api/health` | Liveness |
-| GET | `/api/system/capabilities` | ffmpeg/ffprobe presence, encoders, hardware path |
+| GET | `/api/system/capabilities` | ffmpeg/ffprobe presence, video and audio encoders, hardware path |
 | GET | `/api/libraries` | List libraries |
 | POST | `/api/libraries` | Register `{name, path, kind}` |
 | GET | `/api/libraries/{id}` | One library |
@@ -180,14 +189,14 @@ Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 | GET | `/api/objects/{id}/file` | The original file (range requests supported) |
 | GET | `/api/objects/{id}/subtitles/{track}.vtt` | One subtitle track as WebVTT |
 | GET | `/api/images/{size}/{file}` | Poster/backdrop artwork, proxied and cached |
-| GET | `/api/system/capabilities` | What this host can do |
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/hls/{session}/{file}` | Playlist and segments of a live session |
 
 Entity payloads also carry `poster_url` and `backdrop_url` pointing at the local
 image proxy, so a client never has to know the metadata provider's URL scheme.
 
-`size` must be one of TMDB's renditions (`w92` … `w1280`, `original`), and
+`size` must be one of the allow-listed TMDB renditions (`w45`, `w92`, `w154`,
+`w185`, `w300`, `w342`, `w500`, `w780`, `w1280`, `h632`, `original`), and
 `file` must be a bare image basename; anything else is rejected before it can
 reach either the cache or the upstream origin.
 
@@ -207,6 +216,8 @@ metric and absence-based alerting works.
 | `astraeus_scan_seconds`, `astraeus_scan_files_total`, `astraeus_scan_runs_total` | Scanning |
 | `astraeus_http_requests_total`, `astraeus_http_request_seconds` | HTTP |
 | `astraeus_stream_sessions_active`, `astraeus_probe_errors_total` | Operational |
+| `astraeus_transcode_fallbacks_total` | Hardware transcodes retried in software |
+| `astraeus_auth_granted_total`, `astraeus_auth_denied_total{reason}` | Access gate grants and denials |
 
 Errors are `{"code": "...", "message": "..."}` with a matching status code.
 
@@ -228,6 +239,11 @@ Errors are `{"code": "...", "message": "..."}` with a matching status code.
   "subtitles": true
 }
 ```
+
+The body may also carry `start_seconds`, the offset into the source at which the
+session should begin; the response echoes it back as `start_seconds` so a client
+can keep a continuous timeline across a seek or a quality change. A negative
+value, or one at or past the end of the media, is rejected with `400`.
 
 Omit the body to use the built-in browser profile, which caps at **1920x1080,
 8-bit, stereo**. Those three limits are not arbitrary: they are the ones a
@@ -363,3 +379,13 @@ scripts/make-demo-media.sh  generates a throwaway demo library
 
 The `library` package owns persistence behind a `Repository` interface, which is
 what allows SQLite today and PostgreSQL later without touching the domain code.
+
+## Licence
+
+Astraeus Media is released under the [MIT Licence](LICENSE). Vendored third-party
+components and their notices are listed in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+An adversarial review of the codebase, its known gaps and the competitive
+landscape lives in [`docs/adversarial-review.md`](docs/adversarial-review.md),
+with the two detailed source reports alongside it in `docs/review/`.

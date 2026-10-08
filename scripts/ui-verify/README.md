@@ -48,13 +48,25 @@ node real-media-verify.mjs    http://127.0.0.1:8810 <entityId> [timeoutSeconds]
 
 - the transport is overlaid on the video and there is exactly one play control,
   so the sidebar and the player cannot disagree;
-- the seek bar and a fullscreen control live inside the player container;
+- the seek bar and a fullscreen control live inside the player container, while
+  the context sidebar holds no transport controls;
+- the mute, volume and quality controls exist, the mute and volume controls
+  drive the element, and the volume choice is remembered;
+- every icon drawn in the player has real path data at a usable size, so a bad
+  registry key cannot hide as an empty square;
 - play/pause from the overlay and Space from the keyboard both drive the video;
 - fullscreen entries target the player container (not the bare `<video>`), the
-  bar is still on screen in fullscreen, and leaving fullscreen updates the
-  control rather than leaving it lying;
+  bar is still on screen in fullscreen, the control and its glyph follow the
+  state, and leaving fullscreen updates the control rather than leaving it
+  lying;
 - the bar auto-hides while playing, a hidden bar is not tabbable, and pointer
-  movement brings it back.
+  movement brings it back;
+- a seek past produced content and a quality switch both re-negotiate at the
+  offset — playback resumes near where the viewer was, and the viewer's subtitle
+  choice survives the switch.
+
+28 checks in total; the seek and quality-switch checks are skipped with a note
+when the session is `direct_play` and no quality menu is offered.
 
 Controls are located semantically — a fullscreen control is whatever is
 labelled like one — so these checks survive renaming.

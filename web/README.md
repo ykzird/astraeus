@@ -8,7 +8,7 @@ locally vendored assets (`vendor/hls.min.js` and the icon paths in `icons.js`).
 | --- | --- |
 | `index.html` | The static shell: topbar + breadcrumbs, the three-column grid (nav / canvas / context), the error banner and the toast region. Every dynamic region is filled by `app.js`. |
 | `styles.css` | The whole visual language. CSS custom properties in `:root` separate the two systems: the **GLASS** tokens (`--glass-*`) for translucent blurred surfaces, and the **BRUTAL** tokens (`--brutal-*`, `--shadow-hard*`) for high-contrast tactile controls. |
-| `icons.js` | The icon registry (**generated**, not hand-edited): the 8 [BoxIcons](https://icon-sets.iconify.design/bx/) this UI uses, as frozen path data, plus `AstraeusIcons.icon(name)` returning an `<svg>`. Fetched from the Iconify API at authoring time and vendored — nothing is requested from a third-party origin at runtime. BoxIcons is MIT; regenerate with `node scripts/fetch-icons.mjs`. See `vendor/icons.md` for provenance and `../THIRD_PARTY_NOTICES.md` for the licence notices. |
+| `icons.js` | The icon registry (**generated**, not hand-edited): the 10 [BoxIcons](https://icon-sets.iconify.design/bx/) this UI uses, as frozen path data, plus `AstraeusIcons.icon(name)` returning an `<svg>`. Fetched from the Iconify API at authoring time and vendored — nothing is requested from a third-party origin at runtime. BoxIcons is MIT; regenerate with `node scripts/fetch-icons.mjs`. See `vendor/icons.md` for provenance and `../THIRD_PARTY_NOTICES.md` for the licence notices. |
 | `app.js` | Hash router, API client with per-request timeouts, render functions for the navigation list, breadcrumbs, canvas and context panel, and the player (negotiation, overlay controls, fullscreen, seek binding, subtitles, delivery-decision reporting). |
 
 `app.js` is deliberately organised in numbered sections so the two halves — the
@@ -49,17 +49,18 @@ python3 -m http.server 8123
 ```
 
 To exercise the UI against real data, run the API and serve this directory from
-the same origin (the Go server does not mount a static handler yet — see
-"Known gaps"):
+the same origin — the Go server mounts it at `/` with `--web-dir`:
 
 ```sh
 # from the astraeus-media directory
-./astraeus-server serve --db astraeus.db --addr 127.0.0.1:8098 --enrich-interval 0
+./astraeus-server serve --db astraeus.db --web-dir web --addr 127.0.0.1:8098 --enrich-interval 0
 ```
 
 With a separate static server on another port the page still loads, but the
 `/api/…` calls fail and the UI reports that in the error banner instead of
-spinning forever.
+spinning forever. A list that failed to load is rendered as "Could not load
+…" with a **Retry** button rather than as an empty library, so a request
+failure can never be mistaken for the viewer's media being gone.
 
 ## Playback
 
@@ -74,7 +75,9 @@ server decides:
   `vendor/hls.min.js` (hls.js 1.7.3) over Media Source Extensions** and plays
   the playlist through it. The ~600 KB library is fetched on demand the first
   time a segmented stream is played and reused after that; it is deliberately
-  not a `<script>` tag in `index.html`.
+  not a `<script>` tag in `index.html`. The loader has a 15-second deadline, so
+  a stalled fetch cannot leave the player on a spinner forever, and a failed
+  load is retried on the next attempt rather than cached as a permanent failure.
 
 Subtitle tracks returned by the playback endpoint are served as WebVTT
 (`text/vtt; charset=utf-8`) and attached to the player as `<track>` elements,

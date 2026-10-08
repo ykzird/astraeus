@@ -34,7 +34,7 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Server capability detection: encoder list and QuickSync/VAAPI availability
 - [x] Subtitle tracks probed (codec, language, title, default/forced, text vs
       bitmap), text tracks extracted to WebVTT on demand and cached
-- [ ] Subtitle *rendering* in the player (track selection UI)
+- [x] Subtitle *rendering* in the player (track selection UI)
 - [ ] Multi-audio-track selection
 - [ ] Serving image-based subtitles (PGS/VobSub) — needs OCR or bitmap overlay
 - [ ] Bitrate-aware ABR ladder (currently a single target rendition)
@@ -68,8 +68,10 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Subtitle tracks rendered and selectable in the player, defaulting to Off
       unless the server marks a default; image-based tracks shown but disabled
 - [ ] Subtitle appearance controls (size, colour, background)
-- [ ] Poster/backdrop artwork: TMDB artwork is proxied and cached server-side;
-      the UI prefers `poster_url`/`backdrop_url` and falls back to generated art
+- [ ] Poster/backdrop artwork: TMDB artwork is proxied and cached server-side
+      and every entity payload carries `poster_url`/`backdrop_url`, but the UI
+      does not consume them yet — it only renders an absolute
+      `backdrop_path`/`poster_path` and otherwise falls back to generated art
 
 ## Known gaps
 
@@ -107,5 +109,7 @@ Status as of the current build. Evidence for each claim is the test suite
 - The hls.js fatal-error recovery path and the native-HLS (Safari) branch are
   implemented but have not been observed firing — no Safari was available, and a
   stream failure could not be forced on a live server.
-- OpenTelemetry tracing is not implemented; the KPI registry beyond the four
-  specified metrics is limited to HTTP, scanning and auth counters.
+- OpenTelemetry tracing is not implemented; beyond the four specified metrics,
+  the registry holds counters and histograms for HTTP, scanning, streaming
+  sessions, playback decisions, probe errors, transcoder fallbacks and the
+  access gate.
