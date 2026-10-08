@@ -364,7 +364,8 @@ playing in Chromium through those harnesses.
 
 ```
 cmd/astraeus-server/    CLI entry point and wiring
-internal/library/       domain model, scanner, repository, metadata providers
+internal/library/       domain model, scanner, repository
+internal/metadata/      provider interface, TMDB client, mock, enrichment worker
 internal/streaming/     capability negotiation, probing, HLS session manager
 internal/subtitles/     WebVTT extraction and caching
 internal/images/        artwork proxy and cache
@@ -377,8 +378,16 @@ scripts/ui-verify/      browser harnesses for playback and subtitles
 scripts/make-demo-media.sh  generates a throwaway demo library
 ```
 
-The `library` package owns persistence behind a `Repository` interface, which is
-what allows SQLite today and PostgreSQL later without touching the domain code.
+The `library` package owns the domain model and its persistence behind a
+`Repository` interface, which is what allows SQLite today and PostgreSQL later
+without touching the domain code.
+
+`metadata` is a service over that domain rather than part of it: it depends on
+`library`, and nothing in `library` depends on it, so a library can be scanned
+and served with no metadata provider at all. The enrichment worker asks for only
+two methods — list the entities, write one back — through its own `Store` port,
+so its tests run against an in-memory store instead of a database and the
+service cannot quietly grow a dependency on the whole repository.
 
 ## Licence
 

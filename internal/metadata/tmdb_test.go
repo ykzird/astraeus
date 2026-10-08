@@ -1,4 +1,4 @@
-package library
+package metadata
 
 import (
 	"context"
@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/jok/astraeus-media/internal/library"
 )
 
-func TestTMDBProvider_FetchMetadata_Movie(t *testing.T) {
+func TestTMDB_FetchMetadata_Movie(t *testing.T) {
 	t.Parallel()
 
 	var gotPath, gotQuery, gotKey, gotYear string
@@ -30,14 +32,14 @@ func TestTMDBProvider_FetchMetadata_Movie(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewTMDBProvider("test-key")
+	provider := NewTMDB("test-key")
 	provider.baseURL = server.URL
 
-	entity := &MediaEntity{
+	entity := &library.MediaEntity{
 		ID:       "entity-1",
-		Type:     MovieEntity,
+		Type:     library.MovieEntity,
 		Name:     "Dune",
-		Metadata: &MetadataSet{Extra: map[string]string{"year": "2021"}},
+		Metadata: &library.MetadataSet{Extra: map[string]string{"year": "2021"}},
 	}
 
 	meta, err := provider.FetchMetadata(context.Background(), entity)
@@ -72,7 +74,7 @@ func TestTMDBProvider_FetchMetadata_Movie(t *testing.T) {
 	}
 }
 
-func TestTMDBProvider_FetchMetadata_Series(t *testing.T) {
+func TestTMDB_FetchMetadata_Series(t *testing.T) {
 	t.Parallel()
 
 	var gotPath string
@@ -83,12 +85,12 @@ func TestTMDBProvider_FetchMetadata_Series(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewTMDBProvider("test-key")
+	provider := NewTMDB("test-key")
 	provider.baseURL = server.URL
 
-	meta, err := provider.FetchMetadata(context.Background(), &MediaEntity{
+	meta, err := provider.FetchMetadata(context.Background(), &library.MediaEntity{
 		ID:   "entity-2",
-		Type: SeriesEntity,
+		Type: library.SeriesEntity,
 		Name: "Breaking Bad",
 	})
 	if err != nil {
@@ -105,7 +107,7 @@ func TestTMDBProvider_FetchMetadata_Series(t *testing.T) {
 	}
 }
 
-func TestTMDBProvider_FetchMetadata_EpisodesDoNotHitTheNetwork(t *testing.T) {
+func TestTMDB_FetchMetadata_EpisodesDoNotHitTheNetwork(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,14 +115,14 @@ func TestTMDBProvider_FetchMetadata_EpisodesDoNotHitTheNetwork(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewTMDBProvider("test-key")
+	provider := NewTMDB("test-key")
 	provider.baseURL = server.URL
 
-	entity := &MediaEntity{
+	entity := &library.MediaEntity{
 		ID:       "entity-3",
-		Type:     EpisodeEntity,
+		Type:     library.EpisodeEntity,
 		Name:     "S02E05 - Breakage",
-		Metadata: &MetadataSet{Extra: map[string]string{"season": "2", "episode": "5"}},
+		Metadata: &library.MetadataSet{Extra: map[string]string{"season": "2", "episode": "5"}},
 	}
 	meta, err := provider.FetchMetadata(context.Background(), entity)
 	if err != nil {
@@ -134,7 +136,7 @@ func TestTMDBProvider_FetchMetadata_EpisodesDoNotHitTheNetwork(t *testing.T) {
 	}
 }
 
-func TestTMDBProvider_FetchMetadata_Errors(t *testing.T) {
+func TestTMDB_FetchMetadata_Errors(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -153,7 +155,7 @@ func TestTMDBProvider_FetchMetadata_Errors(t *testing.T) {
 			apiKey:     "test-key",
 			statusCode: http.StatusOK,
 			body:       `{"results":[]}`,
-			wantErrIs:  ErrNotFound,
+			wantErrIs:  library.ErrNotFound,
 		},
 		{
 			name:       "server error",
@@ -183,12 +185,12 @@ func TestTMDBProvider_FetchMetadata_Errors(t *testing.T) {
 			}))
 			defer server.Close()
 
-			provider := NewTMDBProvider(tt.apiKey)
+			provider := NewTMDB(tt.apiKey)
 			provider.baseURL = server.URL
 
-			_, err := provider.FetchMetadata(context.Background(), &MediaEntity{
+			_, err := provider.FetchMetadata(context.Background(), &library.MediaEntity{
 				ID:   "entity-4",
-				Type: MovieEntity,
+				Type: library.MovieEntity,
 				Name: "Dune",
 			})
 			if err == nil {
@@ -201,14 +203,14 @@ func TestTMDBProvider_FetchMetadata_Errors(t *testing.T) {
 	}
 }
 
-func TestTMDBProvider_FetchMetadata_UnsupportedType(t *testing.T) {
+func TestTMDB_FetchMetadata_UnsupportedType(t *testing.T) {
 	t.Parallel()
 
-	provider := NewTMDBProvider("test-key")
+	provider := NewTMDB("test-key")
 
-	_, err := provider.FetchMetadata(context.Background(), &MediaEntity{
+	_, err := provider.FetchMetadata(context.Background(), &library.MediaEntity{
 		ID:   "entity-5",
-		Type: EntityType("Playlist"),
+		Type: library.EntityType("Playlist"),
 		Name: "Whatever",
 	})
 	if err == nil {

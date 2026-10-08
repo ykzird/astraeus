@@ -9,7 +9,7 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Idempotent scans: re-scanning an unchanged tree creates no new rows, and a
       changed file size updates the existing object
 - [x] Metadata integration (TMDB over HTTP, with a synthetic provider fallback)
-- [x] Chainable providers (`ChainProvider`) so TVDB/IMDB can be added behind TMDB
+- [x] Chainable providers (`metadata.Chain`) so TVDB/IMDB can be added behind TMDB
 - [x] Entity hierarchy: Series / Season / Episode derived from the directory
       layout, scoped so two series can each own a "Season 1"
 - [x] Entity status lifecycle: `Incomplete` until a `MetadataSet` is attached

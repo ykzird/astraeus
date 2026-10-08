@@ -115,7 +115,7 @@ type MediaObject struct {
 }
 
 // MetadataSet is a collection of descriptive attributes associated with a
-// MediaEntity. Provider records which MetadataProvider produced it.
+// MediaEntity. Provider records which provider produced it.
 type MetadataSet struct {
 	Title        string            `json:"title"`
 	Description  string            `json:"description"`

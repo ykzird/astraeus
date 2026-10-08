@@ -1,4 +1,4 @@
-package library
+package metadata
 
 import (
 	"context"
@@ -8,23 +8,25 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+
+	"github.com/jok/astraeus-media/internal/library"
 )
 
 // TMDBBaseURL is the public TMDB API endpoint. It is a field on the provider so
 // tests can point it at an httptest server.
 const TMDBBaseURL = "https://api.themoviedb.org/3"
 
-// TMDBProvider implements MetadataProvider using the TMDB API.
-type TMDBProvider struct {
+// TMDB implements Provider using the TMDB API.
+type TMDB struct {
 	apiKey     string
 	baseURL    string
 	httpClient *http.Client
 }
 
-// NewTMDBProvider creates a TMDBProvider. An empty apiKey is a programming
-// error at this level; callers should select a MockProvider instead.
-func NewTMDBProvider(apiKey string) *TMDBProvider {
-	return &TMDBProvider{
+// NewTMDB creates a TMDB provider. An empty apiKey is a programming error at
+// this level; callers should select a Mock instead.
+func NewTMDB(apiKey string) *TMDB {
+	return &TMDB{
 		apiKey:     apiKey,
 		baseURL:    TMDBBaseURL,
 		httpClient: &http.Client{Timeout: 10 * time.Second},
@@ -32,7 +34,7 @@ func NewTMDBProvider(apiKey string) *TMDBProvider {
 }
 
 // Name reports the provider identity.
-func (p *TMDBProvider) Name() string { return "tmdb" }
+func (p *TMDB) Name() string { return "tmdb" }
 
 // tmdbResult covers the fields shared by TMDB's movie and TV search results.
 type tmdbResult struct {
@@ -51,22 +53,22 @@ type tmdbSearchResponse struct {
 }
 
 // FetchMetadata looks the entity up on TMDB.
-func (p *TMDBProvider) FetchMetadata(ctx context.Context, entity *MediaEntity) (*MetadataSet, error) {
+func (p *TMDB) FetchMetadata(ctx context.Context, entity *library.MediaEntity) (*library.MetadataSet, error) {
 	if p.apiKey == "" {
 		return nil, fmt.Errorf("tmdb: no API key configured")
 	}
 
 	switch entity.Type {
-	case MovieEntity:
+	case library.MovieEntity:
 		return p.search(ctx, "movie", entity)
-	case SeriesEntity:
+	case library.SeriesEntity:
 		return p.search(ctx, "tv", entity)
-	case SeasonEntity, EpisodeEntity:
+	case library.SeasonEntity, library.EpisodeEntity:
 		// Episode- and season-level lookups would multiply API calls for
 		// little gain at this stage; the parent series carries the imagery
 		// and these entities keep the numbers the scanner derived.
-		meta := metadataFromEntity(entity)
-		derived := &MetadataSet{
+		meta := fromEntity(entity)
+		derived := &library.MetadataSet{
 			Title:    entity.Name,
 			Provider: p.Name(),
 			Extra:    map[string]string{},
@@ -80,7 +82,7 @@ func (p *TMDBProvider) FetchMetadata(ctx context.Context, entity *MediaEntity) (
 	}
 }
 
-func (p *TMDBProvider) search(ctx context.Context, kind string, entity *MediaEntity) (*MetadataSet, error) {
+func (p *TMDB) search(ctx context.Context, kind string, entity *library.MediaEntity) (*library.MetadataSet, error) {
 	title := entity.DisplayTitle()
 	if title == "" {
 		return nil, fmt.Errorf("tmdb: entity %s has no title to search for", entity.ID)
@@ -93,7 +95,7 @@ func (p *TMDBProvider) search(ctx context.Context, kind string, entity *MediaEnt
 	query := endpoint.Query()
 	query.Set("query", title)
 	query.Set("api_key", p.apiKey)
-	if year := metadataFromEntity(entity).Extra["year"]; year != "" && kind == "movie" {
+	if year := fromEntity(entity).Extra["year"]; year != "" && kind == "movie" {
 		query.Set("year", year)
 	}
 	endpoint.RawQuery = query.Encode()
@@ -119,7 +121,7 @@ func (p *TMDBProvider) search(ctx context.Context, kind string, entity *MediaEnt
 		return nil, fmt.Errorf("tmdb: decoding %s search response: %w", kind, err)
 	}
 	if len(payload.Results) == 0 {
-		return nil, fmt.Errorf("tmdb: no %s result for %q: %w", kind, title, ErrNotFound)
+		return nil, fmt.Errorf("tmdb: no %s result for %q: %w", kind, title, library.ErrNotFound)
 	}
 
 	best := payload.Results[0]
@@ -138,7 +140,7 @@ func (p *TMDBProvider) search(ctx context.Context, kind string, entity *MediaEnt
 		extra["year"] = date[:4]
 	}
 
-	return &MetadataSet{
+	return &library.MetadataSet{
 		Title:        displayTitle,
 		Description:  best.Overview,
 		PosterPath:   best.PosterPath,

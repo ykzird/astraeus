@@ -35,6 +35,7 @@ import (
 	"github.com/jok/astraeus-media/internal/api"
 	"github.com/jok/astraeus-media/internal/images"
 	"github.com/jok/astraeus-media/internal/library"
+	"github.com/jok/astraeus-media/internal/metadata"
 	"github.com/jok/astraeus-media/internal/observability"
 	"github.com/jok/astraeus-media/internal/streaming"
 	"github.com/jok/astraeus-media/internal/subtitles"
@@ -134,8 +135,8 @@ func (c *config) newLogger() (*slog.Logger, error) {
 type env struct {
 	repo     library.Repository
 	scanner  *library.Scanner
-	worker   *library.MetadataWorker
-	provider library.MetadataProvider
+	worker   *metadata.Worker
+	provider metadata.Provider
 	logger   *slog.Logger
 	db       *sqlx.DB
 }
@@ -160,19 +161,19 @@ func (c *config) open() (*env, error) {
 	// With a key the real provider is used, and a miss stays visible as an
 	// incomplete entity. Without one, synthetic metadata keeps the pipeline
 	// exercisable end to end.
-	var provider library.MetadataProvider
+	var provider metadata.Provider
 	if c.tmdbKey != "" {
-		provider = library.NewTMDBProvider(c.tmdbKey)
+		provider = metadata.NewTMDB(c.tmdbKey)
 		logger.Info("using TMDB for metadata")
 	} else {
-		provider = library.NewMockProvider()
+		provider = metadata.NewMock()
 		logger.Warn("no TMDB API key configured; writing synthetic metadata")
 	}
 
 	return &env{
 		repo:     repo,
 		scanner:  library.NewScanner(repo, logger),
-		worker:   library.NewMetadataWorker(repo, provider, 6*time.Hour, logger),
+		worker:   metadata.NewWorker(repo, provider, 6*time.Hour, logger),
 		provider: provider,
 		logger:   logger,
 		db:       db,
@@ -263,7 +264,7 @@ func runServe(args []string) error {
 	}
 
 	if *enrichInterval > 0 {
-		worker := library.NewMetadataWorker(app.repo, app.provider, *enrichInterval, app.logger)
+		worker := metadata.NewWorker(app.repo, app.provider, *enrichInterval, app.logger)
 		worker.SetMetrics(metrics)
 		go worker.Start(ctx)
 	}

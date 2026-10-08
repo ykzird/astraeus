@@ -18,6 +18,7 @@ import (
 
 	"github.com/jok/astraeus-media/internal/images"
 	"github.com/jok/astraeus-media/internal/library"
+	"github.com/jok/astraeus-media/internal/metadata"
 	"github.com/jok/astraeus-media/internal/observability"
 	"github.com/jok/astraeus-media/internal/streaming"
 )
@@ -74,7 +75,7 @@ func newTestEnv(t *testing.T, opts ...envOption) *testEnv {
 		Repository: repo,
 		Scanner:    scanner,
 		Scheduler:  library.NewScanScheduler(repo, scanner, 0, logger),
-		Worker:     library.NewMetadataWorker(repo, library.NewMockProvider(), time.Hour, logger),
+		Worker:     metadata.NewWorker(repo, metadata.NewMock(), time.Hour, logger),
 		Metrics:    observability.New(),
 		Logger:     logger,
 		// A running server probes this at startup, so software encoders are
@@ -325,7 +326,7 @@ func TestEnrichEndpoint(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("enriching: status %d body %s", recorder.Code, recorder.Body.String())
 	}
-	result := decodeBody[library.EnrichResult](t, recorder)
+	result := decodeBody[metadata.EnrichResult](t, recorder)
 	if result.Enriched != 1 {
 		t.Errorf("enriched = %d, want 1", result.Enriched)
 	}

@@ -1,35 +1,37 @@
-package library
+package metadata
 
 import (
 	"context"
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/jok/astraeus-media/internal/library"
 )
 
-// stubProvider is a MetadataProvider test double shared by the provider and
+// stubProvider is a Provider test double shared by the provider and
 // worker tests.
 type stubProvider struct {
 	name string
-	meta *MetadataSet
+	meta *library.MetadataSet
 	err  error
 }
 
 func (s *stubProvider) Name() string { return s.name }
 
-func (s *stubProvider) FetchMetadata(context.Context, *MediaEntity) (*MetadataSet, error) {
+func (s *stubProvider) FetchMetadata(context.Context, *library.MediaEntity) (*library.MetadataSet, error) {
 	return s.meta, s.err
 }
 
-func TestMockProvider_DerivesMetadataFromEntity(t *testing.T) {
+func TestMock_DerivesMetadataFromEntity(t *testing.T) {
 	t.Parallel()
 
-	provider := NewMockProvider()
-	entity := &MediaEntity{
+	provider := NewMock()
+	entity := &library.MediaEntity{
 		ID:       "entity-6",
-		Type:     EpisodeEntity,
+		Type:     library.EpisodeEntity,
 		Name:     "S01E01",
-		Metadata: &MetadataSet{Extra: map[string]string{"season": "1", "episode": "1"}},
+		Metadata: &library.MetadataSet{Extra: map[string]string{"season": "1", "episode": "1"}},
 	}
 
 	meta, err := provider.FetchMetadata(context.Background(), entity)
@@ -50,14 +52,14 @@ func TestMockProvider_DerivesMetadataFromEntity(t *testing.T) {
 	}
 }
 
-func TestChainProvider_FallsBackToTheNextProvider(t *testing.T) {
+func TestChain_FallsBackToTheNextProvider(t *testing.T) {
 	t.Parallel()
 
 	primary := &stubProvider{name: "primary", err: errors.New("primary is down")}
-	secondary := &stubProvider{name: "secondary", meta: &MetadataSet{Title: "From secondary", Provider: "secondary"}}
+	secondary := &stubProvider{name: "secondary", meta: &library.MetadataSet{Title: "From secondary", Provider: "secondary"}}
 
-	chain := NewChainProvider(primary, secondary)
-	meta, err := chain.FetchMetadata(context.Background(), &MediaEntity{ID: "e", Type: MovieEntity, Name: "Dune"})
+	chain := NewChain(primary, secondary)
+	meta, err := chain.FetchMetadata(context.Background(), &library.MediaEntity{ID: "e", Type: library.MovieEntity, Name: "Dune"})
 	if err != nil {
 		t.Fatalf("FetchMetadata: %v", err)
 	}
@@ -66,14 +68,14 @@ func TestChainProvider_FallsBackToTheNextProvider(t *testing.T) {
 	}
 }
 
-func TestChainProvider_ReportsEveryFailure(t *testing.T) {
+func TestChain_ReportsEveryFailure(t *testing.T) {
 	t.Parallel()
 
-	chain := NewChainProvider(
+	chain := NewChain(
 		&stubProvider{name: "primary", err: errors.New("primary is down")},
 		&stubProvider{name: "secondary", err: errors.New("secondary is down")},
 	)
-	_, err := chain.FetchMetadata(context.Background(), &MediaEntity{ID: "e", Type: MovieEntity, Name: "Dune"})
+	_, err := chain.FetchMetadata(context.Background(), &library.MediaEntity{ID: "e", Type: library.MovieEntity, Name: "Dune"})
 	if err == nil {
 		t.Fatal("expected an error when every provider fails")
 	}

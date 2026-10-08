@@ -21,6 +21,7 @@ import (
 	"github.com/jok/astraeus-media/internal/access"
 	"github.com/jok/astraeus-media/internal/images"
 	"github.com/jok/astraeus-media/internal/library"
+	"github.com/jok/astraeus-media/internal/metadata"
 	"github.com/jok/astraeus-media/internal/observability"
 	"github.com/jok/astraeus-media/internal/streaming"
 	"github.com/jok/astraeus-media/internal/subtitles"
@@ -58,7 +59,7 @@ type Deps struct {
 	// Scheduler re-scans every library; when nil, the scan-all endpoint is
 	// unavailable.
 	Scheduler *library.ScanScheduler
-	Worker    *library.MetadataWorker
+	Worker    *metadata.Worker
 	// Prober inspects media files. When nil, playback negotiation is disabled.
 	Prober streaming.Prober
 	// Streams produces segmented streams. When nil, only direct play works.
@@ -85,7 +86,7 @@ type Server struct {
 	repo      library.Repository
 	scanner   *library.Scanner
 	scheduler *library.ScanScheduler
-	worker    *library.MetadataWorker
+	worker    *metadata.Worker
 	prober    streaming.Prober
 	streams   StreamManager
 	server    streaming.ServerCapability

@@ -13,7 +13,7 @@ This document defines the ubiquitous language for the Spatial Media Environment 
 
 ### Metadata
 * **MetadataSet**: A collection of descriptive attributes (title, poster art, etc.) associated with a `MediaEntity`. A `MediaEntity` is considered **Incomplete** until a `MetadataSet` is successfully attached.
-* **MetadataProvider**: An external service (e.g., TMDB) used to fetch a `MetadataSet`.
+* **Provider** (`internal/metadata`): An external service (e.g., TMDB) used to fetch a `MetadataSet`.
 
 ### Streaming
 * **StreamSession**: An active, stateful connection between a client and the server for delivering a `MediaEntity`.
