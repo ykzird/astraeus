@@ -96,6 +96,27 @@ Status as of the current build. Evidence for each claim is the test suite
       does not consume them yet — it only renders an absolute
       `backdrop_path`/`poster_path` and otherwise falls back to generated art
 
+## Phase 5: Packaging — the pieces exist, nothing is released
+
+- [x] Multi-stage `Dockerfile`: static binary, ffmpeg and ffprobe in the runtime
+      image, fixed non-root uid, one writable volume, health check
+- [x] Verified by running it, not by building it: the image serves `/api/health`,
+      scans a mounted library, and delivered all three paths — direct play, HDR
+      tone mapped to 8-bit `bt709`, HDR remuxed and re-encoded at 10-bit
+      `bt2020`/`smpte2084` — using the image's own ffmpeg 5.1.9
+- [x] Hardened systemd unit (`deploy/astraeus.service`): loopback, token auth
+      required, `ProtectSystem=strict` with two writable trees, empty capability
+      set, syscall filter; `systemd-analyze verify` clean and
+      `systemd-analyze security` scoring 1.6 (OK)
+- [x] Deployment runbook (`deploy/README.md`) covering both shapes, backups,
+      upgrades, GPU passthrough and what is deliberately not hardened
+- [x] CI workflow (`.github/workflows/ci.yml`): format, vet, build, unit tests,
+      integration tests, `node --check`, image build and a health wait
+- [ ] Release automation: nothing is tagged, versioned or published anywhere
+- [ ] A TLS reverse-proxy example (Caddy or nginx) beside the systemd unit
+- [ ] Package the VAAPI userspace drivers into the image, so GPU transcoding
+      works in a container without extra packages
+
 ## Known gaps
 
 - Transcoding runs one rendition per request; there is no adaptive bitrate
@@ -163,9 +184,16 @@ Status as of the current build. Evidence for each claim is the test suite
 - The hls.js fatal-error recovery path and the native-HLS (Safari) branch are
   implemented but have not been observed firing — no Safari was available, and a
   stream failure could not be forced on a live server.
-- Nothing is packaged: no `Dockerfile`, no systemd unit, no CI. There is a
-  `LICENSE` (MIT) and a third-party notices file, but running this anywhere means
-  building it yourself.
+- Packaging exists but nothing has been released, and two pieces of it are
+  asserted rather than observed: the CI workflow has never run (the repository
+  has no remote), and the systemd unit has been checked with `systemd-analyze`
+  but never started, because the development host has no reachable systemd
+  manager. The `SystemCallFilter` in that unit is the one setting that could stop
+  ffmpeg on a host where an encoder needs a call outside the list; the runbook
+  says how to diagnose and relax it.
+- The container image ships ffmpeg's VAAPI support but not the vendor userspace
+  drivers, so GPU transcoding in a container needs extra packages. NVENC needs
+  the NVIDIA container runtime.
 - The web UI has no unit tests. It is one large file with no module seam, so its
   logic is only covered by the CDP harnesses in `scripts/ui-verify/`, which need a
   browser and a running server.

@@ -1,6 +1,7 @@
 # Handoff
 
-**As of commit `f489fa4`, 2026-10-08. Version 0.3.0. 85 tracked files.**
+**As of `f489fa4` plus the packaging commits that follow it. Version 0.3.0.
+2026-10-08. 90 tracked files.**
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -108,6 +109,28 @@ drift that eyeballing does not:
 - every metric declared in `internal/observability/kpi.go` is named in the README,
   and nothing named there is undeclared;
 - every route mounted in `internal/api/server.go` appears in the README's table.
+
+Deployment has its own checks. The unit is checked statically and the image is
+checked by running it:
+
+```sh
+# Static checks: syntax and directives, then the hardening score.
+systemd-analyze verify deploy/astraeus.service
+systemd-analyze security --offline=yes deploy/astraeus.service   # 1.6 (OK)
+
+# Build and start the image, then wait for the health check to go green.
+docker build -t astraeus-media:dev .
+docker run -d --name astraeus -p 127.0.0.1:8642:8642 \
+  -v "$PWD/../demo-media:/media:ro" -v astraeus-data:/data astraeus-media:dev
+curl -s localhost:8642/api/health
+docker inspect --format '{{.State.Health.Status}}' astraeus      # healthy
+docker exec astraeus astraeus-server scan --db /data/astraeus.db \
+  --path /media/movies --kind movies --name Movies
+```
+
+Note that `docker build` needs its state inside the workspace on this host, or
+the sandbox refuses it: set `DOCKER_CONFIG=$PWD/../.tmp/docker-config` and
+`BUILDX_CONFIG=$PWD/../.tmp/buildx` before building.
 
 ---
 
@@ -242,26 +265,35 @@ HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
 Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 10/10 subtitles. Full Go suite green with race and integration.
 
+Packaging landed after that, in the commits following `f489fa4`: a multi-stage
+`Dockerfile`, `deploy/astraeus.service`, `deploy/README.md` as the runbook, and
+`.github/workflows/ci.yml`. The image was **run**, not just built: it serves
+`/api/health`, scans a mounted library read-only, and delivered direct play, an
+HDR tone map and an HDR remux *and* an HDR re-encode using the image's own
+**ffmpeg 5.1.9** (the host has 9.0, so this was a real second data point for the
+filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
+`systemd-analyze security`. See §8 for what that does *not* cover.
+
 ---
 
 ## 7. Open work
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **Packaging.** No `Dockerfile`, systemd unit or CI. `LICENSE` and the notices
-   exist. Nothing reaches anyone without this, and it is now the only thing
-   standing between a finished engine and something somebody else can run.
-2. **A real ABR ladder**, and making `max_bitrate_kbps` do something. The field is
+1. **A real ABR ladder**, and making `max_bitrate_kbps` do something. The field is
    currently accepted, validated and echoed but never acted on, which is worse
-   than not having it.
-3. **Multi-audio-track selection** (the first stream wins today) and **image
+   than not having it. It is now the most valuable *engine* work left.
+2. **Multi-audio-track selection** (the first stream wins today) and **image
    subtitles** (PGS/VobSub are detected, reported, and refused).
-4. **Resume / watch state.** The hard part already works: a session can start at
+3. **Resume / watch state.** The hard part already works: a session can start at
    an offset, so this is mostly persistence plus a report endpoint.
-5. **CSP and security headers**, **UI unit tests** (the front end is one 133 KB
+4. **CSP and security headers**, **UI unit tests** (the front end is one 133 KB
    file with no seam — `web/core.js` for the pure timeline maths is the cheapest
    first cut), **artwork IP leak** (metadata-supplied absolute URLs are fetched by
    the browser directly), rate limiting, OpenTelemetry.
+5. **Release automation and a TLS example.** Packaging landed (see §6), but
+   nothing is tagged or published, the CI workflow has never run, and there is no
+   reverse-proxy configuration beside the unit.
 6. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
@@ -297,6 +329,19 @@ Priority order, with the reasoning. Take it top-down.
   down to the produced segment (10-bit, `bt2020nc`/`smpte2084`/`bt2020`), not to
   a compositor showing it correctly — which is why the client has to declare
   `supports_hdr` rather than being assumed capable.
+- **Packaging is verified unevenly, and the gaps are known.** The container was
+  built, started and exercised. The systemd unit was checked with
+  `systemd-analyze verify` and `security`, but never *started*: the development
+  host has no reachable systemd manager, so the hardening directives
+  (`ProtectSystem=strict`, `ReadWritePaths`, the syscall filter) are reasoned
+  about rather than observed. The CI workflow has never executed anywhere — the
+  repository has no remote — though every step in it was run by hand here.
+  `deploy/README.md` states all of this in place, so a reader of the deployment
+  docs does not have to find this handoff to learn it.
+- **The unit's `SystemCallFilter=@system-service` is the one hardening line that
+  could break playback** on a host where an encoder needs a call outside the
+  list. It is the standard set for a service of this kind, but no encoder here
+  exercises every path through it.
 - The visual design of a narrow player, and Firefox/Safari rendering generally,
   have not been looked at by eye.
 

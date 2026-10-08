@@ -1,0 +1,24 @@
+# The build context should be the source and nothing else. Everything here is
+# either large, machine-specific, or already copied into the image by path.
+
+.git
+.gitignore
+
+# Local state: a database is not source, and neither are the caches.
+*.db
+*.db.bak-preupgrade
+.tmp/
+.streams/
+
+# Build output. The image compiles the binary itself; a stale local one would
+# just bloat the context.
+astraeus-server
+*.exe
+
+# Local review material and scripts that the image does not need.
+docs/
+scripts/
+CONTEXT.md
+SPECIFICATION.md
+TODO.md
+THIRD_PARTY_NOTICES.md

@@ -1,0 +1,104 @@
+[Unit]
+Description=Astraeus Media server
+Documentation=file:/usr/local/share/doc/astraeus/README.md
+# The server can start before the network and still serve a local library, but
+# the metadata provider and the artwork proxy need it, so waiting is right.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astraeus
+Group=astraeus
+
+# Secrets live in an environment file rather than in this unit, which is
+# world-readable and usually in a git repository. The file is optional, so a
+# LAN-only install with --auth-mode none still starts.
+#
+#   /etc/astraeus/astraeus.env, mode 0600, owned by root:
+#     ASTRAEUS_AUTH_TOKEN=<openssl rand -hex 32>
+#     TMDB_API_KEY=<themoviedb api key, optional>
+EnvironmentFile=-/etc/astraeus/astraeus.env
+
+# Written as one line per flag so a reader can see every path the service will
+# touch. The addresses are the ones the README's deployment section creates:
+#
+#   /var/lib/astraeus   state: the database and the HLS session directories
+#   /var/cache/astraeus caches: artwork and extracted subtitles
+#   /srv/media          the library, mounted read-only if it lives elsewhere
+#
+# --auth-mode token rather than the default "none": an install that survives a
+# reboot is an install somebody will eventually expose. Set ASTRAEUS_AUTH_TOKEN
+# in the environment file above.
+ExecStart=/usr/local/bin/astraeus-server serve \
+    --addr 127.0.0.1:8642 \
+    --web-dir /usr/local/share/astraeus/web \
+    --db /var/lib/astraeus/astraeus.db \
+    --stream-root /var/lib/astraeus/streams \
+    --image-cache /var/cache/astraeus/images \
+    --subtitle-cache /var/cache/astraeus/subtitles \
+    --auth-mode token \
+    --log-format json
+
+Restart=on-failure
+RestartSec=2s
+
+# Segments are being written when the stop arrives, and ffmpeg needs a moment to
+# finish the file it is on rather than leaving a truncated one behind.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# ---- hardening -------------------------------------------------------------
+# Nothing here needs a privileged operation after binding a port above 1024.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+# Hide other processes' /proc entries. ProcSubset is deliberately not set to
+# "pid": it would also hide /proc/cpuinfo, which some encoders read for CPU
+# feature detection.
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+RemoveIPC=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+# @system-service is the standard allow list for a service like this, plus one
+# refinement: a process with an empty capability set cannot use the privileged
+# calls anyway, so refusing them outright costs nothing.
+#
+# This filter is the one hardening setting that could in principle stop ffmpeg:
+# a call it needs but the list omits fails with EPERM and the transcode dies. If
+# that ever happens, the diagnosis is an EPERM in the session diagnostics, and
+# the fix is to relax this line (`SystemCallFilter=` with no value) rather than
+# to guess. It has not been possible to exercise every filter path of every
+# encoder on the development host.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# The whole filesystem is read-only except the two writable trees. Note that
+# PrivateDevices is deliberately NOT enabled: VAAPI transcoding needs a DRM
+# render node, and that option would hide /dev/dri from the service. If you do
+# not use hardware acceleration, adding PrivateDevices=yes is a free win.
+ReadWritePaths=/var/lib/astraeus /var/cache/astraeus
+
+# A private /tmp keeps ffmpeg's temporary files away from everything else.
+PrivateTmp=yes
+
+# Nothing the service writes - the database, segments, caches - needs to be
+# readable by another account. Segments are handed to clients by this process,
+# not read off disk by anything else.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

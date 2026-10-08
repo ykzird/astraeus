@@ -26,6 +26,16 @@ The goal is to build a "media-first" spatial environment that moves away from th
 * **Primary:** **Native Binary**. The application will be distributed as a statically linked or minimally dependent binary for Linux, allowing for easy integration with systemd and direct hardware access.
 * **Secondary:** **Containerized (Docker/Podman)**. A containerized version will be provided, with specific configurations to map hardware acceleration devices (`/dev/dri`) into the runtime.
 
+Both shapes exist as of 0.3.0 (`Dockerfile`, `deploy/astraeus.service`, and
+`deploy/README.md` as the runbook). The binary is pure Go with no cgo, so the
+image is a two-stage build: one stage compiles a static binary, the runtime stage
+adds the one hard dependency, ffmpeg. The container runs as a fixed non-root uid
+with every writable path inside a single volume, and the unit binds loopback with
+the access gate on, so neither shape publishes an unauthenticated library by
+default. Deployment is where the server's own honesty matters most: the startup
+probe reports which encoders this host can actually use, so a container that
+cannot see a GPU says so instead of transcoding badly.
+
 ### 2.3 High-Level Architecture
 The system follows a modular service-oriented architecture:
 1.  **Library Manager:** Handles filesystem scanning, `MediaEntity` lifecycle, and `MetadataSet` management.

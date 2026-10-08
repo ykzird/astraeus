@@ -1,0 +1,174 @@
+# Deploying Astraeus Media
+
+Two supported shapes: a **container** (everything included, including ffmpeg) and
+a **systemd service** (a binary, ffmpeg from your distribution, and a unit file).
+Both run the same server; pick by how you already run things.
+
+Whatever you pick, three facts decide whether the install is sound:
+
+- **ffmpeg and ffprobe are dependencies, not extras.** The server reports their
+  absence at startup and refuses playback without them.
+- **`--auth-mode` defaults to `none`.** That is right for a trusted LAN and wrong
+  for anything else. Both shapes below turn the gate on before anything is
+  published.
+- **The database is the state.** Segments and caches are disposable; the SQLite
+  file is what a backup has to capture.
+
+---
+
+## Container
+
+```sh
+docker build -t astraeus-media:0.3.0 .
+
+# The image's default command serves on :8642 with every writable path inside
+# /data. This one has no access gate, so keep it on loopback.
+docker run -d --name astraeus \
+  -p 127.0.0.1:8642:8642 \
+  -v /srv/media:/media:ro \
+  -v astraeus-data:/data \
+  astraeus-media:0.3.0
+```
+
+Flags are passed through the entrypoint, so the server's own options can be
+appended to any run — which is also how a library is registered:
+
+```sh
+# Register and scan a library that is mounted read-only at /media.
+docker exec astraeus astraeus-server scan \
+  --db /data/astraeus.db --path /media/movies --kind movies --name Movies
+```
+
+The image's default command already sets every writable path inside one volume:
+
+| Path | Contents |
+| --- | --- |
+| `/data/astraeus.db` | the library database (back this up) |
+| `/data/streams` | HLS session directories, swept at startup and reaped when idle |
+| `/data/images`, `/data/subtitles` | artwork and subtitle caches (disposable) |
+| `/media` | your library, mounted read-only |
+| `/app/web` | the web UI the binary serves |
+
+A realistic run, with the gate on and the library read-only:
+
+```sh
+docker run -d --name astraeus \
+  -p 127.0.0.1:8642:8642 \
+  -e ASTRAEUS_AUTH_TOKEN="$(openssl rand -hex 32)" \
+  -v /srv/media:/media:ro \
+  -v astraeus-data:/data \
+  astraeus-media:0.3.0 \
+  serve --addr 0.0.0.0:8642 --web-dir /app/web \
+        --db /data/astraeus.db --stream-root /data/streams \
+        --image-cache /data/images --subtitle-cache /data/subtitles \
+        --auth-mode token
+```
+
+Publishing on `127.0.0.1` and putting a reverse proxy in front is the intended
+shape; `-p 8642:8642` publishes it to every interface, which without
+`--auth-mode` hands anyone who can reach the port the whole library.
+
+**Hardware acceleration.** A container does not see the GPU unless it is passed
+in: add `--device /dev/dri` for VAAPI, and the container's ffmpeg must be able to
+load the vendor driver (the image ships ffmpeg's VAAPI support but not
+`mesa-va-drivers` / `intel-media-va-driver`). The startup probe answers this
+honestly — `GET /api/system/capabilities` lists what actually encoded, and
+`rejected_encoders` carries ffmpeg's own complaint for what did not.
+
+**What was verified in the image:** built and run; `/api/health` answers and the
+health check turns `healthy`; a mounted library scans; all three delivery paths
+were exercised with the image's own **ffmpeg 5.1.9** — direct play, an HDR source
+tone mapped to 8-bit `bt709` for a browser profile, an HDR source remuxed at
+10-bit `bt2020`/`smpte2084` for a manifest declaring `supports_hdr`, and an HDR
+*re-encode* (forced by a downscale) at 10-bit `bt2020`/`smpte2084` as well.
+
+---
+
+## systemd
+
+Assumes a Linux host with `ffmpeg` installed from the distribution.
+
+```sh
+# 1. An account with no shell, and the three directories the unit names.
+sudo useradd --system --home /var/lib/astraeus --shell /usr/sbin/nologin astraeus
+sudo install -d -o astraeus -g astraeus /var/lib/astraeus /var/cache/astraeus
+sudo install -d -o astraeus -g astraeus /var/cache/astraeus/images /var/cache/astraeus/subtitles
+
+# 2. The binary and the web UI it serves.
+sudo install -m 0755 astraeus-server /usr/local/bin/astraeus-server
+sudo install -d /usr/local/share/astraeus
+sudo cp -r web /usr/local/share/astraeus/web
+sudo install -d /usr/local/share/doc/astraeus
+sudo install -m 0644 README.md /usr/local/share/doc/astraeus/README.md
+
+# 3. The token the unit reads, and the unit itself.
+sudo install -d -m 0755 /etc/astraeus
+printf 'ASTRAEUS_AUTH_TOKEN=%s\n' "$(openssl rand -hex 32)" \
+  | sudo tee /etc/astraeus/astraeus.env >/dev/null
+sudo chmod 0600 /etc/astraeus/astraeus.env
+sudo install -m 0644 deploy/astraeus.service /etc/systemd/system/astraeus.service
+
+# 4. Check what you are about to start, then start it.
+sudo systemd-analyze verify /etc/systemd/system/astraeus.service
+sudo systemctl daemon-reload && sudo systemctl enable --now astraeus
+systemctl status astraeus
+curl -s localhost:8642/api/health
+```
+
+The unit binds **127.0.0.1:8642** and enables `--auth-mode token`, so nothing is
+reachable from off-host until you put a TLS-terminating reverse proxy in front of
+it. `TMDB_API_KEY` goes in the same environment file if you want real metadata
+instead of the synthetic fallback.
+
+### What the unit hardens, and what is untested
+
+`ProtectSystem=strict` with `ReadWritePaths` limits writes to the two state
+directories; `CapabilityBoundingSet=` is empty; `ProtectHome`, `ProtectProc`,
+`ProtectKernel*`, `RestrictAddressFamilies`, `RemoveIPC` and a private `/tmp` are
+on; `UMask=0077` keeps what the service writes to itself. `systemd-analyze
+security` scores it **1.6 (OK)**.
+
+Two deliberate choices are worth knowing:
+
+- **`PrivateDevices` is off**, because it would hide `/dev/dri` and break VAAPI.
+  If you do not use hardware acceleration, turning it on is free.
+- **`SystemCallFilter=@system-service` is the one setting that could stop
+  ffmpeg.** A syscall outside the list fails with `EPERM` and kills the
+  transcode. If a session fails that way, the ffmpeg diagnostics in the session
+  error name it, and the fix is to relax that single line. The filter is the
+  standard one for a service of this kind, but it has not been possible to
+  exercise every encoder on every host.
+
+The unit was checked with `systemd-analyze verify` (clean) and
+`systemd-analyze security`. It has **not** been started as a service on the
+development host — there is no systemd manager reachable in that environment —
+so the runtime behaviour of the hardening directives is reasoned about, not
+observed. If you install it, `systemctl status` and the first playback are the
+things to watch.
+
+---
+
+## Backups and upgrades
+
+```sh
+# The database is the state. Stop the server, or copy it with SQLite's own
+# backup API so a write in flight cannot tear the copy.
+sqlite3 /var/lib/astraeus/astraeus.db ".backup /var/backups/astraeus-$(date +%F).db"
+```
+
+Schema migrations live in the binary and run at startup; a database written by an
+older build is upgraded in place, and the server keeps a
+`*.db.bak-preupgrade` copy the first time it does. Upgrading is: replace the
+binary and the `web` directory, restart. Nothing under `/var/cache` needs to be
+preserved.
+
+---
+
+## Not covered yet
+
+- **TLS.** Put Caddy, nginx or Tailscale in front; the server speaks plain HTTP.
+- **Multiple users or per-user libraries.** The gate is instance-wide.
+- **Kubernetes manifests, Windows or macOS packaging.**
+- **CI.** The workflow in `.github/workflows/ci.yml` runs the same checks that
+  pass locally, but the repository has no remote yet, so it has never executed on
+  GitHub.

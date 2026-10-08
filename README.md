@@ -31,6 +31,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | Observability | Done. The KPI registry is exposed in Prometheus format at `/metrics` |
 | Web UI | Three-column spatial layout, served by the binary; HLS via a vendored hls.js; player controls overlaid on the video (transport, seek, subtitles, volume, quality, fullscreen) |
 | Authentication | Optional gate: trusted-proxy identity (Tailscale / Cloudflare Access) or a bearer token |
+| Packaging | A multi-stage `Dockerfile` (ffmpeg included, non-root, health check) and a hardened systemd unit, both verified as far as this host allows — see [`deploy/README.md`](deploy/README.md) |
 
 ### Playback compatibility
 
@@ -97,6 +98,12 @@ The UI is served from the same origin as the API, from the `web` directory
 Set `TMDB_API_KEY` (or pass `--tmdb-key`) to use real metadata. With a key, a
 title TMDB cannot find stays `Incomplete` so it shows up as work for an
 administrator, rather than being quietly filled in with a placeholder.
+
+To run it as a service rather than from a shell, see
+[`deploy/README.md`](deploy/README.md): a container image that includes ffmpeg,
+and a hardened systemd unit. Both set every writable path explicitly and turn the
+access gate on before publishing a port, because `--auth-mode` defaults to
+`none`.
 
 The database is SQLite, opened with `busy_timeout(5000)`, `journal_mode(WAL)`,
 `synchronous(NORMAL)` and `foreign_keys(1)`. WAL means recent writes live in
@@ -471,6 +478,9 @@ web/                    the Spatial Web UI, including vendored hls.js
                         and the generated BoxIcons registry (web/icons.js)
 scripts/ui-verify/      browser harnesses for playback and subtitles
 scripts/make-demo-media.sh  generates a throwaway demo library
+deploy/                 the systemd unit and the deployment runbook
+Dockerfile              the container image (multi-stage, ffmpeg included)
+.github/workflows/      CI: format, vet, test, integration test, image
 ```
 
 `library` is the domain: the entities, the `Repository` port and the scanner.

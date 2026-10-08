@@ -1,0 +1,91 @@
+name: CI
+
+# NOTE: the repository has no remote yet, so this workflow has never run on
+# GitHub. Every step below is a command that has been run by hand on the
+# development host; see deploy/README.md, which records what was verified and
+# what was not.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build, vet and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The integration tests are not mocks: they run ffmpeg and ffprobe and
+      # assert the segments that come out, so the runner needs them installed.
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      # Formatting is a test here because this project has no other gate on it.
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would change these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      # Separate from the run above so a failure says which layer it is in.
+      - name: Test with integration
+        run: go test -tags=integration -race -count=1 ./...
+
+      # The front end has no build step, so a parse check is the whole of what
+      # can be verified about it without a browser.
+      - name: Parse the web UI
+        run: node --check web/app.js
+
+  image:
+    name: Build the container image
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t astraeus-media:ci .
+
+      # Building is not the same as starting. This catches the class of mistake
+      # that an image build cannot: a missing entrypoint, a bad default flag, a
+      # volume the process cannot write to.
+      - name: Start it and wait for health
+        run: |
+          docker run -d --name astraeus-ci -p 127.0.0.1:8642:8642 astraeus-media:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8642/api/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "the server never answered /api/health; logs follow"
+          docker logs astraeus-ci
+          exit 1
+
+      - name: Show the startup log
+        if: always()
+        run: docker logs astraeus-ci || true
