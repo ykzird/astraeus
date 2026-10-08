@@ -1595,6 +1595,50 @@ func TestNegotiate_BurnKeepsOneRenditionWithAPreference(t *testing.T) {
 	}
 }
 
+// TestNegotiate_ALadderReencodesTheAudio pins the rule the container's ffmpeg
+// forced: a ladder gives every rung its own audio stream, because the HLS muxer
+// refuses to place one copied elementary stream in two variants. On ffmpeg 5.1
+// and 6.1 that refusal silently costs rungs from the master playlist, so a
+// client never sees the lower ones. A single rendition still copies.
+func TestNegotiate_ALadderReencodesTheAudio(t *testing.T) {
+	t.Parallel()
+
+	// AAC in, AAC accepted: without a ladder this is a copy.
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "vp9", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, BitrateKbps: 6_000,
+		AudioBitrateKbps: 128,
+	}
+	adaptive := hdrCapability()
+	adaptive.SupportsHDR = false
+	adaptive.MaxBitDepth = 8
+	adaptive.MaxWidth = 0
+	adaptive.MaxHeight = 0
+
+	ladder := Negotiate(info, adaptive)
+	if len(ladder.Renditions) < 2 {
+		t.Fatalf("expected a ladder, got %+v", ladder.Renditions)
+	}
+	if ladder.AudioAction != ActionTranscode {
+		t.Errorf("a ladder copied the audio (%q); each rung needs its own stream", ladder.AudioAction)
+	}
+	if reasons := strings.Join(ladder.Reasons, "; "); !strings.Contains(reasons, "will not put one copied stream in two variants") {
+		t.Errorf("the reasons should say why the audio is re-encoded: %s", reasons)
+	}
+
+	// The same source pinned to one rendition keeps the copy: the limitation
+	// belongs to the ladder, not to the audio.
+	pinned := adaptive
+	pinned.MaxHeight = 720
+	single := Negotiate(info, pinned)
+	if len(single.Renditions) != 0 {
+		t.Fatalf("a pinned height must be one rendition, got %+v", single.Renditions)
+	}
+	if single.AudioAction != ActionCopy {
+		t.Errorf("a single rendition transcoded the audio (%q); copying is still right there", single.AudioAction)
+	}
+}
+
 // TestNegotiate_LadderRespectsTheBitrateLimit checks that a ladder is scaled by
 // the client's total limit rather than ignoring it.
 func TestNegotiate_LadderRespectsTheBitrateLimit(t *testing.T) {
@@ -1616,9 +1660,12 @@ func TestNegotiate_LadderRespectsTheBitrateLimit(t *testing.T) {
 	if len(decision.Renditions) < 2 {
 		t.Fatalf("expected a ladder, got %+v", decision.Renditions)
 	}
-	// The audio is copied at its own rate, so the top rung may use the rest.
-	if got, want := decision.Renditions[0].BitrateKbps, 2_000-128; got != want {
-		t.Errorf("top rung = %d kbps, want %d (the limit less the audio)", got, want)
+	// The audio is re-encoded, not copied: a ladder gives each rung its own
+	// audio stream, and ffmpeg's HLS muxer refuses to place one copied stream in
+	// two variants. So the top rung may use the limit less what this server
+	// encodes the audio at, not less the source's own rate.
+	if got, want := decision.Renditions[0].BitrateKbps, 2_000-defaultAudioAllowanceKbps; got != want {
+		t.Errorf("top rung = %d kbps, want %d (the limit less the encoded audio)", got, want)
 	}
 	for _, rung := range decision.Renditions {
 		if rung.BitrateKbps > decision.Renditions[0].BitrateKbps {

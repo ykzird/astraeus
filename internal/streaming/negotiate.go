@@ -281,10 +281,34 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		decision.Reasons = append(decision.Reasons, dolbyVisionReencodeNote(info))
 	}
 
+	// Whether this decision is a ladder has to be known before the audio is
+	// decided, because a ladder cannot copy the audio: each rung needs its own
+	// elementary stream, and ffmpeg's HLS muxer refuses to place one copied
+	// stream in two variants ("Same elementary stream found more than once in
+	// two different variant definitions"). With ffmpeg 5.1 and 6.1 that refusal
+	// is not an error the session survives: the master playlist comes out with
+	// fewer rungs than the decision promised, so a client never sees the lower
+	// ones. ffmpeg 9 tolerates it, which is why this went unnoticed until the
+	// container's own ffmpeg was asked to build a ladder.
+	//
+	// The rungs depend on the height and not on the bitrate budget, so this is
+	// knowable here, before the audio's share of that budget is computed from
+	// the action.
+	ladderTop := decision.TargetHeight
+	if ladderTop <= 0 {
+		ladderTop = info.Height
+	}
+	laddering := decision.Deliverable &&
+		decision.VideoAction == ActionTranscode &&
+		!capability.pinsOneRendition() &&
+		!burning &&
+		len(videoLadder(ladderTop, 0)) > 1
+
 	// Audio action.
-	if !hasAudio {
+	switch {
+	case !hasAudio:
 		decision.AudioAction = ActionNone
-	} else if !audioCompatible || channelsTooMany {
+	case !audioCompatible || channelsTooMany:
 		decision.AudioAction = ActionTranscode
 		decision.TargetAudioCodec = capability.PreferredAudioCodec()
 		if decision.TargetAudioCodec == "" {
@@ -294,6 +318,15 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		if channelsTooMany {
 			decision.TargetAudioChannels = capability.MaxAudioChannels
 		}
+	case laddering:
+		decision.AudioAction = ActionTranscode
+		decision.TargetAudioCodec = capability.PreferredAudioCodec()
+		if decision.TargetAudioCodec == "" {
+			decision.Deliverable = false
+			decision.Reasons = append(decision.Reasons, "client declared no audio codecs to transcode into")
+		}
+		decision.Reasons = append(decision.Reasons,
+			fmt.Sprintf("the audio is re-encoded rather than copied because a ladder gives each rung its own stream, and ffmpeg will not put one copied stream in two variants"))
 	}
 
 	// Work out what the client's total bitrate limit leaves for video. The audio
@@ -322,13 +355,8 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	// here would mean either burning only the top one or compositing per rung,
 	// and neither is what the client asked for.
 	laddered := false
-	if decision.Deliverable && decision.VideoAction == ActionTranscode &&
-		!capability.pinsOneRendition() && !burning {
-		top := decision.TargetHeight
-		if top <= 0 {
-			top = info.Height
-		}
-		if ladder := videoLadder(top, budget); len(ladder) > 1 {
+	if laddering {
+		if ladder := videoLadder(ladderTop, budget); len(ladder) > 1 {
 			decision.Renditions = ladder
 			laddered = true
 			// The fields that describe "the video" keep describing the largest

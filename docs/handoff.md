@@ -120,6 +120,15 @@ mise exec -- go test -tags=integration -run BitrateCeiling -v ./internal/streami
 # ladder topped there, measured from the segments, not from the argument list.
 mise exec -- go test -tags=integration -run TestManager_Ladder -v ./internal/streaming/
 
+# The same ladder test against the ffmpeg the container ships, which is not the
+# one on this desk: ffmpeg 9 accepts a ladder that shares one copied audio stream
+# between variants, 5.1 does not, and the difference cost rungs from the master
+# playlist. Run this after any change to the ladder's ffmpeg arguments.
+docker run --rm -v "$PWD":/src -v "$(go env GOMODCACHE)":/gomod -w /src \
+  -e GOMODCACHE=/gomod -e GOCACHE=/tmp/gocache golang:1.26-bookworm bash -c \
+  'apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null 2>&1 && \
+   go test -tags=integration -count=1 -run TestManager_Ladder -v ./internal/streaming/'
+
 # The negotiation contract for a capped quality choice, and the trap it would
 # otherwise fall into: a preference has to limit the output, not merely advise
 # the ladder, or a 4K source with a 720 preference is direct-played whole.
@@ -449,6 +458,22 @@ Verified in a real browser against real 4K content in the round-2 work: 28/28
 chrome, 13/13 player, 10/10 subtitles. Full Go suite green with race and
 integration. Those numbers belong to that content: the bundled demo clips score
 lower on the auto-hide checks for fixture reasons (§8).
+
+**The first real CI run found a ladder defect the dev host could not see** (round
+10). The integration test failed on the runner's ffmpeg 6.1 with a master
+playlist naming two rungs of three — and it reproduced exactly against the
+container's own ffmpeg 5.1.9, so the packaged server had been serving an
+incomplete ladder. The cause was in our arguments, not ffmpeg's: a ladder mapped
+the audio once per rung with `-c:a copy`, so all three variants carried the
+*same* elementary stream. ffmpeg 9 accepts that; 5.1 and 6.1 answer "Same
+elementary stream found more than once in two different variant definitions" and
+quietly leave variants out of the master playlist. A ladder now re-encodes the
+audio per rung, and the decision says why. The rule is pinned by a unit test
+(a ladder transcodes the audio; a pinned single rendition still copies) and by
+the integration test run inside a bookworm container, which is now part of §3.
+This is the clearest argument for the CI and the container being real: the host's
+ffmpeg is not the shipped one, and only running the test on the shipped version
+told the truth.
 
 **The repository went public** in round 10, which changes the project's surface
 rather than its behaviour. The module path was `github.com/jok/astraeus-media`
@@ -846,6 +871,18 @@ Priority order, with the reasoning. Take it top-down.
   `hwupload` per rung on one device, which is plausible but unverified; the
   software fallback after a hardware failure rebuilds the decision for software
   encoders, so a failed ladder should still land somewhere playable.
+- **The development host's ffmpeg is not the shipped one, and that hid a defect
+  for a whole round.** The host runs ffmpeg 9.0; the container ships Debian
+  bookworm's 5.1.9, and CI runs Ubuntu's 6.1. A ladder used to map the audio once
+  per rung with `-c:a copy`, which makes every variant carry the *same* elementary
+  stream. ffmpeg 9 accepts that; 5.1 and 6.1 drop variants from the master
+  playlist without failing the session, so the container's ladder had been serving
+  two rungs of three. The fix re-encodes the audio per rung, and it is verified
+  against 5.1.9 by running the integration test inside a bookworm container —
+  which is now the cheap way to check any ffmpeg-version behaviour this host
+  cannot see. **The lesson worth keeping: when a claim depends on ffmpeg's
+  behaviour, run the test against the version the container ships, not the one on
+  the desk.**
 - **The content security policy is verified against the current UI, not against
   a future one.** A new inline `<style>` or a script fetched from elsewhere would
   be refused at runtime and show up as a console error in the harness — which is

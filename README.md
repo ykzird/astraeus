@@ -637,6 +637,18 @@ all rather than two renditions nobody can tell apart. Each rung is a separate
 encode of the same source, so a ladder costs roughly what its rungs add up to —
 on a small host, pinning a height is the cheaper way to watch.
 
+**A ladder re-encodes the audio, once per rung.** ffmpeg's HLS muxer refuses to
+put one copied elementary stream in two variants (`Same elementary stream found
+more than once in two different variant definitions`), so an audio track that a
+single-rendition session would simply copy has to be encoded for each rung. On
+ffmpeg 5.1 and 6.1 — the versions Debian bookworm and Ubuntu ship, including this
+project's container — that refusal is not something the session survives: the
+master playlist comes out with fewer rungs than the decision promised and a
+client never sees the lower ones. ffmpeg 9 tolerates it, which is why this was
+invisible on the development host until CI ran the ladder test against a
+different version. The extra cost is audio encodes, which are cheap next to the
+video ones.
+
 One honest caveat: a VBV ceiling bounds the average, not every instant. A buffer
 twice the ceiling lets the encoder spend what it has saved, so over a segment
 shorter than the buffer the measured rate can exceed the ceiling — on a
