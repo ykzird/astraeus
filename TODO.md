@@ -286,9 +286,10 @@ Status as of the current build. Evidence for each claim is the test suite
 - The hls.js fatal-error recovery path and the native-HLS (Safari) branch are
   implemented but have not been observed firing — no Safari was available, and a
   stream failure could not be forced on a live server.
-- Packaging exists but nothing has been released, and two pieces of it are
-  asserted rather than observed: the CI workflow has never run (the repository
-  has no remote), and the systemd unit has been checked with `systemd-analyze`
+- Packaging exists but nothing has been released. CI now runs on GitHub and has
+  already caught a defect the development host's ffmpeg hid, but the release
+  workflow has never run because no tag has been pushed; and the systemd unit has
+  been checked with `systemd-analyze`
   but never started, because the development host has no reachable systemd
   manager. The `SystemCallFilter` in that unit is the one setting that could stop
   ffmpeg on a host where an encoder needs a call outside the list; the runbook

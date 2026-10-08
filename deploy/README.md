@@ -228,10 +228,12 @@ its injected version) and the arm64 one confirmed as an AArch64 ELF; the image
 was built with the version and OCI labels and run. The workflow YAML passes
 `actionlint`, and CI scans every push for secrets with trufflehog while
 Dependabot keeps the Go modules, the workflow action pins and the container base
-images current. What has *not* happened is GitHub running any of it: the
-repository had no remote, so `ci.yml` and `release.yml` have both only ever been
-executed as their individual commands, and no tag has been pushed. Treat the first
-tagged release as the first real test of the wiring.
+images current. CI now runs on GitHub for every push to `main` and every pull
+request, and it earned its keep immediately: the first run failed the ladder
+integration test against the runner's ffmpeg and the failure reproduced against
+the container's own 5.1.9, showing that a ladder had been serving two rungs of
+three. The **release** workflow has still never run, because no tag has been
+pushed; treat the first tagged release as the first real test of that half.
 
 ---
 
@@ -267,7 +269,8 @@ identity that wrote them was never recorded.
 - **Kubernetes manifests, Windows or macOS packaging.** Release archives are
   built for Linux, and the image is Linux-only; `scripts/build-release.sh` takes
   extra `goos/goarch` arguments if that changes.
-- **CI and releases have never run on GitHub.** Both workflows run the same
-  commands that pass locally, and every release step was run by hand, but the
-  repository had no remote until recently, so GitHub itself has executed neither.
-  The first push and the first tag are the first real test.
+- **The release workflow has never run.** CI has, on every push and pull
+  request, and it has already caught a defect this host could not see; but
+  publishing needs a tag, and no tag has been pushed. Every step was run by hand,
+  and the build, the checksums, the labels and a real multi-arch build were all
+  exercised, but the GitHub Release and the GHCR push are untested.
