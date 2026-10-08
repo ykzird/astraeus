@@ -445,6 +445,10 @@ func (row libraryRow) toLibrary() (*library.Library, error) {
 // entityColumns is the shared SELECT list for media_entities.
 const entityColumns = `id, library_id, parent_id, type, name, status, created_at, updated_at, metadata`
 
+// The same columns qualified for a join, where a bare id would be ambiguous.
+const prefixedEntityColumns = `e.id, e.library_id, e.parent_id, e.type, e.name, e.status,
+	e.created_at, e.updated_at, e.metadata`
+
 type entityRow struct {
 	ID        string               `db:"id"`
 	LibraryID string               `db:"library_id"`
@@ -782,6 +786,61 @@ func (r *Repository) GetProgress(ctx context.Context, entityID string) (*library
 	}
 	return progress, nil
 }
+
+// ListProgress reports the positions worth resuming, most recent first.
+//
+// The join is what makes this one query rather than N+1: a continue-watching
+// list is a list of *entities*, so the entity travels with its position.
+func (r *Repository) ListProgress(ctx context.Context, limit int) ([]library.ProgressEntry, error) {
+	if limit <= 0 {
+		limit = defaultProgressLimit
+	}
+	var rows []struct {
+		entityRow
+		PositionSeconds float64 `db:"position_seconds"`
+		DurationSeconds float64 `db:"duration_seconds"`
+		UpdatedAt       string  `db:"progress_updated_at"`
+	}
+	// A finished position is excluded by the query rather than after it: with the
+	// filter applied in Go, a finished row would consume one of the limit's slots
+	// and a listing of one could come back empty. The comparison uses the domain's
+	// own fraction, so the rule the report path clears rows with and the rule this
+	// listing hides them with cannot drift apart.
+	if err := r.exec().SelectContext(ctx, &rows,
+		`SELECT `+prefixedEntityColumns+`,
+			p.position_seconds, p.duration_seconds, p.updated_at AS progress_updated_at
+		 FROM playback_progress p
+		 JOIN media_entities e ON e.id = p.entity_id
+		 WHERE p.duration_seconds <= 0 OR p.position_seconds < p.duration_seconds * ?
+		 ORDER BY p.updated_at DESC
+		 LIMIT ?`, library.FinishedFraction, limit); err != nil {
+		return nil, fmt.Errorf("listing playback progress: %w", err)
+	}
+
+	entries := make([]library.ProgressEntry, 0, len(rows))
+	for _, row := range rows {
+		entity, err := row.entityRow.toEntity()
+		if err != nil {
+			return nil, err
+		}
+		updated, err := parseTime(row.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		progress := library.PlaybackProgress{
+			EntityID:        entity.ID,
+			PositionSeconds: row.PositionSeconds,
+			DurationSeconds: row.DurationSeconds,
+			UpdatedAt:       updated,
+		}
+		entries = append(entries, library.ProgressEntry{Entity: *entity, Progress: progress})
+	}
+	return entries, nil
+}
+
+// defaultProgressLimit bounds a listing that a client did not bound. A
+// continue-watching list is for picking something up, not for paging a library.
+const defaultProgressLimit = 20
 
 // DeleteProgress forgets an entity's position, which is what starting over
 // means.

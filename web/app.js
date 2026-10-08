@@ -30,6 +30,8 @@
     libraryList: document.getElementById("library-list"),
     navSummary: document.getElementById("nav-summary"),
     navEmpty: document.getElementById("nav-empty"),
+    continueSection: document.getElementById("continue-section"),
+    continueList: document.getElementById("continue-list"),
     filterToggle: document.getElementById("filter-toggle"),
     incompleteCount: document.getElementById("incomplete-count"),
     incompleteDesc: document.getElementById("incomplete-desc"),
@@ -328,6 +330,11 @@
         keepalive: options && options.keepalive === true,
       });
     },
+    /* What is worth resuming, most recently watched first. The entity is
+       embedded in each row, so the rail needs no second lookup. */
+    progress: function () {
+      return apiFetch("progress");
+    },
   };
 
   /* ── 4. State ────────────────────────────────────────────────────────── */
@@ -355,6 +362,10 @@
        so the canvas never invites a scan for a list it never received. */
     librariesFailed: false,
     entitiesFailed: false,
+    /* The continue-watching rail, most recently watched first. Empty covers
+       both "nothing in progress" and "never loaded"; the section hides for
+       either, so it never costs the rail an empty heading. */
+    continueWatching: [],
     /* Set when a route change was driven by a deliberate user gesture, so
        the canvas (not <body>) receives focus once the new view is painted. */
     focusTarget: null,
@@ -625,14 +636,19 @@
 
   /* ── 5. Artwork ──────────────────────────────────────────────────────── */
 
-  /* poster_path/backdrop_path are TMDB-style paths with no CDN configured,
-     so they are usually unusable. We only trust absolute http(s) URLs and
-     otherwise fall back to a deterministic gradient derived from the id. */
+  /* Artwork is only ever loaded from this server's own proxy.
+     poster_url/backdrop_url point at /api/images/..., which fetches the
+     provider's image server-side and caches it; the provider therefore never
+     learns who is watching, or from where. The metadata's own absolute URL is
+     deliberately not used even when it is present - fetching image.tmdb.org
+     from the browser hands a third party the viewer's address, and the policy
+     the server sends (img-src 'self') would refuse it anyway. With no proxy
+     configured, the deterministic gradient derived from the id stands in,
+     which leaks nothing. */
   function remoteArt(entity) {
-    const metadata = metadataOf(entity);
-    if (!metadata) return null;
-    const candidate = metadata.backdrop_path || metadata.poster_path;
-    if (typeof candidate === "string" && /^https?:\/\//i.test(candidate)) return candidate;
+    if (!entity) return null;
+    const candidate = entity.backdrop_url || entity.poster_url;
+    if (typeof candidate === "string" && candidate) return candidate;
     return null;
   }
 
@@ -920,6 +936,58 @@
     dom.filterToggle.setAttribute("aria-pressed", state.filterIncomplete ? "true" : "false");
     dom.enrichButton.disabled = state.busyAction === "enrich";
     dom.enrichButton.textContent = state.busyAction === "enrich" ? "Enriching…" : "Enrich metadata";
+
+    renderContinueWatching();
+  }
+
+  /**
+   * Paint the continue-watching rail.
+   *
+   * Rows reuse the library-list classes so the two sections read as the same
+   * kind of thing, and each row is a real anchor into the router, exactly like
+   * a library row. State is the only source: a refresh that fails leaves the
+   * section hidden rather than showing anything half-read.
+   */
+  function renderContinueWatching() {
+    /* This list repaints on its own, from a background refresh. Rebuilding it
+       must not drop the reader's place if their focus was inside a row. */
+    const restoreKey = focusKeyOf(document.activeElement);
+    clear(dom.continueList);
+    dom.continueSection.hidden = state.continueWatching.length === 0;
+
+    for (const entry of state.continueWatching) {
+      const entity = entry.entity;
+      const progress = entry.progress || {};
+      /* Position and duration are measured against the media file, so an
+         absent duration means the readout cannot claim to know the end. */
+      const duration = Number(progress.duration_seconds);
+      const position = Number(progress.position_seconds);
+      const readout =
+        isFinite(duration) && duration > 0
+          ? formatClock(position) + " of " + formatClock(duration)
+          : formatClock(position);
+      const kind = typeof entity.type === "string" && entity.type ? entity.type : "Entity";
+
+      dom.continueList.append(
+        el("li", { class: "library-item" }, [
+          el(
+            "a",
+            {
+              class: "library-link",
+              href: hashFor("entity", entity.id),
+              "data-focus-key": "continue:" + entity.id,
+              title: displayTitle(entity),
+            },
+            [
+              el("span", { class: "library-name", text: displayTitle(entity) }),
+              el("span", { class: "continue-meta", text: kind + " · " + readout }),
+            ]
+          ),
+        ])
+      );
+    }
+
+    if (restoreKey) restoreFocus(restoreKey);
   }
 
   function kindLabel(kind) {
@@ -2290,23 +2358,40 @@
       position >= RESUME_MIN_SECONDS
         ? api.saveProgress(pb.entityId, { position_seconds: position, duration_seconds: duration }, opts)
         : api.clearProgress(pb.entityId, opts);
-    attempt.catch(function () {
-      /* Best effort, as above. */
-    });
+    attempt.then(
+      function () {
+        /* This report is what the rail now has to agree with. A failed request
+           changed nothing server-side, so only success asks for the refresh —
+           and a report made as the page goes away has no rail left to paint. */
+        if (opts.keepalive === true) return;
+        refreshContinueWatching();
+      },
+      function () {
+        /* Best effort, as above. */
+      }
+    );
   }
 
   /** Forget a stored position. `warn` is for a viewer who asked for it. */
   function forgetProgress(entityId, options) {
     const opts = options || {};
     if (typeof entityId !== "string" || !entityId) return;
-    api.clearProgress(entityId, opts).catch(function (error) {
-      if (opts.warn !== true) return;
-      toast(
-        "Could not clear the saved position. " +
-          (error && error.message ? error.message : "The server did not answer."),
-        "warn"
-      );
-    });
+    api.clearProgress(entityId, opts).then(
+      function () {
+        /* A cleared position can only leave the rail, and a viewer who asked
+           for it is looking at the result, so this one does not wait for the
+           refresh rate limit. */
+        loadContinueWatching();
+      },
+      function (error) {
+        if (opts.warn !== true) return;
+        toast(
+          "Could not clear the saved position. " +
+            (error && error.message ? error.message : "The server did not answer."),
+          "warn"
+        );
+      }
+    );
   }
 
   /**
@@ -3963,6 +4048,9 @@
     for (const library of state.libraries) {
       if (library && typeof library.id === "string") state.entityIndex.delete(library.id);
     }
+    /* Deliberately not awaited: the rail is a second request and the library
+       paint must not queue behind it. It refreshes again on every report. */
+    loadContinueWatching();
   }
 
   async function refreshEntities(libraryId) {
@@ -3987,6 +4075,58 @@
     rememberEntity(detail.entity);
     if (detail.parent) rememberEntity(detail.parent);
     for (const child of Array.isArray(detail.children) ? detail.children : []) rememberEntity(child);
+  }
+
+  /* Continue watching. Reports land every ten seconds for as long as something
+     plays, and a request per report would be hundreds of list fetches for a
+     rail nobody reads mid-film. A report therefore only asks for a refresh and
+     the fetch itself is rate-limited; because the scheduled fetch runs after
+     the last report in a burst rather than the first, the list still ends up
+     agreeing with the position the server holds. */
+  const CONTINUE_REFRESH_INTERVAL_MS = 20000;
+
+  /* A slower response must never overwrite a newer one, so each load carries a
+     token and only the newest may paint. */
+  let continueFetchToken = 0;
+  let continueRefreshTimer = null;
+  let continueRefreshedAt = 0;
+
+  function refreshContinueWatching() {
+    const wait = continueRefreshedAt + CONTINUE_REFRESH_INTERVAL_MS - Date.now();
+    if (wait > 0) {
+      if (continueRefreshTimer !== null) return;
+      continueRefreshTimer = setTimeout(function () {
+        continueRefreshTimer = null;
+        loadContinueWatching();
+      }, wait);
+      return;
+    }
+    loadContinueWatching();
+  }
+
+  async function loadContinueWatching() {
+    const token = (continueFetchToken += 1);
+    continueRefreshedAt = Date.now();
+    let raw;
+    try {
+      raw = await api.progress();
+    } catch (error) {
+      /* A rail the viewer can live without is not worth a dialog. Dropping the
+         list is the honest outcome: what it held can no longer be vouched for,
+         and the section hides itself rather than showing a stale row. */
+      if (token !== continueFetchToken) return;
+      state.continueWatching = [];
+      renderContinueWatching();
+      return;
+    }
+    if (token !== continueFetchToken) return;
+    const entries = raw && Array.isArray(raw.entries) ? raw.entries : [];
+    state.continueWatching = entries.filter(function (entry) {
+      /* A row with no entity or no position is nothing to continue. */
+      return entry && entry.entity && entry.entity.id && entry.progress;
+    });
+    for (const entry of state.continueWatching) rememberEntity(entry.entity);
+    renderContinueWatching();
   }
 
   /* ── 11. Router ──────────────────────────────────────────────────────── */

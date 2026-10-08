@@ -510,3 +510,74 @@ func TestPlaybackProgress_RejectsAnEntityThatDoesNotExist(t *testing.T) {
 		t.Error("saving progress for a missing entity should be refused by the foreign key")
 	}
 }
+
+// TestListProgress covers the continue-watching query: most recently watched
+// first, each position travelling with its entity, and nothing that is over.
+func TestListProgress(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	lib := mustCreateLibrary(t, repo, "Progress", library.MoviesLibrary)
+
+	first := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Watched Earlier")
+	second := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Watched Later")
+	finished := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Finished")
+
+	if entries, err := repo.ListProgress(ctx, 0); err != nil || len(entries) != 0 {
+		t.Fatalf("nothing played should list nothing, got %+v err=%v", entries, err)
+	}
+
+	if err := repo.SaveProgress(ctx, &library.PlaybackProgress{
+		EntityID: first.ID, PositionSeconds: 100, DurationSeconds: 600,
+	}); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+	// The order is by report time, so a second report has to be later; SQLite's
+	// timestamps are stored with sub-second precision, but a test that depends on
+	// clock resolution is a flaky test, so the wait is explicit.
+	time.Sleep(10 * time.Millisecond)
+	if err := repo.SaveProgress(ctx, &library.PlaybackProgress{
+		EntityID: second.ID, PositionSeconds: 200, DurationSeconds: 600,
+	}); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+
+	// A finished position is excluded even though the row exists, because the
+	// listing must apply the same rule the report path clears rows with.
+	if _, err := repo.db.ExecContext(ctx,
+		`INSERT INTO playback_progress (entity_id, position_seconds, duration_seconds, updated_at)
+		 VALUES (?, ?, ?, ?)`,
+		finished.ID, 599.0, 600.0, formatTime(time.Now())); err != nil {
+		t.Fatalf("inserting a finished position: %v", err)
+	}
+
+	entries, err := repo.ListProgress(ctx, 0)
+	if err != nil {
+		t.Fatalf("ListProgress: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %+v, want the two unfinished positions", entries)
+	}
+	if entries[0].Entity.ID != second.ID || entries[1].Entity.ID != first.ID {
+		t.Errorf("order = %q then %q, want the most recently watched first",
+			entries[0].Entity.Name, entries[1].Entity.Name)
+	}
+	if entries[0].Entity.Name != "Watched Later" || entries[0].Progress.PositionSeconds != 200 {
+		t.Errorf("entry = %+v / %+v, want the entity with its position",
+			entries[0].Entity, entries[0].Progress)
+	}
+	// The entity has to arrive complete: a listing that returned bare ids would
+	// make the client fetch each one to render a row.
+	if entries[0].Entity.LibraryID != lib.ID || entries[0].Entity.Type != library.MovieEntity {
+		t.Errorf("the joined entity is incomplete: %+v", entries[0].Entity)
+	}
+
+	limited, err := repo.ListProgress(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListProgress with a limit: %v", err)
+	}
+	if len(limited) != 1 || limited[0].Entity.ID != second.ID {
+		t.Errorf("limited listing = %+v, want just the most recent", limited)
+	}
+}

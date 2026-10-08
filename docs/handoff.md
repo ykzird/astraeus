@@ -1,8 +1,9 @@
 # Handoff
 
 **As of the round-2 work of 2026-10-08 — HDR and Dolby Vision, packaging, the
-bitrate ceiling, the adaptive bitrate ladder, audio track selection, and
-resumable playback. Version 0.7.0. 92 tracked files.** (`git log` names the commits; the previous handoff was
+bitrate ceiling, the adaptive bitrate ladder, audio track selection, resumable
+playback, a continue-watching list, and response hardening. Version 0.9.0. 93
+tracked files.** (`git log` names the commits; the previous handoff was
 `b76a14f`.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
@@ -109,7 +110,13 @@ mise exec -- go test -tags=integration -run TestManager_DeliversTheChosenAudioTr
 
 # Resume state end to end, over HTTP against a copy of a real database: report a
 # position, read it back, overrun it (400), finish it (cleared), force it.
-mise exec -- go test -run TestPlaybackProgress ./internal/api/ ./internal/library/sqlite/
+mise exec -- go test -run 'TestPlaybackProgress|TestListProgress' ./internal/api/ ./internal/library/sqlite/
+
+# Both resume paths in a real browser - direct play seeks the element itself,
+# segmented delivery is started at the offset by the server - plus the
+# continue-watching list gaining and dropping the entry.
+CDP_PORT=9413 node scripts/ui-verify/resume-verify.mjs http://127.0.0.1:8922 <directPlayEntityId> 300
+CDP_PORT=9413 node scripts/ui-verify/resume-verify.mjs http://127.0.0.1:8921 <segmentedEntityId> 600
 
 # The real thing, against the 17 GB film: a browser profile gets bt709/bt709,
 # an HDR manifest gets 10-bit bt2020/PQ. Copy real.db first; *.db is local state.
@@ -284,6 +291,27 @@ HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
 Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 10/10 subtitles. Full Go suite green with race and integration.
 
+**Response hardening** landed as of 0.9.0: a content security policy with no
+`unsafe-inline` and no `unsafe-eval`, `img-src 'self'`, plus nosniff, referrer,
+frame, cross-origin and permissions headers. The policy is strict because the
+front end earned it — no inline script, no inline style, no HTML-injection sink,
+and a vendored hls.js with no `eval` (checked, not assumed); `blob:` is allowed
+for `media-src` and `worker-src` because MSE plays a blob URL and hls.js demuxes
+in a worker built from one. The artwork leak is closed on both ends: the UI loads
+only the server's own proxy, and `img-src 'self'` makes a provider fetch
+impossible rather than merely discouraged. Verified in a browser with a
+throwaway CDP probe (third-party image refused with an `img-src` violation,
+inline script refused, same-origin image fine) and then with the real harnesses:
+32/32 transport checks and 9/9 resume checks, no console errors under the policy.
+
+**Continue watching** landed as of 0.8.0: `GET /api/progress` lists the stored
+positions most recently watched first, with each entity attached so a row needs
+no second request, and the sidebar renders it as a section that is hidden when
+there is nothing to continue. The finished-position rule lives in that query as
+well as in the report path — applied after the `LIMIT`, a finished row consumes
+one of the slots and a listing of one comes back empty, which is the bug the
+adapter test caught.
+
 **Resumable playback** landed as of 0.7.0: a `playback_progress` table keyed by
 entity with a cascading delete, `PUT`/`DELETE /api/entities/{id}/progress`, and a
 `progress` object on the entity detail. Two rules carry the honesty: a position
@@ -341,25 +369,23 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **A "continue watching" surface.** Progress is stored and resumed, but nothing
-   lists what is half-watched, so a viewer has to find the film again to resume
-   it. It is a query, an endpoint and a row in the navigation, and it is what
-   makes the stored progress pay off.
-2. **Per-user progress**, keyed on the identity the access gate already attaches
-   to every request, once there is more than one viewer to tell apart.
-3. **Image subtitles** (PGS/VobSub are detected, reported and refused): OCR or a
+1. **Per-user progress**, keyed on the identity the access gate already attaches
+   to every request, once there is more than one viewer to tell apart. Until then
+   a second viewer overwrites the first one's place, which is the largest
+   simplification left in the product.
+2. **Image subtitles** (PGS/VobSub are detected, reported and refused): OCR or a
    bitmap overlay, and the only subtitle gap left.
-4. **CSP and security headers**, **UI unit tests** (the front end is one 133 KB
-   file with no seam — `web/core.js` for the pure timeline maths is the cheapest
-   first cut), **artwork IP leak** (metadata-supplied absolute URLs are fetched by
-   the browser directly), rate limiting, OpenTelemetry.
-5. **A ladder a client can pin the top of.** Today pinning a height means one
+3. **Rate limiting and OpenTelemetry**, then **UI unit tests** (the front end is
+   one 133 KB file with no seam — `web/core.js` for the pure timeline maths is the
+   cheapest first cut). CSP, security headers and the artwork leak are done as of
+   0.9.0.
+4. **A ladder a client can pin the top of.** Today pinning a height means one
    rendition, so the quality menu caps quality rather than expressing a preference
    within a ladder — the negotiation model is thinner than it looks there.
-6. **Release automation and a TLS example.** Packaging landed (see §6), but
+5. **Release automation and a TLS example.** Packaging landed (see §6), but
    nothing is tagged or published, the CI workflow has never run, and there is no
    reverse-proxy configuration beside the unit.
-7. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
+6. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
@@ -395,8 +421,18 @@ Priority order, with the reasoning. Take it top-down.
   `hwupload` per rung on one device, which is plausible but unverified; the
   software fallback after a hardware failure rebuilds the decision for software
   encoders, so a failed ladder should still land somewhere playable.
-- **Resume is per entity, not per user, and there is no "continue watching"
-  listing.** The storage is keyed by entity id rather than by the identity the
+- **The content security policy is verified against the current UI, not against
+  a future one.** A new inline `<style>` or a script fetched from elsewhere would
+  be refused at runtime and show up as a console error in the harness — which is
+  the point of the policy, but it means a front-end change that adds one will
+  fail verification rather than merely being flagged.
+- **One transport assertion is timing-sensitive on a 4K transcode.** A harness
+  run against the 17 GB film reported 31/32 once, with the failing check outside
+  the captured tail, and two immediate re-runs passed 32/32 on the same code.
+  Treat a single failure there as worth re-running before chasing it — but do
+  capture the whole output, because `tail` is what lost the name of the check.
+- **Resume is per entity, not per user, and there is now a "continue watching"
+  listing but no per-user dimension.** The storage is keyed by entity id rather than by the identity the
   access gate attaches to a request, because with one instance-wide gate there is
   only one viewer to record. A second viewer would overwrite the first one's
   position, and nothing yet lists what is half-watched, so a viewer has to find

@@ -148,6 +148,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/entities/{id}", s.handleGetEntity)
 	mux.HandleFunc("POST /api/metadata/enrich", s.handleEnrich)
 	mux.HandleFunc("POST /api/entities/{id}/playback", s.handlePlayback)
+	mux.HandleFunc("GET /api/progress", s.handleListProgress)
 	mux.HandleFunc("PUT /api/entities/{id}/progress", s.handleSaveProgress)
 	mux.HandleFunc("DELETE /api/entities/{id}/progress", s.handleDeleteProgress)
 	mux.HandleFunc("GET /api/objects/{id}/file", s.handleObjectFile)
@@ -164,7 +165,72 @@ func (s *Server) Handler() http.Handler {
 	// ambiguous pattern set, so the root handler dispatches instead.
 	mux.HandleFunc("/", s.handleRoot)
 
-	return s.withRequestLogging(mux)
+	// Security headers wrap the whole mux, so a route added later cannot forget
+	// them; the request log wraps that, so it records what was actually served.
+	return s.withRequestLogging(s.withSecurityHeaders(mux))
+}
+
+// contentSecurityPolicy is the policy the web UI actually needs, and nothing
+// more. It is built from what the client is rather than from a template:
+//
+//   - script-src and style-src are 'self' with no 'unsafe-inline' and no
+//     'unsafe-eval', which is only possible because the UI has no inline script,
+//     no inline style and no HTML-injection sink at all - it builds DOM with
+//     createElement and sets styles through the CSSOM. The vendored hls.js uses
+//     no eval either; that was checked rather than assumed.
+//   - media-src and worker-src allow blob: because Media Source Extensions play
+//     a blob URL and hls.js runs its demuxer in a worker built from one.
+//   - img-src is 'self', which is what stops artwork being fetched from a
+//     metadata provider directly: every image the UI shows is proxied through
+//     this server, so a third party never learns who is watching.
+//   - frame-ancestors 'none' and object-src 'none' close the two embedding
+//     routes a media server otherwise offers.
+//
+// There is deliberately no report-uri: this project has no collector, and a
+// policy that reports nowhere is theatre.
+const contentSecurityPolicy = "default-src 'self'; " +
+	"script-src 'self'; " +
+	"style-src 'self'; " +
+	"img-src 'self'; " +
+	"media-src 'self' blob:; " +
+	"worker-src 'self' blob:; " +
+	"connect-src 'self'; " +
+	"font-src 'self'; " +
+	"object-src 'none'; " +
+	"base-uri 'none'; " +
+	"form-action 'none'; " +
+	"frame-ancestors 'none'"
+
+// withSecurityHeaders adds the headers a browser needs to be told about, since
+// none of them can be inferred from the response body.
+func (s *Server) withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := w.Header()
+		// The content type is stated on every response already, and this is what
+		// makes a browser believe it rather than sniffing the bytes.
+		header.Set("X-Content-Type-Options", "nosniff")
+		// Nothing here needs to know where a viewer came from, and the UI links
+		// to nothing external, so a referrer is only ever a leak.
+		header.Set("Referrer-Policy", "no-referrer")
+		header.Set("X-Frame-Options", "DENY")
+		header.Set("Cross-Origin-Resource-Policy", "same-origin")
+		// The features this app has no use for, refused by name rather than by
+		// convention.
+		header.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+
+		// A policy for a JSON body means nothing, and its absence is what keeps a
+		// client's debugger free of a header it can never act on. /metrics is
+		// text for a scraper, not a document.
+		if !isAPIPath(r.URL.Path) && r.URL.Path != "/metrics" {
+			header.Set("Content-Security-Policy", contentSecurityPolicy)
+		}
+
+		// Strict-Transport-Security is deliberately absent: this server speaks
+		// plain HTTP, and a browser ignores the header over a non-secure
+		// connection anyway. A reverse proxy that terminates TLS is where it
+		// belongs, and deploy/README.md says so.
+		next.ServeHTTP(w, r)
+	})
 }
 
 // handleRoot serves the UI for browser requests and the JSON error envelope for
@@ -667,6 +733,53 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	response.URL = "/hls/" + session.ID + "/" + session.PlaylistFile()
 	writeJSON(w, http.StatusOK, response)
 }
+
+// progressEntryResource is a stored position with the entity it belongs to,
+// which is what a "continue watching" row renders from.
+type progressEntryResource struct {
+	Entity   entityResource    `json:"entity"`
+	Progress *progressResource `json:"progress"`
+}
+
+// handleListProgress lists what is worth resuming, most recently watched first.
+//
+// It is one endpoint rather than a field on every entity because the question it
+// answers - "what was I in the middle of" - is a query over positions, not over
+// the library, and answering it from the client would mean fetching everything.
+func (s *Server) handleListProgress(w http.ResponseWriter, r *http.Request) {
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_limit",
+				"limit must be a positive integer")
+			return
+		}
+		limit = parsed
+	}
+	if limit > maxProgressLimit {
+		limit = maxProgressLimit
+	}
+
+	entries, err := s.repo.ListProgress(r.Context(), limit)
+	if err != nil {
+		s.writeRepoError(w, r, err, "listing playback progress")
+		return
+	}
+
+	resources := make([]progressEntryResource, 0, len(entries))
+	for _, entry := range entries {
+		resources = append(resources, progressEntryResource{
+			Entity:   s.decorateEntity(entry.Entity),
+			Progress: newProgressResource(&entry.Progress),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": resources})
+}
+
+// maxProgressLimit caps a listing a client asked to make enormous. The list is
+// for picking something up, not for paging a library.
+const maxProgressLimit = 100
 
 // progressRequest is the body of a progress report.
 type progressRequest struct {

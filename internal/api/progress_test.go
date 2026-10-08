@@ -200,3 +200,54 @@ func TestPlayback_DirectPlayDoesNotClaimToHonourAnOffset(t *testing.T) {
 		t.Errorf("start_seconds = %v, want the requested 300 for a segmented session", response.StartSeconds)
 	}
 }
+
+// TestListProgress_ListsWhatIsWorthResuming covers the continue-watching list:
+// one request answers "what was I in the middle of", with the entity ready to
+// render rather than an id to look up.
+func TestListProgress_ListsWhatIsWorthResuming(t *testing.T) {
+	t.Parallel()
+
+	env := newTestEnv(t)
+	entity, _ := seedPlayableEntity(t, env, "Arrival (2016).mp4", "mp4 bytes")
+
+	recorder := env.do(t, http.MethodGet, "/api/progress", "")
+	var empty struct {
+		Entries []progressEntryResource `json:"entries"`
+	}
+	empty = decodeBody[struct {
+		Entries []progressEntryResource `json:"entries"`
+	}](t, recorder)
+	if len(empty.Entries) != 0 {
+		t.Fatalf("nothing played should list nothing, got %+v", empty.Entries)
+	}
+
+	env.do(t, http.MethodPut, "/api/entities/"+entity.ID+"/progress",
+		`{"position_seconds": 1200, "duration_seconds": 7000}`)
+
+	recorder = env.do(t, http.MethodGet, "/api/progress", "")
+	body := decodeBody[struct {
+		Entries []progressEntryResource `json:"entries"`
+	}](t, recorder)
+	if len(body.Entries) != 1 {
+		t.Fatalf("entries = %+v, want the one position", body.Entries)
+	}
+	entry := body.Entries[0]
+	if entry.Entity.ID != entity.ID || entry.Entity.Name != entity.Name {
+		t.Errorf("entry entity = %+v, want %q", entry.Entity, entity.Name)
+	}
+	if entry.Progress == nil || entry.Progress.PositionSeconds != 1200 {
+		t.Errorf("entry progress = %+v, want 1200", entry.Progress)
+	}
+
+	// A limit the client chooses is honoured, and one it cannot mean is refused.
+	if recorder := env.do(t, http.MethodGet, "/api/progress?limit=1", ""); recorder.Code != http.StatusOK {
+		t.Errorf("limit=1 status = %d, want 200", recorder.Code)
+	}
+	recorder = env.do(t, http.MethodGet, "/api/progress?limit=0", "")
+	if recorder.Code != http.StatusBadRequest {
+		t.Errorf("limit=0 status = %d, want 400", recorder.Code)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "invalid_limit") {
+		t.Errorf("expected an invalid_limit code, got %s", body)
+	}
+}

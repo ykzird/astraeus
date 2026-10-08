@@ -50,10 +50,22 @@ type Repository interface {
 	SaveProgress(ctx context.Context, progress *PlaybackProgress) error
 	GetProgress(ctx context.Context, entityID string) (*PlaybackProgress, error)
 	DeleteProgress(ctx context.Context, entityID string) error
+	// ListProgress reports what is worth resuming, most recently watched first,
+	// with the entity each position belongs to. Positions in the closing
+	// fraction of an entity are left out even if a row survives: the answer to
+	// "what was I watching" should not be a film that is over.
+	ListProgress(ctx context.Context, limit int) ([]ProgressEntry, error)
 
 	// WithTx runs fn inside a transaction. The Repository handed to fn is bound
 	// to that transaction; returning an error rolls the whole thing back.
 	WithTx(ctx context.Context, fn func(tx Repository) error) error
+}
+
+// ProgressEntry is a stored position and the entity it describes, which is what
+// a "continue watching" list is made of.
+type ProgressEntry struct {
+	Entity   MediaEntity      `json:"entity"`
+	Progress PlaybackProgress `json:"progress"`
 }
 
 // PruneResult reports what a prune removed.

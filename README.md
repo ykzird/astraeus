@@ -34,6 +34,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | Observability | Done. The KPI registry is exposed in Prometheus format at `/metrics` |
 | Web UI | Three-column spatial layout, served by the binary; HLS via a vendored hls.js; player controls overlaid on the video (transport, seek, subtitles, volume, quality, fullscreen) |
 | Authentication | Optional gate: trusted-proxy identity (Tailscale / Cloudflare Access) or a bearer token |
+| Security headers | A content security policy with no `unsafe-inline` and no `unsafe-eval`, plus nosniff, a referrer policy, frame denial and a permissions policy. Verified in a browser: a third-party image and an inline script are both refused |
 | Packaging | A multi-stage `Dockerfile` (ffmpeg included, non-root, health check) and a hardened systemd unit, both verified as far as this host allows — see [`deploy/README.md`](deploy/README.md) |
 
 ### Playback compatibility
@@ -256,7 +257,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.7.0`).
+identifier (currently `0.9.0`).
 
 ## HTTP API
 
@@ -276,6 +277,7 @@ identifier (currently `0.7.0`).
 | GET | `/api/entities/{id}` | Entity with its objects, children and parent |
 | POST | `/api/metadata/enrich` | Run one enrichment pass |
 | POST | `/api/entities/{id}/playback` | Negotiate playback, returns a URL and subtitle tracks |
+| GET | `/api/progress` | What is worth resuming, most recently watched first |
 | PUT | `/api/entities/{id}/progress` | Record where the viewer got to (resumable playback) |
 | DELETE | `/api/entities/{id}/progress` | Forget it, which is what starting over means |
 | GET | `/api/objects/{id}/file` | The original file (range requests supported) |
@@ -308,6 +310,14 @@ Three rules keep it honest rather than merely present:
 The player resumes on Play and reports while watching. It reports a position
 under five seconds as a *clear* rather than a store, so a viewer who sampled ten
 seconds of something does not get offered a resume at the beginning.
+
+`GET /api/progress` is what makes a stored position findable: it lists what is
+worth resuming, most recently watched first, with each entity attached so a
+client can render a row without a second request. Watched-through entries are
+excluded by the query rather than filtered afterwards — a finished row consuming
+one of the limit's slots is how a listing of one comes back empty. The player's
+sidebar renders it as a **Continue watching** section, hidden entirely when there
+is nothing to continue, and refreshes when progress changes.
 
 Entity payloads also carry `poster_url` and `backdrop_url` pointing at the local
 image proxy, so a client never has to know the metadata provider's URL scheme.
@@ -503,6 +513,42 @@ twice the ceiling lets the encoder spend what it has saved, so over a segment
 shorter than the buffer the measured rate can exceed the ceiling — on a
 six-second test segment a 500 kbps limit measured 632 kbps muxed, while the same
 source unlimited measured 3.3 Mbps. Over a real stream the average converges.
+
+## Security headers
+
+Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy:
+no-referrer`, `X-Frame-Options: DENY`, `Cross-Origin-Resource-Policy:
+same-origin` and a `Permissions-Policy` that refuses the features this app has no
+use for. Documents additionally carry a content security policy:
+
+```
+default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';
+media-src 'self' blob:; worker-src 'self' blob:; connect-src 'self';
+font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none';
+frame-ancestors 'none'
+```
+
+The strictness is possible because of how the front end is written, not in spite
+of it: there is no inline script, no inline style, and no HTML-injection sink
+anywhere in `web/`, so `'unsafe-inline'` is not needed, and the vendored hls.js
+contains no `eval` either — that was checked, not assumed. `blob:` appears for
+`media-src` and `worker-src` because Media Source Extensions play a blob URL and
+hls.js runs its demuxer in a worker built from one. JSON responses get the
+transport-level headers but **not** the policy: a policy on a JSON body is
+something a client can never act on.
+
+`img-src 'self'` is also the enforcement behind a privacy fix: artwork is only
+ever loaded from this server's `/api/images/...` proxy, which fetches the
+provider's image server-side. The UI no longer uses the metadata's own absolute
+URL even when it is present, because fetching `image.tmdb.org` from the browser
+tells that third party who is watching and from where. Verified in headless
+Chromium: a third-party image is refused with an `img-src` violation, an inline
+script is refused, a same-origin image is not, and the whole 32-check player
+harness passes with no console errors under the policy.
+
+`Strict-Transport-Security` is deliberately absent: this server speaks plain
+HTTP, where browsers ignore it. A reverse proxy that terminates TLS is where it
+belongs — see [`deploy/README.md`](deploy/README.md).
 
 ## Access gate
 

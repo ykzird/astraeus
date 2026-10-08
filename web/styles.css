@@ -602,6 +602,41 @@ img {
   color: color-mix(in srgb, var(--brutal-accent-ink) 62%, transparent);
 }
 
+/* Continue watching. A peer of the library list, so its rows are the same
+   rows; only the heading, the divider above it and the height cap are its
+   own. The cap matters because this list is short by nature and must not
+   starve the library list of the rail's free space. */
+.nav-section {
+  flex: 0 0 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--glass-border);
+}
+
+/* `hidden` must win over `display: flex`, as it does for .banner. */
+.nav-section[hidden] {
+  display: none;
+}
+
+.nav-section-title {
+  padding: 14px var(--pad-panel) 0;
+}
+
+.continue-list {
+  flex: 0 1 auto;
+  max-height: 40vh;
+}
+
+.continue-meta {
+  font-family: var(--font-mono);
+  font-size: var(--step-xs);
+  color: var(--ink-mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .nav-panel > .muted {
   padding: 4px var(--pad-panel) 12px;
 }

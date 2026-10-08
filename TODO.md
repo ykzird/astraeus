@@ -78,6 +78,12 @@ Status as of the current build. Evidence for each claim is the test suite
       address, for Tailscale / Cloudflare Access) and `token` mode (constant-time
       bearer token), with per-request identity logging and grant/deny metrics.
       Fails closed on misconfiguration.
+- [x] Security headers and a content security policy with no `unsafe-inline` or
+      `unsafe-eval`, driven by what the UI actually needs; verified in a browser
+      (third-party image and inline script refused, 32/32 harness checks pass)
+- [x] Artwork is loaded only through the server's own proxy; the metadata
+      provider's absolute URLs are no longer fetched by the browser, and
+      `img-src 'self'` makes that structural rather than a convention
 - [ ] Rate limiting
 - [ ] OpenTelemetry tracing
 
@@ -147,10 +153,10 @@ Status as of the current build. Evidence for each claim is the test suite
   re-negotiates with `start_seconds` and ffmpeg seeks the input, so any point
   in the film is reachable in a couple of seconds. The landing point is
   keyframe-aligned, so it can be a second or two early.
-- Playback position is stored per entity and resumed, but progress is
-  instance-wide rather than per user: the access gate identifies a request, and
-  nothing yet keys progress on that identity. There is also no "continue
-  watching" listing, so a viewer has to find the film again to resume it.
+- Playback position is stored per entity, resumed on play, and listed as a
+  **Continue watching** section, but progress is instance-wide rather than per
+  user: the access gate identifies a request, and nothing yet keys progress on
+  that identity, so a second viewer would overwrite the first one's place.
 - HDR is handled, with caveats that are all reported in the negotiation reasons
   rather than hidden:
   - **Dolby Vision profile 5** stores IPTPQc2, not PQ. Tone mapping it with the
@@ -220,12 +226,13 @@ Status as of the current build. Evidence for each claim is the test suite
 - The web UI has no unit tests. It is one large file with no module seam, so its
   logic is only covered by the CDP harnesses in `scripts/ui-verify/`, which need a
   browser and a running server.
-- No `Content-Security-Policy` or other security headers are sent. The absence of
-  any HTML-injection sink in the UI is currently the only defence, and it is a
-  discipline rather than an enforced boundary.
-- Artwork from a metadata provider is fetched by the browser directly when the
-  entity carries an absolute URL, which tells that third party the viewer's IP.
-  The server-side image proxy exists but is not used for those URLs.
+- The content security policy has no `report-uri`: there is no collector to send
+  reports to, and a policy that reports nowhere is theatre. A deployment that
+  wants violation reporting has to add both ends.
+- `Strict-Transport-Security` is not sent by the server. It speaks HTTP, so the
+  header would mean nothing there; a TLS-terminating proxy should set it.
+- Cross-origin isolation (`COOP`/`COEP`) is not configured. Nothing here needs
+  it, and enabling it would break resources that are not `CORP`-tagged.
 - OpenTelemetry tracing is not implemented; beyond the four specified metrics,
   the registry holds counters and histograms for HTTP, scanning, streaming
   sessions, playback decisions, probe errors, transcoder fallbacks and the

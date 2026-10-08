@@ -53,7 +53,11 @@
 
     <main class="layout">
       <!-- ── Left: navigation ─────────────────────────────────────────── -->
-      <aside class="panel nav-panel" aria-labelledby="nav-heading">
+      <!-- The landmark is named for the rail rather than for its first
+           section: it holds libraries *and* continue-watching, and a landmark
+           announced as "Libraries" while containing both misleads a screen
+           reader. The visible heading inside still titles the library list. -->
+      <aside class="panel nav-panel" aria-label="Library navigation">
         <div class="panel-head">
           <h2 id="nav-heading" class="panel-title">Libraries</h2>
           <p id="nav-summary" class="panel-sub">Loading…</p>
@@ -61,6 +65,21 @@
 
         <ul id="library-list" class="library-list"></ul>
         <p id="nav-empty" class="muted small" hidden>No libraries yet.</p>
+
+        <!-- A peer of the library list, below it. Hidden outright rather than
+             shown empty: a rail with nothing to resume should not spend a
+             heading and a placeholder on saying so. -->
+        <section
+          id="continue-section"
+          class="nav-section"
+          aria-labelledby="continue-heading"
+          hidden
+        >
+          <h3 id="continue-heading" class="panel-title nav-section-title">
+            Continue watching
+          </h3>
+          <ul id="continue-list" class="library-list continue-list"></ul>
+        </section>
 
         <div class="nav-actions">
           <button

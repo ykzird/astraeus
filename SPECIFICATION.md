@@ -121,6 +121,19 @@ The system will track the following key metrics to ensure performance excellence
 
 ## 7. Security & Access Control
 
+### 7.0 Response hardening
+
+Every response carries `X-Content-Type-Options`, `Referrer-Policy`,
+`X-Frame-Options`, `Cross-Origin-Resource-Policy` and `Permissions-Policy`;
+documents also carry a content security policy with no `unsafe-inline` and no
+`unsafe-eval`, and `img-src 'self'` so artwork can only come from this server's
+own proxy. That policy is affordable because the front end has no inline script,
+no inline style and no HTML-injection sink — the discipline the UI already
+followed is now an enforced boundary rather than a convention. JSON and metrics
+responses are exempt from the policy, which they could not act on.
+`Strict-Transport-Security` is left to a TLS-terminating proxy, because this
+server speaks plain HTTP and browsers ignore the header there.
+
 ### 7.1 Authentication & Authorization
 *   **Access Model:** A single-gate, instance-wide access model.
 *   **Implementation:** Integration with **Tailscale** or **Cloudflare Access** for secure, identity-aware remote connectivity. No built-in user registration; access is managed by the administrator.
@@ -286,6 +299,10 @@ Sessions are bounded and explicit: `--max-sessions` (default 8) caps concurrent
 segmented streams — each is an ffmpeg process — and a refusal is a `429
 too_many_sessions`, while `DELETE /api/streams/{id}` stops one immediately
 rather than waiting for the idle reaper.
+
+The resumable positions are also a query - what is worth continuing, most
+recently watched first - so the stored state is discoverable rather than
+something a viewer has to remember their way back to.
 
 Playback position is persisted per entity and resumable: a report replaces the
 stored position, a position in the closing 5% clears it because that entity is

@@ -79,6 +79,20 @@ async function progress() {
   return body.progress || null;
 }
 
+// The ids the sidebar's continue-watching list is showing, read from the API the
+// UI itself reads, so the check does not depend on the sidebar's markup.
+async function continueWatchingIds() {
+  try {
+    const res = await fetch(baseUrl + "/api/progress");
+    if (!res.ok) return null;
+    const body = await res.json();
+    if (!body || !Array.isArray(body.entries)) return null;
+    return body.entries.map((entry) => entry && entry.entity && entry.entity.id).filter(Boolean);
+  } catch (error) {
+    return null;
+  }
+}
+
 async function putProgress(position, duration) {
   const res = await fetch(baseUrl + "/api/entities/" + encodeURIComponent(entityId) + "/progress", {
     method: "PUT",
@@ -193,6 +207,14 @@ async function main() {
     reported !== null && watchedTo !== null && Math.abs(Number(reported.position_seconds) - watchedTo) < 30,
     "watched to " + before.clock + ", server has " + JSON.stringify(reported));
 
+  // The sidebar's continue-watching section is what makes a stored position
+  // findable at all: without it a viewer has to remember which film they were
+  // in the middle of.
+  const listed = await continueWatchingIds();
+  record("the continue-watching list offers the entity being watched",
+    listed !== null && listed.includes(entityId),
+    "listed=" + (listed === null ? "unavailable" : JSON.stringify(listed)));
+
   // Starting over must clear it: the next Play should not offer the old place.
   await cdp.eval(`(() => { const b = document.querySelector('[data-action="restart"]'); if (b) { b.click(); return true; } return false; })()`);
   await sleep(3000);
@@ -200,6 +222,13 @@ async function main() {
   record("starting over cleared the stored position",
     afterRestart === null || Number(afterRestart.position_seconds) < 5,
     "server has " + JSON.stringify(afterRestart));
+
+  // And it must leave the list, or a film that is over would keep offering
+  // itself as something to continue.
+  const afterList = await continueWatchingIds();
+  record("the continue-watching list drops it once it is cleared",
+    afterList !== null && !afterList.includes(entityId),
+    "listed=" + (afterList === null ? "unavailable" : JSON.stringify(afterList)));
 
   record("no console errors during the run", consoleErrors.length === 0,
     consoleErrors.length ? consoleErrors.join(" | ") : "clean");
