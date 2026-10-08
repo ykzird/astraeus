@@ -180,6 +180,59 @@ things to watch.
 
 ---
 
+## Releases
+
+A release is a tag. Pushing one that starts with `v` runs
+`.github/workflows/release.yml`, which gates on the unit tests, builds the
+archives, publishes a GitHub Release and pushes a multi-arch image to GHCR:
+
+```sh
+git tag -a v0.17.0 -m "v0.17.0"
+git push origin v0.17.0
+```
+
+The same workflow has a `dry_run` option in the Actions tab: it builds every
+artifact and the image and publishes nothing, which is how to check a change to
+it without spending a tag.
+
+**What a release contains.** One `astraeus-server_<version>_<os>_<arch>.tar.gz`
+per platform — `linux/amd64` and `linux/arm64` by default — each holding the
+binary, the `web` directory it serves (a server without a UI is half a server),
+`LICENSE` and `THIRD_PARTY_NOTICES.md`, plus a `checksums.txt` covering them:
+
+```sh
+sha256sum -c checksums.txt          # from inside the extracted release dir
+./astraeus-server version           # astraeus-server 0.17.0
+```
+
+The image is published as both `:<version>` and `:latest`, one manifest covering
+amd64 and arm64, with build provenance and an SBOM attested alongside it. The
+package is private by default; make it public in the repository's package
+settings if anonymous pulls are wanted. The version is baked in at build time
+(`-ldflags "-X main.version=..."`), so a binary built from a working tree reports
+`dev` rather than a number it cannot back up.
+
+**Running the build by hand** is deliberate: the workflow calls the same script
+you can, and every step below is a command that was run on the development host
+before the repository had a remote.
+
+```sh
+# This host reaches go through mise; CI has it on PATH.
+mise exec -- scripts/build-release.sh 0.17.0
+mise exec -- scripts/build-release.sh 0.17.0 linux/amd64 linux/arm64 darwin/arm64
+```
+
+**What was verified, and what was not.** The archives were built for amd64 and
+arm64, the checksums verified with `sha256sum -c`, the amd64 binary run (printing
+its injected version) and the arm64 one confirmed as an AArch64 ELF; the image
+was built with the version and OCI labels and run. The workflow YAML passes
+`actionlint`. What has *not* happened is GitHub running any of it: the repository
+had no remote, so `ci.yml` and `release.yml` have both only ever been executed as
+their individual commands, and no tag has been pushed. Treat the first tagged
+release as the first real test of the wiring.
+
+---
+
 ## Backups and upgrades
 
 ```sh
@@ -209,7 +262,10 @@ identity that wrote them was never recorded.
 - **Multiple users or per-user libraries.** The gate is instance-wide: it decides
   whether a request is admitted, not what it may see, so every admitted user sees
   the whole library. Playback progress is per viewer, but access is not.
-- **Kubernetes manifests, Windows or macOS packaging.**
-- **CI.** The workflow in `.github/workflows/ci.yml` runs the same checks that
-  pass locally, but the repository has no remote yet, so it has never executed on
-  GitHub.
+- **Kubernetes manifests, Windows or macOS packaging.** Release archives are
+  built for Linux, and the image is Linux-only; `scripts/build-release.sh` takes
+  extra `goos/goarch` arguments if that changes.
+- **CI and releases have never run on GitHub.** Both workflows run the same
+  commands that pass locally, and every release step was run by hand, but the
+  repository had no remote until recently, so GitHub itself has executed neither.
+  The first push and the first tag are the first real test.

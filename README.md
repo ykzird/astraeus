@@ -97,6 +97,25 @@ go build -o astraeus-server ./cmd/astraeus-server
 ./astraeus-server serve --db astraeus.db
 ```
 
+A `go build` from a working tree reports its version as `dev`, because that is
+what it is. Tagged releases build with the version baked in:
+
+```sh
+# Published archives: binary, the web UI it serves, and the licence notices.
+tar -xzf astraeus-server_0.17.0_linux_amd64.tar.gz
+cd astraeus-server_0.17.0_linux_amd64
+sha256sum -c ../checksums.txt     # from the same release
+./astraeus-server version         # astraeus-server 0.17.0
+./astraeus-server serve --db astraeus.db
+
+# Or the image, which includes ffmpeg and tesseract.
+docker pull ghcr.io/jok/astraeus-media:0.17.0
+```
+
+A release is cut by pushing a tag; `scripts/build-release.sh` is the whole build
+and can be run by hand, and [`deploy/README.md`](deploy/README.md) is the
+runbook.
+
 The UI is served from the same origin as the API, from the `web` directory
 (`--web-dir`, set it to an empty string to serve the API only).
 
@@ -260,7 +279,8 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.16.0`).
+identifier: a released binary prints its tag, and one built from a working tree
+prints `dev`.
 
 `serve` flags that are easy to miss because they are named in the sections below
 rather than here:

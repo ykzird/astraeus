@@ -1,0 +1,145 @@
+name: Release
+
+# Cutting a release is pushing a tag:
+#
+#   git tag -a v0.17.0 -m "v0.17.0" && git push origin v0.17.0
+#
+# The same workflow can be run by hand from the Actions tab: `dry_run` builds
+# every artifact and the image but publishes nothing, which is the way to check
+# a change to this file without spending a tag.
+#
+# Every command below was run by hand on the development host before the
+# repository had a remote; deploy/README.md records what that did and did not
+# cover.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build everything and publish nothing
+        type: boolean
+        default: true
+
+# One release at a time, and never cancel a half-published one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # create the GitHub Release
+  packages: write # push the image to GHCR
+
+jobs:
+  gate:
+    name: Gate on the unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # A tag is a promise that this revision passed; the full integration
+      # suite runs in ci.yml, which a tag push also triggers.
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+
+  version:
+    name: Resolve the version
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.resolve.outputs.value }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - name: Resolve
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            # A dry run is not a release number and must not look like one.
+            echo "value=0.0.0-dryrun" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  binaries:
+    name: Build the release archives
+    needs: [gate, version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        run: scripts/build-release.sh "${{ needs.version.outputs.value }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-archives
+          path: dist/*.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-checksums
+          path: dist/checksums.txt
+          if-no-files-found: error
+
+  publish:
+    name: Publish the GitHub Release
+    needs: [version, binaries]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # gh is preinstalled on the runner, so publishing needs no third-party
+      # release action; --generate-notes writes the notes from the commits.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/checksums.txt \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
+  image:
+    name: Build and push the container image
+    needs: [gate, version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # GHCR requires a lower-case repository path.
+      - name: Image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: needs.version.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.version.outputs.publish == 'true' }}
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ needs.version.outputs.value }}
+            ${{ steps.image.outputs.name }}:latest
+          build-args: |
+            VERSION=${{ needs.version.outputs.value }}
+            REVISION=${{ github.sha }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          # Attestations travel with the image, so a consumer can see what built
+          # it and what is inside it without a separate signing key.
+          provenance: true
+          sbom: true

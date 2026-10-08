@@ -7,9 +7,19 @@
 # so the runtime image needs no toolchain and no libc beyond Debian's.
 
 # ---- build -----------------------------------------------------------------
-FROM golang:1.26-bookworm AS build
+# The builder runs on the *build* platform and cross-compiles for the target
+# one, so a multi-arch build needs no emulation: the Go toolchain is native and
+# only the runtime base image differs per architecture.
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
 
 WORKDIR /src
+
+# The version the binary reports. The release workflow passes the tag; a plain
+# `docker build` leaves the development default, which is what an untagged build
+# honestly is. TARGETOS/TARGETARCH are defined by BuildKit from --platform.
+ARG VERSION=dev
+ARG TARGETOS=linux
+ARG TARGETARCH
 
 # The module files are copied first so the dependency layer survives a source
 # change, which is most of the build time.
@@ -22,12 +32,27 @@ COPY web ./web
 
 # CGO_ENABLED=0 is what makes a static binary, and -trimpath keeps the build
 # reproducible by keeping this machine's paths out of it.
-RUN CGO_ENABLED=0 GOOS=linux go build \
-        -trimpath -ldflags "-s -w" \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+        -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
         -o /out/astraeus-server ./cmd/astraeus-server
 
 # ---- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim
+
+# Provenance for a released image: what it is, where its source is, which
+# revision built it and under what licence. The release workflow passes SOURCE,
+# VERSION and REVISION; an untagged build gets defaults that say so.
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG SOURCE=https://github.com/jok/astraeus-media
+LABEL org.opencontainers.image.title="Astraeus Media" \
+      org.opencontainers.image.description="A single-binary media server with an embedded web UI" \
+      org.opencontainers.image.source="${SOURCE}" \
+      org.opencontainers.image.url="${SOURCE}" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.base.name="docker.io/library/debian:bookworm-slim"
 
 # ffmpeg is a hard dependency, not a convenience: without it the server can still
 # list a library but cannot probe a file, so it reports that at startup and

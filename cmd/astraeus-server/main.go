@@ -43,8 +43,12 @@ import (
 	"github.com/jok/astraeus-media/internal/tracing"
 )
 
-// version is the build identifier reported by `astraeus-server version`.
-const version = "0.16.0"
+// version is the build identifier reported by `astraeus-server version` and
+// recorded as service.version on exported traces. It is a variable rather than
+// a constant so a release build can set it from the tag with
+// `-ldflags "-X main.version=..."`. A plain `go build` leaves it as "dev",
+// which is what an untagged working-tree binary honestly is.
+var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {

@@ -1,13 +1,14 @@
 # Handoff
 
-**As of the round-9 work of 2026-10-08 — a quality choice that caps a ladder.
-Version 0.16.0. 115 tracked files.** (`git log` names the commits; the previous
-handoff was `3d14775`, which added OCR for PGS image subtitles. Round 8 was OCR,
-round 7 front-end unit tests, round 6 trace export, round 5 API rate limiting,
-round 4 image subtitles by burn-in, round 3 per-viewer progress, and round 2
-HDR/Dolby Vision, packaging, the bitrate ceiling, the adaptive ladder, audio
-track selection, resumable playback, the continue-watching list and response
-hardening.)
+**As of the round-10 work of 2026-10-08 — release automation. 117 tracked
+files; the in-tree version is `dev` and a release takes its number from its tag
+(the next tag would be v0.17.0).** (`git log` names the commits; the previous
+handoff was `e2a434e`, which made a quality choice cap a ladder. Round 9 was that
+ladder cap, round 8 OCR for PGS image subtitles, round 7 front-end unit tests,
+round 6 trace export, round 5 API rate limiting, round 4 image subtitles by
+burn-in, round 3 per-viewer progress, and round 2 HDR/Dolby Vision, packaging,
+the bitrate ceiling, the adaptive ladder, audio track selection, resumable
+playback, the continue-watching list and response hardening.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -250,6 +251,29 @@ Note that `docker build` needs its state inside the workspace on this host, or
 the sandbox refuses it: set `DOCKER_CONFIG=$PWD/../.tmp/docker-config` and
 `BUILDX_CONFIG=$PWD/../.tmp/buildx` before building.
 
+Releases are checked by building one. The workflow calls the same script, and
+the version it bakes in is the only difference between this and a plain build:
+
+```sh
+# Archives for the default platforms (linux/amd64, linux/arm64) in ./dist.
+mise exec -- scripts/build-release.sh 0.17.0
+(cd dist && sha256sum -c checksums.txt)
+tar -xzf dist/astraeus-server_0.17.0_linux_amd64.tar.gz -C /tmp
+/tmp/astraeus-server_0.17.0_linux_amd64/astraeus-server version   # 0.17.0
+
+# The image carries the version and the OCI provenance labels; both are read
+# back from the built artefact rather than from the Dockerfile.
+docker build --build-arg VERSION=0.17.0 --build-arg REVISION="$(git rev-parse --short HEAD)" \
+  -t astraeus-media:0.17.0 .
+docker inspect astraeus-media:0.17.0 --format '{{json .Config.Labels}}' | python3 -m json.tool
+docker run --rm astraeus-media:0.17.0 version
+
+# Both workflows lint clean; actionlint runs from a container, so nothing is
+# installed on the host.
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/repo -w /repo rhysd/actionlint:latest
+```
+
+
 ---
 
 ## 4. Architecture
@@ -410,6 +434,37 @@ Verified in a real browser against real 4K content in the round-2 work: 28/28
 chrome, 13/13 player, 10/10 subtitles. Full Go suite green with race and
 integration. Those numbers belong to that content: the bundled demo clips score
 lower on the auto-hide checks for fixture reasons (§8).
+
+**Release automation** landed as of round 10 (untagged; the next tag is
+v0.17.0). Pushing a `v*` tag runs `.github/workflows/release.yml`, which gates on
+the unit tests, builds one archive per platform with
+`scripts/build-release.sh`, publishes a GitHub Release with a checksums file and
+generated notes, and pushes a multi-arch image — `linux/amd64` and `linux/arm64`
+in one manifest — to GHCR with build provenance and an SBOM attested alongside
+it. The workflow is thin on purpose: all of the work is in the script, which runs
+by hand, and that is how it was verified. The repository still has no remote, so
+neither workflow has executed on GitHub.
+
+Two decisions shaped it. **The version had to stop being a constant.** It is now
+a variable set from the tag with `-ldflags "-X main.version=..."`, so `go build`
+reports `dev` and a release reports its tag; a binary that cannot name the
+revision it came from should say so rather than print a number it cannot back up.
+**The build is hand-rolled rather than GoReleaser.** The project already avoids a
+dependency it can replace with a page it controls, and here the whole release
+fits in one script whose every step can be run and checked on the development
+host — which is the property that made it verifiable at all without a remote.
+
+Verified by running it, not by reading it. `scripts/build-release.sh 0.17.0`
+produced `astraeus-server_0.17.0_linux_{amd64,arm64}.tar.gz` (binary, the `web`
+directory it serves, `LICENSE`, the notices) and a checksums file that
+`sha256sum -c` accepts; the amd64 binary printed `astraeus-server 0.17.0` and the
+arm64 one is an AArch64 ELF. The image was built with the version and the OCI
+labels, `docker inspect` read all eight labels back with the right revision, and
+the container served `/api/health`. The multi-arch build was run for real
+(emulated arm64 only for the runtime layer's `apt-get`, because the builder stage
+runs on `$BUILDPLATFORM` and cross-compiles) and its OCI index carries both
+platforms. `actionlint` accepts both workflows. What has *not* happened is GitHub
+running any of it.
 
 **A quality choice that caps a ladder** landed as of 0.16.0, which fixes a
 negotiation model that was thinner than its field name. Until now
@@ -702,9 +757,10 @@ the fixture's caption. The unit passes `systemd-analyze verify` and scores 1.6
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **Release automation and a TLS example.** Packaging landed (see §6), but
-   nothing is tagged or published, the CI workflow has never run, and there is no
-   reverse-proxy configuration beside the unit.
+1. **A TLS example.** Release automation landed in round 10 (see §6), so a tag
+   now builds and publishes the archives and the image; what is still missing is
+   the reverse-proxy configuration beside the unit, and the runbook for the
+   access-gate interaction a proxy creates.
 2. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
    VobSub (or DVB) track keeps its refusal and its burn because it lives in a
    different container with a different palette, and no such sample exists here.
@@ -881,10 +937,15 @@ Priority order, with the reasoning. Take it top-down.
   `systemd-analyze verify` and `security`, but never *started*: the development
   host has no reachable systemd manager, so the hardening directives
   (`ProtectSystem=strict`, `ReadWritePaths`, the syscall filter) are reasoned
-  about rather than observed. The CI workflow has never executed anywhere — the
-  repository has no remote — though every step in it was run by hand here.
-  `deploy/README.md` states all of this in place, so a reader of the deployment
-  docs does not have to find this handoff to learn it.
+  about rather than observed. **Neither workflow has executed on GitHub** — the
+  repository has no remote — though every step in both was run by hand here, and
+  the release build was run end to end (archives, checksums, the injected
+  version, the labels, a real multi-arch build). The arm64 image needed QEMU for
+  the runtime layer's `apt-get`; `tonistiigi/binfmt --install arm64` registered it
+  on this host, which is a kernel-level change this repository did not make and
+  does not document, because CI's `docker/setup-qemu-action` does the same thing
+  from scratch. `deploy/README.md` states all of this in place, so a reader of the
+  deployment docs does not have to find this handoff to learn it.
 - **The unit's `SystemCallFilter=@system-service` is the one hardening line that
   could break playback** on a host where an encoder needs a call outside the
   list. It is the standard set for a service of this kind, but no encoder here
