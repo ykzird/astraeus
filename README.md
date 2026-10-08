@@ -25,6 +25,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | REST API | Done. Libraries, entities, scanning, enrichment, playback, artwork, subtitles |
 | Capability negotiation | Done. Direct play / remux / transcode, with reasons |
 | Segmented streaming | Done. HLS via ffmpeg, passthrough or transcode |
+| HDR and Dolby Vision | Detected from the source's colour tags; **tone mapped to SDR** for clients that cannot show it, and passed through at 10 bits for those that can. Dolby Vision profile 8 keeps its HDR10 base layer; profile 5 is flagged as approximate |
 | Hardware acceleration | NVENC, QuickSync, VideoToolbox, VAAPI and AMF, each **verified by running it with the real options** at startup; rejected encoders report why; software fallback |
 | Subtitles | Done. Text tracks extracted to WebVTT, cached and served |
 | Observability | Done. The KPI registry is exposed in Prometheus format at `/metrics` |
@@ -160,7 +161,56 @@ retried once in software and `astraeus_transcode_fallbacks_total` counts it,
 rather than failing the request when a working software path exists.
 
 `GET /api/system/capabilities` reports what survived that check, including the
-`video_encoders` and `audio_encoders` this host can actually offer.
+`video_encoders` and `audio_encoders` this host can actually offer, and
+`hdr_video_encoders`, which lists the encoders that also produced a **10-bit**
+stream — each with the pixel format it accepted.
+
+### HDR and dynamic range
+
+A high dynamic range source is not merely a brighter one. PQ (SMPTE ST 2084) and
+HLG code values describe light through a different transfer function, so SDR
+output has to convert them; ffmpeg's default behaviour is to reinterpret the
+values and tag the result as the source was tagged. The picture then reaches the
+player looking washed out — milky blacks, flat contrast — **and the stream
+claims to be HDR while containing 8-bit data**, which is what makes it wrong
+rather than merely different.
+
+Dynamic range is decided from the source's **transfer function**, not its bit
+depth or its primaries. A 10-bit BT.2020 SDR master is stored exactly like an SDR
+one and is never tone mapped; guessing HDR from a wide-gamut tag would reduce the
+contrast of a correct picture, which is worse than leaving a mis-tagged file
+alone.
+
+| Source | Client | Result |
+| --- | --- | --- |
+| SDR | any | Unchanged. No tone mapping, whatever the bit depth |
+| HDR | declares `supports_hdr` | **Kept**: direct play, remux, or a 10-bit re-encode, tagged BT.2020 with the source's PQ or HLG transfer. Dolby Vision's dynamic metadata is not carried through a re-encode and the reasons say so |
+| HDR | does not | **Tone mapped to SDR**: 8-bit BT.709, tagged `bt709`/`bt709`/`bt709` |
+
+Tone mapping is the documented software chain — `zscale` to linear light, the
+`hable` tone curve, `zscale` back to BT.709 — because it needs no GPU. The
+libplacebo filter tone maps better and understands BT.2390 and Dolby Vision, but
+it requires a working Vulkan device and fails the whole transcode where one is
+missing, so it is deliberately not used.
+
+Keeping HDR is a *separately proved* capability. A video encoder that works at
+8 bits can still refuse 10, so at startup each encoder is probed a second time
+with a 10-bit pixel format and a real session's options; `hdr_video_encoders` is
+that list. If a client asks for HDR and no encoder here proved 10-bit — or the
+only one that did has since failed — the stream is tone mapped to SDR with the
+reason attached, because failing a request that a working software encoder could
+have served is the wrong answer.
+
+Two caveats are reported rather than hidden. **Dolby Vision profile 5** stores
+IPTPQc2, not PQ, so tone mapping it without a Dolby Vision converter produces
+approximate colour, and the reasons say exactly that. Re-encoding a **profile 8**
+stream keeps its HDR10 base layer but not the dynamic metadata. Mastering-display
+and content-light metadata are not carried through a re-encode either.
+
+Detection reads ffprobe's `color_transfer`, `color_primaries`, `color_space` and
+the stream's `DOVI configuration record`; all of it appears in the playback
+response's `media_info` as `dynamic_range`, `dolby_vision_profile` and
+`dolby_vision_base_layer_hdr10`.
 
 ### Scanning
 
@@ -196,7 +246,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.2.0`).
+identifier (currently `0.3.0`).
 
 ## HTTP API
 
@@ -265,6 +315,7 @@ Errors are `{"code": "...", "message": "..."}` with a matching status code.
   "max_bitrate_kbps": 120000,
   "max_bit_depth": 8,
   "max_audio_channels": 2,
+  "supports_hdr": false,
   "supports_hls": true,
   "subtitles": true
 }
@@ -312,14 +363,18 @@ Modes:
 - **`remux`** — streams are compatible but the container is not; they are copied
   into HLS unchanged, so quality is bit-identical.
 - **`transcode`** — at least one stream is incompatible, or the source is larger
-  than the client accepts; only the offending streams are re-encoded.
+  than the client accepts; only the offending streams are re-encoded. This is
+  also where an HDR source is tone mapped for a client that cannot show HDR.
 
 A `409` means the client's declaration makes delivery impossible (for example it
 needs re-encoding but cannot play HLS); the reasons explain why.
 
 The decision also carries the concrete targets it chose — `target_height` for a
-downscale and `target_audio_channels` for a downmix — so a client can see not
-just that it will be re-encoded but what it will get.
+downscale, `target_audio_channels` for a downmix, and `target_dynamic_range` for
+the delivered video's dynamic range — so a client can see not just that it will
+be re-encoded but what it will get. A `tone_map` flag says the picture was
+converted from HDR to SDR, which is a visible change rather than a quality
+trade-off.
 
 A manifest naming a codec that does not exist is refused with `400` before it
 can reach ffmpeg. A codec that exists but that this host cannot encode is a
@@ -334,6 +389,14 @@ first it tears down the whole `MediaSource`, so the player attaches, fetches
 every segment and never shows a frame. A browser client should declare
 `max_audio_channels: 2` and `max_bit_depth: 8` — the built-in profile already
 does.
+
+`supports_hdr` is the one field that is **not** inferred from anything else, and
+it is off in the built-in profile. Nothing about an arbitrary browser proves it
+can render HDR, so assuming it would hand a PQ stream to a compositor that shows
+it washed out. A client that really can — a television app, a browser on an HDR
+display reporting through its own manifest — says so. Declaring it alongside
+`max_bit_depth: 8` is a contradiction and is refused with `400`: HDR is stored at
+ten bits or more.
 
 ## Access gate
 

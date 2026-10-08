@@ -1,10 +1,13 @@
 # Handoff
 
-**As of commit `428341c`, 2026-10-08. Version 0.2.0. 83 tracked files.**
+**As of commit `f489fa4`, 2026-10-08. Version 0.3.0. 85 tracked files.**
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
 long time; the state and open-work sections are the ones to refresh.
+
+If you are an agent picking this up, read §5 first: there is a session-budget
+rule there that decides when to stop and hand over rather than run long.
 
 ---
 
@@ -44,6 +47,8 @@ Traps that have cost time:
 | CLI flags are per-command, and the top-level `--help` lists only the commands | run `./astraeus-server <cmd> -h`; `--db` exists on `scan`, `library add` and `enrich`, but not at the top level |
 | `scan` has no `--all` flag | use `POST /api/scan` for every library, or `scan --library <id>` for one |
 | Stream and cache dirs default to temp | pass `--stream-root` / `--subtitle-cache` / `--image-cache` inside the workspace when testing |
+| `web/vendor/hls.min.js` is 620 KB on one line | exclude `web/vendor` (or `*.min.js`) from any search across `web/`, or one grep flushes the result |
+| The session transcript echoes each provider response in a `stream` field | a char count over it says ~3x the truth. Take the prompt size from the `usage` block of the last `assistant/message`: `inputTokens + cacheReadTokens` |
 
 ---
 
@@ -76,6 +81,25 @@ CDP_PORT=9410 node real-media-verify.mjs    http://127.0.0.1:8910 <realFilmId> 1
 the overlay, icons, fullscreen, audio, quality switching, subtitle persistence
 and auto-hide, against real 4K content. Last run: **28/28**, and it ran against
 the 17 GB film, not the demo clips.
+
+Dynamic range has its own checks, and they are worth re-running after any change
+to negotiation or to the ffmpeg argument builder:
+
+```sh
+# Synthesises a PQ/BT.2020 fixture and runs both delivery paths through real
+# ffmpeg, asserting the *produced segment*: 8-bit bt709 after a tone map, 10-bit
+# smpte2084/bt2020 when HDR is kept.
+mise exec -- go test -tags=integration -run 'ToneMapsHDR|KeepsHDR' -v ./internal/streaming/
+
+# The real thing, against the 17 GB film: a browser profile gets bt709/bt709,
+# an HDR manifest gets 10-bit bt2020/PQ. Copy real.db first; *.db is local state.
+cp real.db /tmp/verify.db   # or anywhere outside the repo
+./astraeus-server serve --db /tmp/verify.db --web-dir web --addr 127.0.0.1:8912 \
+  --enrich-interval 0 --scan-interval 0 --stream-root /tmp/verify-streams &
+curl -s localhost:8912/api/system/capabilities | python3 -m json.tool   # hdr_video_encoders
+# then POST a capability manifest to /api/entities/{id}/playback and ffprobe a
+# fetched segment for pix_fmt and colour tags (see §3's commands for the shape)
+```
 
 Two mechanical checks worth re-running after any change to the API surface or the
 metrics registry — both are scripted in the review's spirit and catch documentation
@@ -137,13 +161,60 @@ Conventions that matter more than they look:
 - **Verify claims mechanically.** Test counts before and after a refactor (37
   before, 37 after the library split); metrics and routes against the docs.
 - **A failing test after a deliberate behaviour change usually asserts the old
-  bug.** This has happened four times now — `EncoderFor`'s "nothing available"
+  bug.** This has happened five times now — `EncoderFor`'s "nothing available"
   case expected a software encoder that was never declared, the sweep fixture
   predated the marker file, `compiledButUnusable` put a rejected encoder in the
-  verified list, and the pixel-format test expected VAAPI to take `-pix_fmt`.
+  verified list, the pixel-format test expected VAAPI to take `-pix_fmt`, and the
+  encoder probe test assumed one probe per encoder where there are now two.
   Check which is wrong before "fixing" the code.
 - **Regression tests must fail before the fix.** The auto-hide check was run
-  against the unfixed build to prove it caught the reported bug.
+  against the unfixed build to prove it caught the reported bug; so was the HDR
+  work, where reproducing the old command line showed an 8-bit stream still
+  tagged `smpte2084`/`bt2020`.
+- **Test the artefact, not the command line, when colour or format is the
+  point.** Asserting the ffmpeg arguments would have passed for a mechanism that
+  does not work: `-color_primaries` is accepted and ignored. The integration
+  tests probe the produced segment instead.
+
+### Session budget: stop before the harness compacts you
+
+Long agent sessions get compacted, and a compaction loses the thread of a
+multi-step increment. Rather than discover that halfway through a change, watch
+the budget and hand over deliberately.
+
+```sh
+# Measures the real prompt size from the provider's own usage block.
+mkdir -p .tmp && cat > .tmp/ctx-check.sh <<'EOF'
+FILE=$(find "${DSH_HOME:-$HOME/.dsh}/sessions" -type d -name "${DSH_SESSION_ID:?}" | head -1)/session.v4.jsonl.zstd
+zstd -dc "$FILE" | python3 -c '
+import json,sys
+WINDOW, used, at = 1_000_000, 0, (0,0)
+for line in sys.stdin:
+    e = json.loads(line) if line.strip() else {}
+    if e.get("type") == "request/context":
+        WINDOW = e["data"].get("contextWindow", WINDOW)
+    if e.get("type") == "assistant/message" and e["data"].get("usage"):
+        u = e["data"]["usage"]
+        used, at = u.get("inputTokens",0)+u.get("cacheReadTokens",0), (e["data"].get("turn"), e["data"].get("step"))
+print(f"{used:,} of {WINDOW:,} tokens ({100*used/WINDOW:.1f}% used), last measured at {at}")'
+EOF
+bash .tmp/ctx-check.sh
+```
+
+The window is **1,000,000 tokens** for `deepseek-flash`, so the two thresholds
+below leave room to finish properly. They are deliberately far below the
+harness's own compaction point, because the point is to end by choice:
+
+| Used | Do |
+| --- | --- |
+| **70%** (700k) | Wrap up: finish the increment in hand, no new work |
+| **80%** (800k) | Stop picking up work entirely. Sync `README`, `SPECIFICATION`, `TODO` and this handoff with the state you reached, commit it, and hand over a short summary a fresh session can start from |
+
+The handover must say what is done and verified, what is half-done, the exact
+command that reproduces each claim, and the next priority from §7 — §7 is
+written to be taken top-down for exactly this reason. A one-line reference to
+this document plus the state is enough to start the next session; it should not
+need this session's transcript.
 
 ---
 
@@ -158,6 +229,16 @@ direct play with range requests; WebVTT subtitles; the access gate; Prometheus
 KPIs; and a full player (overlay transport, fullscreen, subtitles, volume, quality
 selection, auto-hide).
 
+Dynamic range is a sixth axis as of `f489fa4`. HDR is classified from the
+source's transfer function (PQ and HLG, never from bit depth or primaries),
+Dolby Vision is reported with its profile and base-layer compatibility, a client
+that cannot show HDR gets a tone-mapped SDR stream tagged BT.709, and one that
+declares `supports_hdr` keeps 10-bit HDR through a copy, remux or re-encode. The
+re-encode path is gated on a second startup probe per encoder, because an encoder
+that works at 8 bits may refuse 10. Verified against the 17 GB film: 1920x820
+H.264 tagged `bt709`/`bt709`/`bt709` for the browser profile, 2528x1080 10-bit
+HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
+
 Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 10/10 subtitles. Full Go suite green with race and integration.
 
@@ -165,26 +246,26 @@ Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 
 ## 7. Open work
 
-Priority order, with the reasoning:
+Priority order, with the reasoning. Take it top-down.
 
-1. **HDR and Dolby Vision.** Deliberately deferred — the owner has no HDR monitor
-   and would have to test on a TV. Only bit depth is probed, output is pinned to
-   8-bit, so a 10-bit BT.2020/PQ source is converted to SDR naively and looks
-   washed out or dark. This is *visibly wrong output*, not a missing feature, which
-   is why it leads the list. Both Jellyfin and Plex still have open bugs here.
-2. **Packaging.** No `Dockerfile`, systemd unit or CI. `LICENSE` and the notices
-   exist. Nothing reaches anyone without this.
-3. **A real ABR ladder**, and making `max_bitrate_kbps` do something. The field is
+1. **Packaging.** No `Dockerfile`, systemd unit or CI. `LICENSE` and the notices
+   exist. Nothing reaches anyone without this, and it is now the only thing
+   standing between a finished engine and something somebody else can run.
+2. **A real ABR ladder**, and making `max_bitrate_kbps` do something. The field is
    currently accepted, validated and echoed but never acted on, which is worse
    than not having it.
-4. **Multi-audio-track selection** (the first stream wins today) and **image
+3. **Multi-audio-track selection** (the first stream wins today) and **image
    subtitles** (PGS/VobSub are detected, reported, and refused).
-5. **Resume / watch state.** The hard part already works: a session can start at
+4. **Resume / watch state.** The hard part already works: a session can start at
    an offset, so this is mostly persistence plus a report endpoint.
-6. **CSP and security headers**, **UI unit tests** (the front end is one 133 KB
+5. **CSP and security headers**, **UI unit tests** (the front end is one 133 KB
    file with no seam — `web/core.js` for the pure timeline maths is the cheapest
    first cut), **artwork IP leak** (metadata-supplied absolute URLs are fetched by
    the browser directly), rate limiting, OpenTelemetry.
+6. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
+   the Dolby Vision tooling) and **carrying mastering-display / content-light
+   metadata through a re-encode**. Both are refinements of work that is otherwise
+   complete, and both need hardware or samples that do not exist on this host.
 
 `TODO.md` carries the complete list with detail.
 
@@ -199,9 +280,23 @@ Priority order, with the reasoning:
 - **VAAPI is in the same position**, and its `-vaapi_device` was missing from
   real sessions until recently — the probe passed while playback would have
   failed. Fixed, and asserted by a test, but still unexercised on hardware.
-- **HDR**, as above.
+- **HDR on hardware is unverified.** The 10-bit probe runs per encoder on
+  whatever host starts the server, so the mechanism is exercised; the hardware
+  families themselves are not. On this machine the probe verified five *software*
+  encoders at 10-bit, and the VAAPI tone-map path (`tonemap_vaapi` is not used;
+  tone mapping happens in software before the upload) has never run.
+- **HLG is implemented but never seen.** It is classified, and tagged
+  `arib-std-b67`, but no HLG sample exists here to tone map or pass through.
+- **Dolby Vision profile 5 tone mapping is approximate and untested.** No profile
+  5 sample exists here either; the reasons say the colour will be approximate,
+  which is the honest position, but the approximation itself has not been looked
+  at.
 - **Firefox is not installed**, so the hls.js path has only been verified in
   Chromium, and the native-HLS (Safari) branch has never been observed firing.
+- **No browser has been asked to play an HDR stream.** The HDR path is verified
+  down to the produced segment (10-bit, `bt2020nc`/`smpte2084`/`bt2020`), not to
+  a compositor showing it correctly — which is why the client has to declare
+  `supports_hdr` rather than being assumed capable.
 - The visual design of a narrow player, and Firefox/Safari rendering generally,
   have not been looked at by eye.
 
@@ -240,5 +335,25 @@ documentation without hardware to check them against.
 - **`internal/library` still holds models, the port and the scanner** — 2,000
   lines doing one job, not a missed extraction. The seams that were worth cutting
   have been.
+- **No `-color_primaries` appears anywhere in a session command line.** That is
+  the fix, not an omission: ffmpeg writes the encoder's VUI from the *frame*
+  properties and ignores those options — verified by re-encoding a PQ source and
+  finding `unknown` primaries and transfer, and by watching them break tags that
+  `-x265-params` alone got right. Colour is set where it is read: `zscale` stages
+  in the tone-map chain, `setparams` on an HDR pass-through.
+- **Every encoder is probed twice at startup**, once at 8 bits and once at 10.
+  That is deliberate: an encoder can work at 8 and refuse 10, and offering HDR on
+  the strength of the 8-bit result would fail at the first frame. The 10-bit list
+  is reported separately as `hdr_video_encoders`, each with the pixel format it
+  accepted.
+- **A remux of an HDR source keeps HDR without re-encoding**, so an HDR film over
+  an incompatible container is copied rather than converted. Only a client that
+  declared `supports_hdr` ever reaches that path, because an SDR client's
+  decision is a tone map.
+- **A tone-map session fails rather than degrades on a mis-tagged source.**
+  `zscale` reports "no path between colorspaces" if a file claims PQ but is not
+  HDR. Failing is deliberate — a wrong picture delivered silently is worse — but
+  the error arrives as `500 stream_start_failed`, which does not name the
+  mis-tagging. Worth improving if it is ever seen in the wild.
 - **`docs/review/*` name types that no longer exist** (`library.SQLiteRepository`,
   `MetadataProvider`). They are point-in-time records with headers saying so.

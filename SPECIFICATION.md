@@ -69,6 +69,7 @@ To ensure maximum efficiency and minimal latency, the server implements a **Proa
 3.  **Decision:**
     *   **Direct Play (Segmented):** If the client supports the source codec and protocol, the server serves the original bits via segmented passthrough (HLS/DASH).
     *   **Transcoded Streaming:** If a mismatch is detected, the server initiates a `TranscodeJob` to convert the source into a compatible, segmented stream.
+    *   **Tone Mapping:** If the source is high dynamic range and the client has not declared that it can render HDR, the job converts the transfer function to SDR as well as any codec mismatch, since PQ or HLG code values shown as SDR describe different light rather than merely less of it. A client that can render HDR keeps it, provided an encoder on this host has proved it can produce 10-bit output.
 
 ### 4.2 Streaming Protocols
 * **Primary:** **HLS (HTTP Live Streaming)** or **DASH (Dynamic Adaptive Streaming over HTTP)**. 
@@ -227,6 +228,27 @@ container, codec, resolution (as a bounding box, so a 2.35:1 source fits a
 count matter because a codec name the client accepts is not proof it can decode
 the stream: Chromium refuses 10-bit H.264 and 5.1 AAC SourceBuffers, and a
 refused audio append tears down the video with it.
+
+Dynamic range is a sixth axis. It is classified from the source's **transfer
+function** — PQ (SMPTE ST 2084) and HLG (ARIB STD-B67) are HDR, everything else
+is SDR — and deliberately not from bit depth or primaries, because a 10-bit
+BT.2020 SDR master is stored like any other SDR material. A client that has not
+declared `supports_hdr` receives a tone-mapped SDR stream: an HDR source shown as
+SDR is not merely dimmer, its code values describe different light. A client that
+has declared it keeps HDR through a copy, a remux or a 10-bit re-encode, and the
+HDR path is gated on an encoder the startup probe drove with a 10-bit pixel
+format, because an encoder that works at 8 bits may still refuse 10. Where no
+such encoder exists the stream is tone mapped to SDR with the reason attached
+rather than failed. Dolby Vision is reported alongside the range (profile and
+whether the base layer is HDR10); its dynamic metadata cannot survive a
+re-encode and profile 5's IPTPQc2 base layer cannot be converted correctly
+without a Dolby Vision tone mapper, both of which appear in the reasons.
+
+The output's colour is set on the frames, not through `-color_primaries` and
+friends: those options were measured not to reach the output, because ffmpeg
+writes the encoder's VUI from the frame properties. The tone-map chain sets
+BT.709 through `zscale`; an HDR pass-through states BT.2020 and its transfer
+through `setparams`.
 
 The pure function knows nothing about the host, so the API runs it through
 `NegotiateForServer`: if the chosen target codec has no encoder here it is

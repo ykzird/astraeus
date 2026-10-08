@@ -42,9 +42,16 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Subtitle tracks probed (codec, language, title, default/forced, text vs
       bitmap), text tracks extracted to WebVTT on demand and cached
 - [x] Subtitle *rendering* in the player (track selection UI)
+- [x] Dynamic range: classified from the source's transfer function (PQ / HLG),
+      reported with the Dolby Vision profile, tone mapped to SDR for clients that
+      cannot show HDR, and passed through at 10 bits for those that can
+- [x] 10-bit HDR encoder support verified by a second startup probe per encoder,
+      separate from the 8-bit one because an encoder that works at 8 may refuse 10
 - [ ] Multi-audio-track selection
 - [ ] Serving image-based subtitles (PGS/VobSub) — needs OCR or bitmap overlay
 - [ ] Bitrate-aware ABR ladder (currently a single target rendition)
+- [ ] Dolby Vision profile 5 *correct* conversion (IPTPQc2 needs a Dolby Vision
+      tone mapper; the software chain produces approximate colour and says so)
 
 ## Phase 3: API & Security — API complete, security outstanding
 
@@ -99,15 +106,37 @@ Status as of the current build. Evidence for each claim is the test suite
   keyframe-aligned, so it can be a second or two early.
 - Playback position is not stored, so there is no resume across sessions or
   devices; the offset machinery it needs now exists.
-- HDR and Dolby Vision are not handled. Only bit depth is probed, and output is
-  pinned to 8-bit, so a 10-bit BT.2020/PQ source is converted to SDR naively and
-  looks washed out or dark. There is no tone mapping and no colour metadata, and
-  a client that could handle HDR is not told the source has it.
+- HDR is handled, with caveats that are all reported in the negotiation reasons
+  rather than hidden:
+  - **Dolby Vision profile 5** stores IPTPQc2, not PQ. Tone mapping it with the
+    software chain gives approximate colour — better than refusing to play the
+    file, but not correct. Doing it properly needs libplacebo (which requires
+    Vulkan) or the Dolby Vision tooling. No profile 5 sample exists on this host,
+    so even the approximation is unverified; it is reported and left at that.
+  - **Re-encoding loses Dolby Vision dynamic metadata.** Profile 8's HDR10 base
+    layer survives, and the reasons say the dynamic metadata does not. A
+    direct play or remux keeps everything.
+  - **Mastering-display and content-light (MaxCLL/MaxFALL) metadata are not
+    carried through a re-encode.** They are neither read from the source nor
+    written to the output.
+  - **HLG is implemented but unverified.** It is classified and tagged
+    (`arib-std-b67`), but no HLG sample exists here to tone map or pass through.
+  - **The tone-map chain needs a genuinely HDR-tagged source.** `zscale` reports
+    "no path between colorspaces" on an SDR input, so a file that claims PQ but
+    is not would fail the session rather than playing badly. That is a deliberate
+    choice - a failed session is more honest than a wrong picture - but the
+    failure surfaces as `500 stream_start_failed`, not as a clear explanation of
+    the mis-tagging.
+  - **Hardware HDR encoding is unverified**, in the same way the hardware
+    encoders are: the 10-bit probe runs on whatever host starts the server, but
+    no NVIDIA, Intel or AMD GPU is reachable here. On this machine the probe
+    verified five software encoders at 10-bit.
+- Multi-audio-track selection is not implemented; the first audio stream wins.
 - Image-based subtitles (PGS, VobSub) are detected and reported but not
   delivered — that needs OCR or bitmap overlay support.
-- Multi-audio-track selection is not implemented; the first audio stream wins.
-- Browser clients are capped at 1080p, 8-bit and stereo by default. There is no
-  surround passthrough and no per-client override beyond sending a capability
+- Browser clients are capped at 1080p, 8-bit and stereo by default, and do not
+  declare HDR support, so a PQ film is tone mapped for them by design. There is
+  no surround passthrough and no per-client override beyond sending a capability
   manifest, and the cap is a constant rather than a flag.
 - A capability manifest that omits `max_audio_channels` or `max_bit_depth` is
   treated as unrestricted, which can hand a browser a stream it cannot decode
