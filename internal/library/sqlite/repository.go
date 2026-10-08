@@ -133,6 +133,16 @@ func (r *Repository) Migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_media_entities_parent_id ON media_entities(parent_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_media_objects_entity_id ON media_objects(media_entity_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_libraries_path ON libraries(path)`,
+		// Resumable playback. The foreign key cascades so progress cannot
+		// outlive the entity it describes, which is what happens when a file is
+		// pruned: a row left behind would be progress in a film that is gone.
+		`CREATE TABLE IF NOT EXISTS playback_progress (
+			entity_id TEXT PRIMARY KEY,
+			position_seconds REAL NOT NULL,
+			duration_seconds REAL NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL,
+			FOREIGN KEY (entity_id) REFERENCES media_entities(id) ON DELETE CASCADE
+		)`,
 	}
 	for _, stmt := range baseline {
 		if _, err := r.exec().ExecContext(ctx, stmt); err != nil {
@@ -722,6 +732,87 @@ func (r *Repository) GetObjectsByEntity(ctx context.Context, entityID string) ([
 		objects = append(objects, *obj)
 	}
 	return objects, nil
+}
+
+// ---- playback progress -----------------------------------------------------
+
+// SaveProgress records where a viewer got to, replacing any earlier position for
+// the same entity. An upsert rather than an insert-or-update pair because the
+// common case is a position that already exists, and doing it in one statement
+// is what keeps two concurrent players from racing to insert the same row.
+func (r *Repository) SaveProgress(ctx context.Context, progress *library.PlaybackProgress) error {
+	if progress == nil {
+		return errors.New("nil playback progress")
+	}
+	if progress.EntityID == "" {
+		return errors.New("playback progress needs an entity id")
+	}
+	_, err := r.exec().ExecContext(ctx,
+		`INSERT INTO playback_progress (entity_id, position_seconds, duration_seconds, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(entity_id) DO UPDATE SET
+			position_seconds = excluded.position_seconds,
+			duration_seconds = excluded.duration_seconds,
+			updated_at = excluded.updated_at`,
+		progress.EntityID, progress.PositionSeconds, progress.DurationSeconds, formatTime(time.Now()))
+	if err != nil {
+		return fmt.Errorf("saving playback progress for %s: %w", progress.EntityID, err)
+	}
+	return nil
+}
+
+// GetProgress returns an entity's position, or (nil, nil) when it has none.
+//
+// Absence is not an error here: almost every entity in a library has never been
+// played, and a caller that had to distinguish "no progress" from "lookup
+// failed" for every listing would be worse off for it.
+func (r *Repository) GetProgress(ctx context.Context, entityID string) (*library.PlaybackProgress, error) {
+	var rows []progressRow
+	if err := r.exec().SelectContext(ctx, &rows,
+		`SELECT entity_id, position_seconds, duration_seconds, updated_at
+		 FROM playback_progress WHERE entity_id = ?`, entityID); err != nil {
+		return nil, fmt.Errorf("getting playback progress for %s: %w", entityID, err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	progress, err := rows[0].toProgress()
+	if err != nil {
+		return nil, fmt.Errorf("reading playback progress for %s: %w", entityID, err)
+	}
+	return progress, nil
+}
+
+// DeleteProgress forgets an entity's position, which is what starting over
+// means.
+func (r *Repository) DeleteProgress(ctx context.Context, entityID string) error {
+	if _, err := r.exec().ExecContext(ctx,
+		`DELETE FROM playback_progress WHERE entity_id = ?`, entityID); err != nil {
+		return fmt.Errorf("deleting playback progress for %s: %w", entityID, err)
+	}
+	return nil
+}
+
+// progressRow is the table's shape, kept separate from the domain type so the
+// time format stays where the rest of the adapter's conversions live.
+type progressRow struct {
+	EntityID        string  `db:"entity_id"`
+	PositionSeconds float64 `db:"position_seconds"`
+	DurationSeconds float64 `db:"duration_seconds"`
+	UpdatedAt       string  `db:"updated_at"`
+}
+
+func (row progressRow) toProgress() (*library.PlaybackProgress, error) {
+	updated, err := parseTime(row.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &library.PlaybackProgress{
+		EntityID:        row.EntityID,
+		PositionSeconds: row.PositionSeconds,
+		DurationSeconds: row.DurationSeconds,
+		UpdatedAt:       updated,
+	}, nil
 }
 
 // ---- helpers ---------------------------------------------------------------

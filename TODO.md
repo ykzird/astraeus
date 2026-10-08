@@ -147,8 +147,10 @@ Status as of the current build. Evidence for each claim is the test suite
   re-negotiates with `start_seconds` and ffmpeg seeks the input, so any point
   in the film is reachable in a couple of seconds. The landing point is
   keyframe-aligned, so it can be a second or two early.
-- Playback position is not stored, so there is no resume across sessions or
-  devices; the offset machinery it needs now exists.
+- Playback position is stored per entity and resumed, but progress is
+  instance-wide rather than per user: the access gate identifies a request, and
+  nothing yet keys progress on that identity. There is also no "continue
+  watching" listing, so a viewer has to find the film again to resume it.
 - HDR is handled, with caveats that are all reported in the negotiation reasons
   rather than hidden:
   - **Dolby Vision profile 5** stores IPTPQc2, not PQ. Tone mapping it with the

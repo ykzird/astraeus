@@ -407,3 +407,106 @@ func TestParseTime_LegacyFormats(t *testing.T) {
 		})
 	}
 }
+
+// TestPlaybackProgress covers resumable playback's storage: one position per
+// entity, replaced rather than accumulated, absent until the first report.
+func TestPlaybackProgress(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	lib := mustCreateLibrary(t, repo, "Progress", library.MoviesLibrary)
+	entity := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "Arrival (2016)")
+
+	// Nothing played yet is not an error, and not a row.
+	progress, err := repo.GetProgress(ctx, entity.ID)
+	if err != nil {
+		t.Fatalf("GetProgress on an unplayed entity: %v", err)
+	}
+	if progress != nil {
+		t.Fatalf("unplayed entity has progress %+v, want none", progress)
+	}
+
+	if err := repo.SaveProgress(ctx, &library.PlaybackProgress{
+		EntityID: entity.ID, PositionSeconds: 90, DurationSeconds: 600,
+	}); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+	progress, err = repo.GetProgress(ctx, entity.ID)
+	if err != nil {
+		t.Fatalf("GetProgress: %v", err)
+	}
+	if progress == nil || progress.PositionSeconds != 90 || progress.DurationSeconds != 600 {
+		t.Fatalf("progress = %+v, want 90 of 600", progress)
+	}
+	if progress.UpdatedAt.IsZero() {
+		t.Error("progress was stored without a timestamp")
+	}
+
+	// Reporting again replaces the position: a viewer has one place in a film,
+	// not a list of places they have been.
+	if err := repo.SaveProgress(ctx, &library.PlaybackProgress{
+		EntityID: entity.ID, PositionSeconds: 300, DurationSeconds: 600,
+	}); err != nil {
+		t.Fatalf("SaveProgress (second report): %v", err)
+	}
+	progress, err = repo.GetProgress(ctx, entity.ID)
+	if err != nil {
+		t.Fatalf("GetProgress after the second report: %v", err)
+	}
+	if progress.PositionSeconds != 300 {
+		t.Errorf("position = %v, want the latest report 300", progress.PositionSeconds)
+	}
+
+	// Starting over forgets it entirely.
+	if err := repo.DeleteProgress(ctx, entity.ID); err != nil {
+		t.Fatalf("DeleteProgress: %v", err)
+	}
+	if progress, err := repo.GetProgress(ctx, entity.ID); err != nil || progress != nil {
+		t.Errorf("after DeleteProgress: progress=%+v err=%v, want none", progress, err)
+	}
+}
+
+// TestPlaybackProgress_GoesWithTheEntity is the reason the table has a cascading
+// foreign key: a pruned entity must not leave a position behind pointing at a
+// film that no longer exists.
+func TestPlaybackProgress_GoesWithTheEntity(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	lib := mustCreateLibrary(t, repo, "Progress", library.MoviesLibrary)
+	entity := mustCreateEntity(t, repo, lib.ID, nil, library.MovieEntity, "A Film That Gets Deleted")
+
+	if err := repo.SaveProgress(ctx, &library.PlaybackProgress{
+		EntityID: entity.ID, PositionSeconds: 60, DurationSeconds: 600,
+	}); err != nil {
+		t.Fatalf("SaveProgress: %v", err)
+	}
+
+	if _, err := repo.db.ExecContext(ctx, `DELETE FROM media_entities WHERE id = ?`, entity.ID); err != nil {
+		t.Fatalf("deleting the entity: %v", err)
+	}
+
+	var count int
+	if err := repo.db.GetContext(ctx, &count, `SELECT COUNT(*) FROM playback_progress`); err != nil {
+		t.Fatalf("counting progress rows: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("%d progress rows survived their entity", count)
+	}
+}
+
+// TestPlaybackProgress_RejectsAnEntityThatDoesNotExist pins the other half of
+// the foreign key: progress cannot be invented for something that is not there.
+func TestPlaybackProgress_RejectsAnEntityThatDoesNotExist(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	err := repo.SaveProgress(context.Background(), &library.PlaybackProgress{
+		EntityID: "00000000-0000-0000-0000-000000000000", PositionSeconds: 1,
+	})
+	if err == nil {
+		t.Error("saving progress for a missing entity should be refused by the foreign key")
+	}
+}

@@ -209,6 +209,9 @@
         signal: controller.signal,
         cache: "no-store",
         credentials: "same-origin",
+        /* A position reported as the page goes away has to outlive the
+           document, which the browser will not let an ordinary request do. */
+        keepalive: opts.keepalive === true,
       });
     } catch (error) {
       clearTimeout(timer);
@@ -307,6 +310,22 @@
       return apiFetch("entities/" + encodeURIComponent(entityId) + "/playback", {
         method: "POST",
         body: body,
+      });
+    },
+    /* Where the viewer got to. PUT replaces the stored position rather than
+       appending one, so a repeated report corrects it instead of piling up. */
+    saveProgress: function (entityId, body, options) {
+      return apiFetch("entities/" + encodeURIComponent(entityId) + "/progress", {
+        method: "PUT",
+        body: body,
+        keepalive: options && options.keepalive === true,
+      });
+    },
+    /* Forget a position outright; this is what starting over means. */
+    clearProgress: function (entityId, options) {
+      return apiFetch("entities/" + encodeURIComponent(entityId) + "/progress", {
+        method: "DELETE",
+        keepalive: options && options.keepalive === true,
       });
     },
   };
@@ -504,6 +523,11 @@
          `sessionStart`, so source time = media time + sessionStart. The server
          also echoes it back; this is that value. */
       sessionStart: 0,
+      /* A resume offset that direct play still has to apply itself: the server
+         serves the whole original file and cannot start it mid-file, so the
+         seek waits for the element to have a timeline. Always 0 for segmented
+         delivery, where the server really did start at the offset. */
+      resumeAt: 0,
       /* The whole film's duration, from media_info — not what this session has
          produced. The seek bar spans this. */
       sourceDuration: 0,
@@ -1943,9 +1967,24 @@
   playerVideo.setAttribute("aria-label", "Media player");
   playerVideo.addEventListener("loadedmetadata", function () {
     if (!state.playback.url) return;
-    state.playback.duration = isFinite(playerVideo.duration) ? playerVideo.duration : 0;
-    if (state.playback.status === "loading") state.playback.status = "ready";
-    if (!state.playback.started) state.playback.status = "ready";
+    const pb = state.playback;
+    /* Direct play resumes here: the server ignored the offset because it
+       serves the whole file, so the seek waits until the element has a
+       timeline. Cleared before the seek, so a further event cannot re-apply
+       it, and the element's own clock stays the source clock (sessionStart
+       is 0 on this path). */
+    if (pb.resumeAt > 0) {
+      const target = pb.resumeAt;
+      pb.resumeAt = 0;
+      try {
+        playerVideo.currentTime = target;
+      } catch (error) {
+        /* A source that will not seek simply plays from the beginning. */
+      }
+    }
+    pb.duration = isFinite(playerVideo.duration) ? playerVideo.duration : 0;
+    if (pb.status === "loading") pb.status = "ready";
+    if (!pb.started) pb.status = "ready";
     syncTransport();
     /* The seek bar's max depends on the duration, which we only learn now. */
     render();
@@ -1966,17 +2005,30 @@
     state.playback.started = true;
     state.playback.status = "ready";
     state.playback.blockedAutoplay = false;
+    /* Start the ten-second chain here rather than on metadata: this is the
+       first moment there is real elapsed playback to report. */
+    scheduleProgressReport(state.playback);
     syncTransport();
     showPlayerControls();
     scheduleControlsHide();
     if (wasBlocked) render();
   });
   playerVideo.addEventListener("pause", function () {
+    /* A pause is a natural bookmark — the viewer is probably walking away —
+       and it freezes the clock, so the periodic chain has nothing left to
+       report. Safe to call during teardown too: a session that is no longer
+       live, or no longer current, is skipped inside reportProgress. */
+    stopProgressReporting();
+    reportProgress(state.playback);
     syncTransport();
     /* Never fade away on a paused frame. */
     showPlayerControls();
   });
   playerVideo.addEventListener("ended", function () {
+    stopProgressReporting();
+    /* Reporting here is what lets the server clear a position in the closing
+       minutes instead of offering to resume three seconds from the end. */
+    reportProgress(state.playback);
     syncTransport();
     showPlayerControls();
   });
@@ -2158,6 +2210,150 @@
     const bounds = seekableBounds();
     if (!(bounds.end > 0)) return null;
     return { from: pb.sessionStart + bounds.start, to: pb.sessionStart + bounds.end };
+  }
+
+  /* ── Resuming and progress reports ───────────────────────────────────────
+     A position is only worth offering back when the viewer actually got
+     somewhere: a few seconds in is still "the beginning" to anyone watching.
+     The server has its own rule for the other end — a report in the closing
+     minutes is treated as finished and clears the row instead. */
+
+  const RESUME_MIN_SECONDS = 5;
+  /* The server's own rule for the other end: a position in the last 5% is
+     "watched through" and is cleared rather than stored. Mirrored locally so a
+     remembered position can never offer a resume the server has refused. */
+  const FINISHED_FRACTION = 0.95;
+  /* A report on every timeupdate would be several PUTs a second for a number
+     that barely moved; ten seconds of playback is the most that can be lost
+     to a crash or a hard close. */
+  const PROGRESS_REPORT_INTERVAL_MS = 10000;
+
+  /* The one live report chain. Module state rather than session state because
+     it is a timer, and a timer outlives the session object it was armed for —
+     which is exactly why every report re-checks that session. */
+  let progressReportTimer = null;
+
+  /**
+   * The offset a fresh negotiation should start at, or 0.
+   *
+   * Read from the detail the canvas is showing, so it can only ever be this
+   * entity's own position. An explicit start-over clears it (restartPlayback),
+   * which is what stops the next Play from resuming the offset the viewer just
+   * abandoned.
+   */
+  function resumeOffsetFor(entity) {
+    const detail = state.detail;
+    if (!detail || !detail.entity || detail.entity.id !== entity.id) return 0;
+    if (!isLeafType(entity.type)) return 0;
+    const progress = detail.progress;
+    if (!progress || typeof progress !== "object") return 0;
+    if (progress.finished === true) return 0;
+    const position = Number(progress.position_seconds);
+    if (!isFinite(position) || position < RESUME_MIN_SECONDS) return 0;
+    /* A stored position can outlive the file it was measured against — a
+       different release of the same film, say — and the server rejects a start
+       at or past the end outright. Refusing to resume is the honest answer. */
+    const duration = Number(progress.duration_seconds);
+    if (isFinite(duration) && duration > 0 && position >= duration - 0.5) return 0;
+    return position;
+  }
+
+  /**
+   * Send the position this session is at, or forget the stored one when there
+   * is nothing worth resuming.
+   *
+   * `options.final` marks a report made while the session is being put away:
+   * it is allowed through even though the session may already have been
+   * detached from `state.playback`, and it is the one the caller will not get
+   * another chance to make.
+   *
+   * Failures are swallowed here. The film matters more than the bookmark: a
+   * position that cannot be stored is not worth a dialog, not worth stopping
+   * playback for, and the next report will try again anyway. An explicit
+   * start-over is the exception and warns where it is issued.
+   */
+  function reportProgress(pb, options) {
+    const opts = options || {};
+    if (!pb || typeof pb.entityId !== "string" || !pb.entityId) return;
+    if (!playbackIsLive(pb)) return;
+    /* The gate that keeps a late report off the wrong entity: a queued report
+       belongs to the session it was armed for, and the URL below is built from
+       that session's own id, never from whatever is playing now. Because
+       navigation replaces `state.playback` wholesale, a stale report either
+       fails this check or carries the id it belongs to. */
+    if (opts.final !== true && state.playback !== pb) return;
+
+    const duration = sourceDurationOf(pb);
+    const position = currentSourceTime(pb);
+    rememberProgress(pb.entityId, position, duration);
+    const attempt =
+      position >= RESUME_MIN_SECONDS
+        ? api.saveProgress(pb.entityId, { position_seconds: position, duration_seconds: duration }, opts)
+        : api.clearProgress(pb.entityId, opts);
+    attempt.catch(function () {
+      /* Best effort, as above. */
+    });
+  }
+
+  /** Forget a stored position. `warn` is for a viewer who asked for it. */
+  function forgetProgress(entityId, options) {
+    const opts = options || {};
+    if (typeof entityId !== "string" || !entityId) return;
+    api.clearProgress(entityId, opts).catch(function (error) {
+      if (opts.warn !== true) return;
+      toast(
+        "Could not clear the saved position. " +
+          (error && error.message ? error.message : "The server did not answer."),
+        "warn"
+      );
+    });
+  }
+
+  /**
+   * Keep the loaded detail's copy of the position at the value just reported.
+   *
+   * The detail is fetched once per navigation, so without this a viewer who
+   * stops and presses Play again would be sent back to the position the page
+   * loaded with — the beginning, for an entity that had never been played.
+   * A position the server would clear is cleared locally as well, which is
+   * also what an explicit start-over does.
+   */
+  function rememberProgress(entityId, position, duration) {
+    const detail = state.detail;
+    if (!detail || !detail.entity || detail.entity.id !== entityId) return;
+    if (position < RESUME_MIN_SECONDS || (duration > 0 && position >= duration * FINISHED_FRACTION)) {
+      detail.progress = null;
+      return;
+    }
+    detail.progress = {
+      position_seconds: position,
+      duration_seconds: duration,
+      percent: duration > 0 ? (100 * position) / duration : 0,
+      finished: false,
+      updated_at: new Date().toISOString(),
+    };
+  }
+
+  function stopProgressReporting() {
+    if (progressReportTimer !== null) {
+      clearTimeout(progressReportTimer);
+      progressReportTimer = null;
+    }
+  }
+
+  /**
+   * Arm the ten-second report for `pb`. A single chain, so a second `play`
+   * cannot stack timers, and it re-arms itself only while that exact session
+   * is still playing — a pause, an end, a failure or a navigation ends it.
+   */
+  function scheduleProgressReport(pb) {
+    stopProgressReporting();
+    progressReportTimer = setTimeout(function () {
+      progressReportTimer = null;
+      if (state.playback !== pb || !playbackIsLive(pb)) return;
+      reportProgress(pb);
+      if (!playerVideo.paused && !playerVideo.ended) scheduleProgressReport(pb);
+    }, PROGRESS_REPORT_INTERVAL_MS);
   }
 
   function handleHlsError(HlsCtor, instance, recovery, data) {
@@ -2463,6 +2659,10 @@
   /* Order matters: kill hls.js before touching the element, otherwise the
      MediaSource teardown surfaces as a spurious media error. */
   function resetActiveMedia() {
+    /* The clock is about to disappear, so nothing is left for the periodic
+       chain to report; a session that continues (a quality switch) re-arms it
+       from its next `play`. */
+    stopProgressReporting();
     destroyHls();
     teardownVideo();
   }
@@ -2590,8 +2790,15 @@
 
   function stopPlayback(options) {
     const opts = options || {};
-    /* Capture the session before the reset, so its transcoder can be stopped. */
+    /* Capture the session before the reset, so its transcoder can be stopped
+       and its last position reported. */
     const sessionId = state.playback.sessionId;
+    const session = state.playback;
+    /* The position at the moment of stopping is the one worth keeping: the
+       element still holds it, and `final` lets it through even though this
+       session is about to be replaced. Sent before the reset so the id is
+       still the one that was playing. */
+    reportProgress(session, { final: true });
     /* Reset state BEFORE tearing the element down: with url already null, the
        teardown's own `error`/`emptied` events cannot be mistaken for a real
        playback failure. */
@@ -3362,15 +3569,29 @@
     clearError();
     render();
 
+    /* Where to pick up. Read from the loaded detail, which only ever holds
+       this entity's own progress; a start-over has already cleared it. */
+    const resumeSeconds = resumeOffsetFor(entity);
+
     try {
-      /* Auto quality, from the top: the body still carries the full capability
-         manifest, because a body replaces the server's browser defaults. */
-      const result = await api.playback(entity.id, playbackRequestBody(0, null));
+      /* Auto quality. The body still carries the full capability manifest,
+         because a body replaces the server's browser defaults. */
+      const result = await api.playback(entity.id, playbackRequestBody(resumeSeconds, null));
       /* Navigation or Stop may have replaced the session during the request. */
       if (state.playback !== session) return;
-      applyPlaybackResult(session, result, entity, { startSeconds: 0, maxHeight: null });
+      applyPlaybackResult(session, result, entity, { startSeconds: resumeSeconds, maxHeight: null });
       startSessionMedia(session, entity, true);
-      if (session.mode === "direct_play") {
+      /* Direct play applies the offset client-side, so its sessionStart is 0
+         and the requested offset is the one to name; segmented delivery names
+         what the server actually started at. */
+      const resumedFrom = session.mode === "direct_play" ? resumeSeconds : session.sessionStart;
+      if (resumeSeconds >= RESUME_MIN_SECONDS && resumedFrom > 0) {
+        /* The viewer pressed Play expecting the opening titles; say plainly
+           why the clock does not start there, in the transport's own format. */
+        const message = "Resuming from " + formatClock(resumedFrom);
+        setActionStatus(message, "ok");
+        toast(message, "info");
+      } else if (session.mode === "direct_play") {
         setActionStatus("Playing “" + session.title + "” directly from the original file.", "ok");
       }
     } catch (error) {
@@ -3429,7 +3650,19 @@
   }
 
   function restartPlayback() {
-    if (!state.playback.url) return;
+    const pb = state.playback;
+    if (!pb.url) return;
+    /* Start over means the stored position goes too, on the server and in the
+       detail this page is holding: leaving the local copy behind would let the
+       next Play resume the very offset the viewer just abandoned. Clearing the
+       detail first is the part that survives a failed request. */
+    if (state.detail && state.detail.entity && state.detail.entity.id === pb.entityId) {
+      state.detail.progress = null;
+    }
+    forgetProgress(pb.entityId, { warn: true });
+    /* Back to the top of the film, not just the top of what this session
+       produced: seeking inside the current session cannot reach behind its own
+       start, so this re-negotiates from zero when it has to. */
     seekToSource(0);
   }
 
@@ -3551,15 +3784,23 @@
     pb.subtitles = Array.isArray(result.subtitles) ? result.subtitles : [];
     pb.reasons = decision && Array.isArray(decision.reasons) ? decision.reasons : [];
     pb.error = null;
-    /* Where this stream begins in the source. The server echoes the requested
-       offset (omitted at zero); the true start is keyframe-aligned and may sit
-       a second or two earlier, so this mapping is close, not exact. */
-    pb.sessionStart =
-      isFinite(echoed) && echoed >= 0
-        ? echoed
-        : requested && isFinite(requested.startSeconds)
-        ? requested.startSeconds
-        : 0;
+    /* Where this stream begins in the source. Segmented delivery really does
+       start there — the server hands ffmpeg the offset — so media time 0 is
+       source time `sessionStart`; the server echoes the offset, and the true
+       start is keyframe-aligned and may sit a second or two earlier, so this
+       mapping is close, not exact. Direct play is the exception: the server
+       serves the whole original file and ignores the offset (it only echoes
+       it), so the file's own timeline is the source's, and the offset has to
+       be applied as a seek once the element has metadata. */
+    const requestedStart =
+      requested && isFinite(requested.startSeconds) ? Math.max(0, requested.startSeconds) : 0;
+    if (pb.mode === "direct_play") {
+      pb.sessionStart = 0;
+      pb.resumeAt = requestedStart > 0 ? requestedStart : 0;
+    } else {
+      pb.sessionStart = isFinite(echoed) && echoed >= 0 ? echoed : requestedStart;
+      pb.resumeAt = 0;
+    }
     pb.sourceDuration = mediaInfoDuration(pb);
     pb.targetHeight = decision && Number(decision.target_height) > 0 ? Number(decision.target_height) : 0;
     pb.maxHeight = requested && "maxHeight" in requested ? requested.maxHeight : null;
@@ -4081,6 +4322,9 @@
   function releaseSessionOnUnload() {
     const pb = state.playback;
     if (!pb || !pb.url) return;
+    /* The last position rides along with the stream teardown: keepalive is
+       what lets both requests outlive the document. */
+    reportProgress(pb, { final: true, keepalive: true });
     releaseStreamSession(pb.sessionId, true);
   }
 

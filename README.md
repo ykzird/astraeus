@@ -25,6 +25,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | REST API | Done. Libraries, entities, scanning, enrichment, playback, artwork, subtitles |
 | Capability negotiation | Done. Direct play / remux / transcode, with reasons |
 | Segmented streaming | Done. HLS via ffmpeg, passthrough or transcode |
+| Resume / watch state | Done. A viewer's position is stored per entity, reported while watching, and resumed when Play is pressed again; watched-through films forget theirs |
 | Audio tracks | Done. Every track is probed and listed; a client picks one by stream index, and the file's own default is delivered when it does not |
 | Adaptive bitrate | Done. A manifest that omits `max_height` gets a master playlist with up to three rungs, each with its own ceiling; naming a height gets one rendition |
 | HDR and Dolby Vision | Detected from the source's colour tags; **tone mapped to SDR** for clients that cannot show it, and passed through at 10 bits for those that can. Dolby Vision profile 8 keeps its HDR10 base layer; profile 5 is flagged as approximate |
@@ -255,7 +256,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.6.0`).
+identifier (currently `0.7.0`).
 
 ## HTTP API
 
@@ -275,11 +276,38 @@ identifier (currently `0.6.0`).
 | GET | `/api/entities/{id}` | Entity with its objects, children and parent |
 | POST | `/api/metadata/enrich` | Run one enrichment pass |
 | POST | `/api/entities/{id}/playback` | Negotiate playback, returns a URL and subtitle tracks |
+| PUT | `/api/entities/{id}/progress` | Record where the viewer got to (resumable playback) |
+| DELETE | `/api/entities/{id}/progress` | Forget it, which is what starting over means |
 | GET | `/api/objects/{id}/file` | The original file (range requests supported) |
 | GET | `/api/objects/{id}/subtitles/{track}.vtt` | One subtitle track as WebVTT |
 | GET | `/api/images/{size}/{file}` | Poster/backdrop artwork, proxied and cached |
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/hls/{session}/{file}` | Playlist and segments of a live session |
+
+### Resume and watch state
+
+Where a viewer got to is stored per entity and reported by `PUT
+/api/entities/{id}/progress` with `{"position_seconds": 754.5,
+"duration_seconds": 7025}`; `GET /api/entities/{id}` then carries a `progress`
+object with the same numbers plus `percent` and `finished`. `DELETE` forgets the
+position.
+
+Three rules keep it honest rather than merely present:
+
+- A position in the last 5% of the media is **finished**, and finishing *clears*
+  the position instead of storing it. Resuming three seconds from the end is
+  worse than starting the next thing.
+- A position beyond the end of the media is a `400` with the arithmetic in the
+  message. A player reporting its final frame a moment after the end is fine;
+  numbers that are simply wrong are not stored for the next resume to trust.
+- Progress is per **entity**, not per user, because the access gate is
+  instance-wide: there is one viewer as far as this server is concerned. The
+  table is keyed by entity id and cascades when the entity is pruned, so a
+  deleted film cannot leave a bookmark behind.
+
+The player resumes on Play and reports while watching. It reports a position
+under five seconds as a *clear* rather than a store, so a viewer who sampled ten
+seconds of something does not get offered a resume at the beginning.
 
 Entity payloads also carry `poster_url` and `backdrop_url` pointing at the local
 image proxy, so a client never has to know the metadata provider's URL scheme.

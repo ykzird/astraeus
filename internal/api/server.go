@@ -148,6 +148,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/entities/{id}", s.handleGetEntity)
 	mux.HandleFunc("POST /api/metadata/enrich", s.handleEnrich)
 	mux.HandleFunc("POST /api/entities/{id}/playback", s.handlePlayback)
+	mux.HandleFunc("PUT /api/entities/{id}/progress", s.handleSaveProgress)
+	mux.HandleFunc("DELETE /api/entities/{id}/progress", s.handleDeleteProgress)
 	mux.HandleFunc("GET /api/objects/{id}/file", s.handleObjectFile)
 	mux.HandleFunc("GET /api/objects/{id}/subtitles/{file}", s.handleSubtitle)
 	mux.HandleFunc("GET /api/system/capabilities", s.handleSystemCapabilities)
@@ -392,6 +394,37 @@ type entityDetail struct {
 	Objects  []library.MediaObject `json:"objects"`
 	Children []entityResource      `json:"children"`
 	Parent   *entityResource       `json:"parent,omitempty"`
+	// Progress is where the viewer got to, omitted when the entity has never
+	// been played. It rides along with the detail rather than living behind its
+	// own endpoint because every client that renders an entity wants it, and one
+	// request is better than two.
+	Progress *progressResource `json:"progress,omitempty"`
+}
+
+// progressResource is a stored position, plus the fraction it represents so a
+// client does not have to guard against a zero duration to draw a bar.
+type progressResource struct {
+	PositionSeconds float64   `json:"position_seconds"`
+	DurationSeconds float64   `json:"duration_seconds"`
+	Percent         float64   `json:"percent"`
+	Finished        bool      `json:"finished"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+func newProgressResource(progress *library.PlaybackProgress) *progressResource {
+	if progress == nil {
+		return nil
+	}
+	resource := &progressResource{
+		PositionSeconds: progress.PositionSeconds,
+		DurationSeconds: progress.DurationSeconds,
+		Finished:        progress.IsFinished(),
+		UpdatedAt:       progress.UpdatedAt,
+	}
+	if progress.DurationSeconds > 0 {
+		resource.Percent = 100 * progress.PositionSeconds / progress.DurationSeconds
+	}
+	return resource
 }
 
 func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
@@ -413,10 +446,17 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	progress, err := s.repo.GetProgress(ctx, entity.ID)
+	if err != nil {
+		s.writeRepoError(w, r, err, "getting playback progress")
+		return
+	}
+
 	detail := entityDetail{
 		Entity:   s.decorateEntity(*entity),
 		Objects:  objects,
 		Children: s.decorateEntities(children),
+		Progress: newProgressResource(progress),
 	}
 	if entity.ParentID != nil {
 		parent, err := s.repo.GetEntity(ctx, *entity.ParentID)
@@ -580,6 +620,18 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if decision.Mode == streaming.ModeDirectPlay {
+		// Direct play serves the original file whole, so an offset cannot be
+		// applied here - the client seeks its own element. Echoing the requested
+		// start would tell every API client that the stream begins somewhere it
+		// does not, and one that trusted it would build a timeline wrong by the
+		// offset. The request is not refused either: seeking a local file is
+		// instant and free, which is the appeal of direct play in the first place.
+		if startSeconds > 0 {
+			response.StartSeconds = 0
+			response.Decision.Reasons = append(response.Decision.Reasons,
+				fmt.Sprintf("direct play serves the whole file, so the requested start of %.3f seconds is applied by the client seeking rather than by this server",
+					startSeconds))
+		}
 		response.URL = "/api/objects/" + object.ID + "/file"
 		writeJSON(w, http.StatusOK, response)
 		return
@@ -614,6 +666,82 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	// otherwise; either way the client is handed the one file it should open.
 	response.URL = "/hls/" + session.ID + "/" + session.PlaylistFile()
 	writeJSON(w, http.StatusOK, response)
+}
+
+// progressRequest is the body of a progress report.
+type progressRequest struct {
+	PositionSeconds float64 `json:"position_seconds"`
+	DurationSeconds float64 `json:"duration_seconds"`
+}
+
+// handleSaveProgress records where a viewer got to.
+//
+// It is a PUT because it replaces a position rather than creating a record: a
+// client that reports every few seconds is not building a history, and a
+// retried report must not be a second row.
+func (s *Server) handleSaveProgress(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	entity, err := s.repo.GetEntity(ctx, r.PathValue("id"))
+	if err != nil {
+		s.writeRepoError(w, r, err, "getting entity")
+		return
+	}
+
+	var request progressRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if math.IsNaN(request.PositionSeconds) || math.IsInf(request.PositionSeconds, 0) || request.PositionSeconds < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_position",
+			"position_seconds must be a finite, non-negative number of seconds")
+		return
+	}
+	if math.IsNaN(request.DurationSeconds) || math.IsInf(request.DurationSeconds, 0) || request.DurationSeconds < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_duration",
+			"duration_seconds must be a finite, non-negative number of seconds")
+		return
+	}
+	// A position past the end is not a strict error - a player can report its
+	// final position a moment after the media ended - but a position beyond the
+	// media plus a second means the numbers are wrong, and storing them would
+	// make the next resume start past the end.
+	if request.DurationSeconds > 0 && request.PositionSeconds > request.DurationSeconds+1 {
+		writeError(w, http.StatusBadRequest, "position_beyond_end",
+			fmt.Sprintf("position_seconds %.3f is past the end of the media (%.3f seconds)",
+				request.PositionSeconds, request.DurationSeconds))
+		return
+	}
+
+	// Progress past the closing credits is cleared rather than stored: resuming
+	// three seconds from the end is worse than starting the next thing.
+	progress := &library.PlaybackProgress{
+		EntityID:        entity.ID,
+		PositionSeconds: request.PositionSeconds,
+		DurationSeconds: request.DurationSeconds,
+	}
+	if progress.IsFinished() {
+		if err := s.repo.DeleteProgress(ctx, entity.ID); err != nil {
+			s.writeRepoError(w, r, err, "clearing finished playback progress")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := s.repo.SaveProgress(ctx, progress); err != nil {
+		s.writeRepoError(w, r, err, "saving playback progress")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDeleteProgress forgets a position, which is what starting over means.
+func (s *Server) handleDeleteProgress(w http.ResponseWriter, r *http.Request) {
+	if err := s.repo.DeleteProgress(r.Context(), r.PathValue("id")); err != nil {
+		s.writeRepoError(w, r, err, "deleting playback progress")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleStopStream ends a streaming session immediately.

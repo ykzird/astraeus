@@ -40,6 +40,17 @@ type Repository interface {
 	// from disk stops being a ghost entry in every listing.
 	PruneLibrary(ctx context.Context, libraryID string, keepPaths map[string]bool) (PruneResult, error)
 
+	// Playback progress: where a viewer got to, so playback can resume.
+	//
+	// SaveProgress records a position, replacing any earlier one for the same
+	// entity - a viewer who rewinds and watches again has one position, not a
+	// history. GetProgress reports (nil, nil) when the entity has never been
+	// played, because having no progress is the normal case rather than an
+	// error. DeleteProgress forgets it, which is what "start over" means.
+	SaveProgress(ctx context.Context, progress *PlaybackProgress) error
+	GetProgress(ctx context.Context, entityID string) (*PlaybackProgress, error)
+	DeleteProgress(ctx context.Context, entityID string) error
+
 	// WithTx runs fn inside a transaction. The Repository handed to fn is bound
 	// to that transaction; returning an error rolls the whole thing back.
 	WithTx(ctx context.Context, fn func(tx Repository) error) error

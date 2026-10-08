@@ -1,8 +1,8 @@
 # Handoff
 
 **As of the round-2 work of 2026-10-08 — HDR and Dolby Vision, packaging, the
-bitrate ceiling, the adaptive bitrate ladder, and audio track selection. Version
-0.6.0. 90 tracked files.** (`git log` names the commits; the previous handoff was
+bitrate ceiling, the adaptive bitrate ladder, audio track selection, and
+resumable playback. Version 0.7.0. 92 tracked files.** (`git log` names the commits; the previous handoff was
 `b76a14f`.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
@@ -106,6 +106,10 @@ mise exec -- go test -tags=integration -run TestManager_Ladder -v ./internal/str
 # Serves a file with two audio tracks and asserts the *delivered segment* carries
 # the chosen one, which is the check a command-line assertion would miss.
 mise exec -- go test -tags=integration -run TestManager_DeliversTheChosenAudioTrack -v ./internal/streaming/
+
+# Resume state end to end, over HTTP against a copy of a real database: report a
+# position, read it back, overrun it (400), finish it (cleared), force it.
+mise exec -- go test -run TestPlaybackProgress ./internal/api/ ./internal/library/sqlite/
 
 # The real thing, against the 17 GB film: a browser profile gets bt709/bt709,
 # an HDR manifest gets 10-bit bt2020/PQ. Copy real.db first; *.db is local state.
@@ -280,6 +284,14 @@ HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
 Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 10/10 subtitles. Full Go suite green with race and integration.
 
+**Resumable playback** landed as of 0.7.0: a `playback_progress` table keyed by
+entity with a cascading delete, `PUT`/`DELETE /api/entities/{id}/progress`, and a
+`progress` object on the entity detail. Two rules carry the honesty: a position
+in the closing 5% clears the row because that entity is watched through, and a
+position past the end is a `400` rather than something the next resume would
+trust. Progress is per entity, not per user - the gate is instance-wide, and the
+storage does not assume that, it simply has no user key yet.
+
 **Audio track selection** landed as of 0.6.0. Every audio stream is probed into
 `media_info.audio_tracks` (index, codec, channels, bitrate, language, title,
 default), and `audio_track_index` chooses one; omitting it, or sending 0, means
@@ -329,20 +341,25 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **Resume / watch state.** The hard part already works: a session can start at
-   an offset, so this is mostly persistence plus a report endpoint.
-3. **CSP and security headers**, **UI unit tests** (the front end is one 133 KB
+1. **A "continue watching" surface.** Progress is stored and resumed, but nothing
+   lists what is half-watched, so a viewer has to find the film again to resume
+   it. It is a query, an endpoint and a row in the navigation, and it is what
+   makes the stored progress pay off.
+2. **Per-user progress**, keyed on the identity the access gate already attaches
+   to every request, once there is more than one viewer to tell apart.
+3. **Image subtitles** (PGS/VobSub are detected, reported and refused): OCR or a
+   bitmap overlay, and the only subtitle gap left.
+4. **CSP and security headers**, **UI unit tests** (the front end is one 133 KB
    file with no seam — `web/core.js` for the pure timeline maths is the cheapest
    first cut), **artwork IP leak** (metadata-supplied absolute URLs are fetched by
    the browser directly), rate limiting, OpenTelemetry.
-4. **A ladder a client can pin the top of.** Today pinning a height means one
+5. **A ladder a client can pin the top of.** Today pinning a height means one
    rendition, so the quality menu caps quality rather than expressing a preference
-   within a ladder. Multi-audio selection and this are the two places the
-   negotiation model is thinner than it looks.
-5. **Release automation and a TLS example.** Packaging landed (see §6), but
+   within a ladder — the negotiation model is thinner than it looks there.
+6. **Release automation and a TLS example.** Packaging landed (see §6), but
    nothing is tagged or published, the CI workflow has never run, and there is no
    reverse-proxy configuration beside the unit.
-6. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
+7. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
@@ -378,6 +395,17 @@ Priority order, with the reasoning. Take it top-down.
   `hwupload` per rung on one device, which is plausible but unverified; the
   software fallback after a hardware failure rebuilds the decision for software
   encoders, so a failed ladder should still land somewhere playable.
+- **Resume is per entity, not per user, and there is no "continue watching"
+  listing.** The storage is keyed by entity id rather than by the identity the
+  access gate attaches to a request, because with one instance-wide gate there is
+  only one viewer to record. A second viewer would overwrite the first one's
+  position, and nothing yet lists what is half-watched, so a viewer has to find
+  the film again to resume it.
+- **A progress report is only as good as the player's clock.** The stored
+  position comes from the client; the server validates its range and clears a
+  finished one, but it cannot tell a real position from a plausible wrong one.
+  The consequence is bounded: the worst case is a resume in the wrong place,
+  which the transport's seek control fixes.
 - **The audio menu's browser behaviour is verified against the demo library, not
   the real films.** The 4K films in the real library each carry one audio track,
   so the menu only appears for the generated dual-audio fixture. The mapping

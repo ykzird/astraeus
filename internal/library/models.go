@@ -115,6 +115,38 @@ type MediaObject struct {
 	CreatedAt     time.Time `json:"created_at" db:"created_at"`
 }
 
+// PlaybackProgress is where a viewer got to in an entity. It is what makes
+// playback resumable: without it, every play starts at zero and a film watched
+// over three evenings is never finished.
+//
+// It is per *entity*, not per user, because access is a single instance-wide
+// gate: there is one viewer as far as this server is concerned. A multi-user
+// version would key on the identity the access gate already puts on each
+// request, which is why nothing else here assumes there is only one.
+type PlaybackProgress struct {
+	EntityID string `json:"entity_id" db:"entity_id"`
+	// PositionSeconds is how far into the media the viewer was.
+	PositionSeconds float64 `json:"position_seconds" db:"position_seconds"`
+	// DurationSeconds is what the player believed the media's length was. It is
+	// recorded rather than derived so a later probe that disagrees - a different
+	// release of the same film - does not invent progress the viewer never made.
+	DurationSeconds float64   `json:"duration_seconds" db:"duration_seconds"`
+	UpdatedAt       time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// FinishedFraction is the point past which a viewer is treated as having
+// finished: reporting progress in the closing seconds and resuming there is
+// worse than starting the next thing.
+const FinishedFraction = 0.95
+
+// IsFinished reports whether this progress means the entity is watched through.
+func (p *PlaybackProgress) IsFinished() bool {
+	if p == nil || p.DurationSeconds <= 0 {
+		return false
+	}
+	return p.PositionSeconds >= p.DurationSeconds*FinishedFraction
+}
+
 // MetadataSet is a collection of descriptive attributes associated with a
 // MediaEntity. Provider records which provider produced it.
 type MetadataSet struct {

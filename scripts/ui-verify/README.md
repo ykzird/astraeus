@@ -27,6 +27,7 @@ node player-verify.mjs        http://127.0.0.1:8810 <episodeId> <movieId>
 node subtitle-verify.mjs      http://127.0.0.1:8810 <captionedEpisodeId> <movieId>
 node player-chrome-verify.mjs http://127.0.0.1:8810 <entityId>
 node real-media-verify.mjs    http://127.0.0.1:8810 <entityId> [timeoutSeconds]
+node resume-verify.mjs        http://127.0.0.1:8810 <entityId> [resumeSeconds]
 ```
 
 `CDP_PORT` overrides the debugging port (default 9333).
@@ -86,6 +87,21 @@ labelled like one — so these checks survive renaming.
   reasons and whether delivery went through MSE;
 - seeks within produced content, and reports the media element's state if it
   never starts.
+
+`resume-verify.mjs`
+
+- writes a position through `PUT /api/entities/{id}/progress`, plays the entity
+  the way a person does, and reads the transport's **source** clock — so it fails
+  if the player ignores the stored position and starts at zero anyway;
+- pauses after a few seconds and asks the server what it now holds, because a
+  player that stores nothing is indistinguishable from one that resumes nothing;
+- clicks the transport's start-over control and checks the position is gone, so
+  the next Play cannot offer the old place;
+- reports a console error as a failure, like the other harnesses.
+
+It needs an entity longer than the resume position plus a minute — a resume at
+300s in a three-second clip proves nothing — and exits with usage status if the
+entity is too short.
 
 `subtitle-verify.mjs`
 
