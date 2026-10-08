@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jok/astraeus-media/internal/library/naming"
 )
 
 // ScanResult summarises what a scan actually did. It is returned to callers
@@ -83,12 +84,12 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 			return nil
 		}
 		if entry.IsDir() {
-			if path != root && IsIgnored(entry.Name()) {
+			if path != root && naming.IsIgnored(entry.Name()) {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		if IsIgnored(entry.Name()) || !IsVideoFile(path) {
+		if naming.IsIgnored(entry.Name()) || !naming.IsVideoFile(path) {
 			return nil
 		}
 
@@ -257,7 +258,7 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 				MediaEntityID: leafEntity.ID,
 				FilePath:      absPath,
 				Size:          info.Size(),
-				MimeType:      MimeTypeForExt(filepath.Ext(absPath)),
+				MimeType:      naming.MimeTypeForExt(filepath.Ext(absPath)),
 				CreatedAt:     s.now(),
 			}
 			if err := tx.CreateObject(ctx, obj); err != nil {
@@ -307,19 +308,19 @@ func moviePlacement(relPath, absPath string) (entitySpec, bool) {
 	// The file name is usually the most precise title, but a containing folder
 	// that carries a release year ("Blade Runner 2049 (2017)/...1080p.mkv") is
 	// a stronger signal, so it wins in that case only.
-	parts := splitPath(relPath)
+	parts := naming.SplitPath(relPath)
 	source := filepath.Base(absPath)
 	if len(parts) >= 2 {
 		if dir := parts[len(parts)-2]; dir != "" {
-			if _, year := ParseMovieName(dir); year != 0 {
+			if _, year := naming.ParseMovieName(dir); year != 0 {
 				source = dir
 			}
 		}
 	}
 
-	title, year := ParseMovieName(source)
+	title, year := naming.ParseMovieName(source)
 	if title == "" {
-		title = TitleFromPath(absPath)
+		title = naming.TitleFromPath(absPath)
 	}
 	if title == "" {
 		return entitySpec{}, false
@@ -333,14 +334,14 @@ func moviePlacement(relPath, absPath string) (entitySpec, bool) {
 }
 
 func showPlacement(relPath, absPath string) ([]entitySpec, entitySpec, bool) {
-	info, ok := ParseEpisodePath(relPath)
+	info, ok := naming.ParseEpisodePath(relPath)
 	if !ok || info.Series == "" {
 		return nil, entitySpec{}, false
 	}
 
 	containers := []entitySpec{{Type: SeriesEntity, Name: info.Series}}
 	if info.Season > 0 {
-		containers = append(containers, entitySpec{Type: SeasonEntity, Name: SeasonDirName(info.Season)})
+		containers = append(containers, entitySpec{Type: SeasonEntity, Name: naming.SeasonDirName(info.Season)})
 	}
 
 	name := fmt.Sprintf("S%02dE%02d", info.Season, info.Episode)

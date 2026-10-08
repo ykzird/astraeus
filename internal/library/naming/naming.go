@@ -1,4 +1,4 @@
-package library
+package naming
 
 import (
 	"path/filepath"
@@ -110,7 +110,7 @@ func ParseEpisodeName(fileName string) (EpisodeInfo, bool) {
 // A path with no directory component has no series to attach to, so it is
 // rejected; ParseEpisodeName handles bare file names.
 func ParseEpisodePath(relPath string) (EpisodeInfo, bool) {
-	parts := splitPath(relPath)
+	parts := SplitPath(relPath)
 	if len(parts) < 2 {
 		return EpisodeInfo{}, false
 	}
@@ -188,7 +188,12 @@ func cleanTitle(s string) string {
 	return s
 }
 
-func splitPath(p string) []string {
+// SplitPath breaks a path into its meaningful components, dropping empty
+// segments and "." / ".." so that a relative path and an absolute one decompose
+// the same way. Callers use it to reason about where a file sits - for example
+// which folder names wrap it - without depending on the separator or on how the
+// path was spelled.
+func SplitPath(p string) []string {
 	p = filepath.ToSlash(filepath.Clean(p))
 	if p == "." || p == "/" {
 		return nil

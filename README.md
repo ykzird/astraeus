@@ -364,7 +364,8 @@ playing in Chromium through those harnesses.
 
 ```
 cmd/astraeus-server/    CLI entry point and wiring
-internal/library/       domain model, repository port, scanner, naming
+internal/library/       domain model, repository port, scanner
+internal/library/naming/  pure filename and path rules (no dependencies)
 internal/library/sqlite/  the SQLite adapter for that port
 internal/metadata/      provider interface, TMDB client, mock, enrichment worker
 internal/streaming/     capability negotiation, probing, HLS session manager
@@ -379,12 +380,18 @@ scripts/ui-verify/      browser harnesses for playback and subtitles
 scripts/make-demo-media.sh  generates a throwaway demo library
 ```
 
-`library` is the domain: the entities, the `Repository` port, the scanner and
-the filename rules. It contains no SQL and imports no database driver, which is
-what makes "SQLite today, PostgreSQL later" a real statement rather than an
-aspiration — the storage engine is a detail of `internal/library/sqlite`, which
-implements the port, owns the schema and its migrations, and is the only package
-that knows the tables exist.
+`library` is the domain: the entities, the `Repository` port and the scanner.
+It contains no SQL and imports no database driver, which is what makes "SQLite
+today, PostgreSQL later" a real statement rather than an aspiration — the
+storage engine is a detail of `internal/library/sqlite`, which implements the
+port, owns the schema and its migrations, and is the only package that knows the
+tables exist.
+
+The rules that turn a file name into a title, season and episode are in
+`internal/library/naming`, which imports nothing at all. They are the part of
+the domain most worth isolating: they are pure, they are fiddly, and the scanner
+and the schema migration both depend on them agreeing with each other — an
+entity renamed by a migration has to end up named the way a scan would name it.
 
 The composition root in `cmd` is the one place that names the concrete adapter,
 which is also where the port and the adapter are checked against each other at

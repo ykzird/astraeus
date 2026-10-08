@@ -13,6 +13,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/jok/astraeus-media/internal/library"
+	"github.com/jok/astraeus-media/internal/library/naming"
 )
 
 // sqlxExecutor is satisfied by both *sqlx.DB and *sqlx.Tx, which lets the same
@@ -235,7 +236,7 @@ func (r *Repository) backfillEntityNames(ctx context.Context) error {
 			`SELECT file_path FROM media_objects WHERE media_entity_id = ? LIMIT 1`, row.ID)
 		switch {
 		case err == nil && filePath != "":
-			name = library.TitleFromPath(filePath)
+			name = naming.TitleFromPath(filePath)
 		case err != nil && !errors.Is(err, sql.ErrNoRows):
 			return fmt.Errorf("looking up object for entity %s: %w", row.ID, err)
 		}
