@@ -126,12 +126,18 @@ sudo useradd --system --home /var/lib/astraeus --shell /usr/sbin/nologin astraeu
 sudo install -d -o astraeus -g astraeus /var/lib/astraeus /var/cache/astraeus
 sudo install -d -o astraeus -g astraeus /var/cache/astraeus/images /var/cache/astraeus/subtitles
 
-# 2. The binary and the web UI it serves.
+# 2. The binary and the web UI it serves, and the documentation the README
+#    links to. The pages are installed together so those links keep resolving;
+#    the trailing chmod is because this repository's own files are not
+#    world-readable.
 sudo install -m 0755 astraeus-server /usr/local/bin/astraeus-server
 sudo install -d /usr/local/share/astraeus
 sudo cp -r web /usr/local/share/astraeus/web
-sudo install -d /usr/local/share/doc/astraeus
-sudo install -m 0644 README.md /usr/local/share/doc/astraeus/README.md
+sudo install -d -m 0755 /usr/local/share/doc/astraeus
+sudo cp -r README.md SPECIFICATION.md TODO.md CONTEXT.md CONTRIBUTING.md \
+  SECURITY.md LICENSE THIRD_PARTY_NOTICES.md docs deploy \
+  /usr/local/share/doc/astraeus/
+sudo chmod -R a+rX /usr/local/share/doc/astraeus
 
 # 3. The token the unit reads, and the unit itself.
 sudo install -d -m 0755 /etc/astraeus

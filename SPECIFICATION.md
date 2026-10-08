@@ -173,7 +173,8 @@ server speaks plain HTTP and browsers ignore the header there.
 
 This section records where the running system diverges from, or has advanced
 beyond, the plan above. It is the authoritative description of what exists; the
-code lives in `astraeus-media/` and its `README.md` documents usage.
+code lives in `astraeus-media/`; `README.md` is the way in and `docs/` is the
+reference.
 
 ### 9.1 Storage
 
@@ -350,7 +351,7 @@ turning the subtitles off re-negotiates a session without the composite.
 
 ### 9.4 Interface
 
-The MVP exposes a REST API (§HTTP API in `astraeus-media/README.md`) rather than
+The MVP exposes a REST API (documented in [`docs/api.md`](docs/api.md)) rather than
 the gRPC option mentioned in §2.3.
 
 Observability is implemented: the KPI registry of §6.1 is instrumented and
