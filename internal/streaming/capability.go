@@ -48,6 +48,14 @@ type ClientCapability struct {
 	// in practice, so this defaults to 2 for browser clients. Zero means
 	// unrestricted.
 	MaxAudioChannels int `json:"max_audio_channels"`
+	// BurnSubtitleIndex selects an image-based subtitle stream to burn into the
+	// picture, as the ffmpeg stream index reported in a probe's subtitle list.
+	// Image subtitles (PGS, VobSub) carry pictures rather than text, so a
+	// browser cannot render one as a selectable track; compositing it into the
+	// video is the only way to show it, and that requires re-encoding. A text
+	// track named here is not burned - it is delivered as a track, which is
+	// better in every way - and the reasons say so. Zero means none.
+	BurnSubtitleIndex int `json:"burn_subtitle_index"`
 	// SupportsHLS enables the segmented delivery modes.
 	SupportsHLS bool `json:"supports_hls"`
 	// Subtitles indicates the client can render subtitle tracks.
@@ -97,7 +105,8 @@ func (c ClientCapability) Validate() error {
 		return fmt.Errorf("capability must list at least one audio codec")
 	}
 	if c.MaxWidth < 0 || c.MaxHeight < 0 || c.MaxBitrateKbps < 0 ||
-		c.MaxBitDepth < 0 || c.MaxAudioChannels < 0 || c.AudioTrackIndex < 0 {
+		c.MaxBitDepth < 0 || c.MaxAudioChannels < 0 || c.AudioTrackIndex < 0 ||
+		c.BurnSubtitleIndex < 0 {
 		return fmt.Errorf("capability limits must not be negative")
 	}
 	// A client that can render HDR can decode 10-bit: PQ and HLG are stored at
@@ -141,18 +150,19 @@ func firstUnknown(values, known []string, normalise func(string) string) string 
 // "H265", "h.265" and "hevc" are all understood.
 func (c ClientCapability) Normalise() ClientCapability {
 	return ClientCapability{
-		Containers:       normaliseAll(c.Containers, normaliseContainer),
-		VideoCodecs:      normaliseAll(c.VideoCodecs, NormaliseVideoCodec),
-		AudioCodecs:      normaliseAll(c.AudioCodecs, NormaliseAudioCodec),
-		MaxWidth:         c.MaxWidth,
-		MaxHeight:        c.MaxHeight,
-		MaxBitrateKbps:   c.MaxBitrateKbps,
-		MaxBitDepth:      c.MaxBitDepth,
-		AudioTrackIndex:  c.AudioTrackIndex,
-		MaxAudioChannels: c.MaxAudioChannels,
-		SupportsHDR:      c.SupportsHDR,
-		SupportsHLS:      c.SupportsHLS,
-		Subtitles:        c.Subtitles,
+		Containers:        normaliseAll(c.Containers, normaliseContainer),
+		VideoCodecs:       normaliseAll(c.VideoCodecs, NormaliseVideoCodec),
+		AudioCodecs:       normaliseAll(c.AudioCodecs, NormaliseAudioCodec),
+		MaxWidth:          c.MaxWidth,
+		MaxHeight:         c.MaxHeight,
+		MaxBitrateKbps:    c.MaxBitrateKbps,
+		MaxBitDepth:       c.MaxBitDepth,
+		AudioTrackIndex:   c.AudioTrackIndex,
+		MaxAudioChannels:  c.MaxAudioChannels,
+		BurnSubtitleIndex: c.BurnSubtitleIndex,
+		SupportsHDR:       c.SupportsHDR,
+		SupportsHLS:       c.SupportsHLS,
+		Subtitles:         c.Subtitles,
 	}
 }
 

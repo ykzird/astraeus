@@ -71,6 +71,11 @@ type Decision struct {
 	// filter chain: a 10-bit HDR source re-encoded for another reason still
 	// needs 10-bit HDR output, not a tone map.
 	ToneMap bool `json:"tone_map,omitempty"`
+	// BurnedSubtitleIndex is the image subtitle stream this decision composites
+	// into the picture, zero when none is. Burning a bitmap into the video is a
+	// re-encode by definition - there is no way to composite into copied bits -
+	// so a decision with this set is always a single-rendition transcode.
+	BurnedSubtitleIndex int `json:"burned_subtitle_index,omitempty"`
 
 	// Reasons explains every choice, in order. This is what makes a surprising
 	// decision debuggable instead of mysterious.
@@ -195,8 +200,34 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	// anything, so that is what happens instead.
 	trackChosen := hasAudio && capability.AudioTrackIndex > 0 && !trackRequestIgnored
 
+	// An image-based subtitle cannot be a selectable track: the browser has no
+	// way to render a picture timed to the video, so the only way to show one is
+	// to composite it into the picture while re-encoding. A text track named
+	// here is *not* burned - it is delivered as a track, which is better in
+	// every way - and a stream index the file does not have burns nothing.
+	burning := false
+	if capability.BurnSubtitleIndex > 0 {
+		track, found := info.SubtitleTrackByIndex(capability.BurnSubtitleIndex)
+		switch {
+		case !found:
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("this file has no subtitle track with stream index %d, so nothing is burned into the picture",
+					capability.BurnSubtitleIndex))
+		case track.Text:
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("subtitle track %d is text-based (%s), so it is delivered as a selectable track rather than burned into the picture",
+					track.Index, track.Codec))
+		default:
+			burning = true
+			decision.BurnedSubtitleIndex = track.Index
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("image subtitle track %d (%s) is burned into the picture, which needs a re-encode because a bitmap cannot be composited into copied bits",
+					track.Index, track.Codec))
+		}
+	}
+
 	switch {
-	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany || hdrMismatch || bitrateTooHigh:
+	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany || hdrMismatch || bitrateTooHigh || burning:
 		decision.Mode = ModeTranscode
 	case trackChosen:
 		decision.Mode = ModeRemux
@@ -207,7 +238,7 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	}
 
 	// Video action.
-	if !videoCompatible || needsDownscale || tooDeep || hdrMismatch || bitrateTooHigh {
+	if !videoCompatible || needsDownscale || tooDeep || hdrMismatch || bitrateTooHigh || burning {
 		decision.VideoAction = ActionTranscode
 		decision.TargetVideoCodec = capability.PreferredVideoCodec()
 		// An HDR source that has to be re-encoded should land in a codec that can
@@ -282,9 +313,13 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		}
 	}
 
-	// A ladder, when the client asked to adapt rather than pin a height.
+	// A ladder, when the client asked to adapt rather than pin a height. A burn
+	// is deliberately excluded: the subtitle is composited once, in one filter
+	// graph, so a burned session is a single rendition. Offering rungs here
+	// would mean either burning only the top one or compositing per rung, and
+	// neither is what the client asked for.
 	laddered := false
-	if decision.Deliverable && decision.VideoAction == ActionTranscode && capability.MaxHeight <= 0 {
+	if decision.Deliverable && decision.VideoAction == ActionTranscode && capability.MaxHeight <= 0 && !burning {
 		top := decision.TargetHeight
 		if top <= 0 {
 			top = info.Height

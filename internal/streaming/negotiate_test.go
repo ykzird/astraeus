@@ -1769,3 +1769,138 @@ func TestBuildFFmpegArgs_MapsTheChosenAudioStream(t *testing.T) {
 		t.Errorf("chosen track mapped %d times, want once per rung:\n%s", got, strings.Join(ladder, " "))
 	}
 }
+
+// TestNegotiate_BurnsAnImageSubtitle is the contract for a bitmap subtitle: a
+// browser cannot render one as a track, so asking for it means compositing it
+// into the picture, which is a single-rendition re-encode.
+func TestNegotiate_BurnsAnImageSubtitle(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+		Subtitles: []SubtitleTrack{
+			{Index: 2, Codec: "subrip", Text: true, Language: "en"},
+			{Index: 3, Codec: "hdmv_pgs_subtitle", Text: false, Language: "fr"},
+		},
+	}
+	capability := ClientCapability{
+		Containers: []string{"matroska"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true, Subtitles: true,
+		BurnSubtitleIndex: 3,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.Mode != ModeTranscode || decision.VideoAction != ActionTranscode {
+		t.Fatalf("mode = %q action = %q, want a transcode: a bitmap cannot be composited into copied bits",
+			decision.Mode, decision.VideoAction)
+	}
+	if decision.BurnedSubtitleIndex != 3 {
+		t.Errorf("burned index = %d, want 3", decision.BurnedSubtitleIndex)
+	}
+	// No height was pinned, but a burn is one composited picture: a ladder here
+	// would mean burning only one rung.
+	if len(decision.Renditions) != 0 {
+		t.Errorf("renditions = %+v, want a single rendition for a burn", decision.Renditions)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "burned into the picture") {
+		t.Errorf("the reasons do not say the subtitle is burned in: %v", decision.Reasons)
+	}
+}
+
+// TestNegotiate_DoesNotBurnATextSubtitle pins the other half: a text track named
+// for burning is delivered as a selectable track instead, because that is
+// better than irreversibly burning it in, and the reason says which happened.
+func TestNegotiate_DoesNotBurnATextSubtitle(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+		Subtitles:   []SubtitleTrack{{Index: 2, Codec: "subrip", Text: true, Language: "en"}},
+	}
+	capability := ClientCapability{
+		Containers: []string{"matroska"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true, Subtitles: true,
+		BurnSubtitleIndex: 2,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.BurnedSubtitleIndex != 0 {
+		t.Errorf("burned index = %d, want none: a text track is not burned", decision.BurnedSubtitleIndex)
+	}
+	if decision.VideoAction == ActionTranscode {
+		t.Error("a text track named for burning forced a re-encode; it should be delivered as a track")
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "text-based") {
+		t.Errorf("the reasons do not explain why nothing was burned: %v", decision.Reasons)
+	}
+}
+
+// TestNegotiate_BurnIndexThatDoesNotExist pins the third case: an index the file
+// does not have burns nothing and says so, rather than failing the session.
+func TestNegotiate_BurnIndexThatDoesNotExist(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+		Subtitles:   []SubtitleTrack{{Index: 3, Codec: "hdmv_pgs_subtitle", Text: false}},
+	}
+	capability := ClientCapability{
+		Containers: []string{"matroska"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true, Subtitles: true,
+		BurnSubtitleIndex: 9,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.BurnedSubtitleIndex != 0 {
+		t.Errorf("burned index = %d, want none for an index the file lacks", decision.BurnedSubtitleIndex)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "no subtitle track with stream index 9") {
+		t.Errorf("the reasons do not name the missing track: %v", decision.Reasons)
+	}
+}
+
+// TestBuildFFmpegArgs_BurnsAnImageSubtitle asserts the shape of the command that
+// does the compositing: the picture is the filter graph's output, the subtitle
+// comes from a second opening of the input, and no -vf is attached (ffmpeg
+// refuses -vf on an output that already has a -filter_complex).
+func TestBuildFFmpegArgs_BurnsAnImageSubtitle(t *testing.T) {
+	t.Parallel()
+
+	cfg := ManagerConfig{SegmentSeconds: 6, Server: ServerCapability{VideoEncoders: []string{"libx264"}}}
+	decision := Decision{
+		Mode: ModeTranscode, Deliverable: true, Container: "hls",
+		VideoAction: ActionTranscode, AudioAction: ActionCopy,
+		TargetVideoCodec: "h264", TargetHeight: 720, BurnedSubtitleIndex: 3,
+	}
+
+	args, err := BuildFFmpegArgsAt("/tmp/session", "/media/movie.mkv", decision, cfg, 901.5)
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgsAt: %v", err)
+	}
+	line := strings.Join(args, " ")
+
+	if got := strings.Count(line, "-i /media/movie.mkv"); got != 2 {
+		t.Errorf("input opened %d times, want twice: the subtitle needs its own input\n%s", got, line)
+	}
+	if got := strings.Count(line, "-ss 901.500"); got != 2 {
+		t.Errorf("offset applied %d times, want to both inputs so the cue timeline lines up\n%s", got, line)
+	}
+	for _, want := range []string{
+		"-filter_complex [0:v:0]scale=-2:720[base];[1:3]format=rgba[burn0];[burn0][base]scale2ref=flags=neighbor[burn][base2];[base2][burn]overlay=format=auto[v]",
+		"-map [v]",
+		"-c:v libx264",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("missing %q from:\n%s", want, line)
+		}
+	}
+	if strings.Contains(line, "-vf") {
+		t.Errorf("-vf cannot share an output with -filter_complex:\n%s", line)
+	}
+}

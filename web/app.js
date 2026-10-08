@@ -477,8 +477,12 @@
    *
    * `audioTrackIndex` is omitted for Auto as well: the contract reserves both
    * a missing field and 0 for "the server's choice", so neither is ever sent.
+   *
+   * `burnSubtitleIndex` names an image-based subtitle track to burn into the
+   * picture. It shares the audio field's convention — absent and 0 both mean
+   * "do not burn" — so it is only ever sent for a real global stream index.
    */
-  function playbackRequestBody(startSeconds, maxHeight, audioTrackIndex) {
+  function playbackRequestBody(startSeconds, maxHeight, audioTrackIndex, burnSubtitleIndex) {
     const body = {
       containers: ["mp4", "webm", "hls"],
       video_codecs: ["h264", "vp9", "av1"],
@@ -497,6 +501,13 @@
     if (typeof maxHeight === "number" && maxHeight > 0) body.max_height = maxHeight;
     if (typeof audioTrackIndex === "number" && isFinite(audioTrackIndex) && audioTrackIndex > 0) {
       body.audio_track_index = audioTrackIndex;
+    }
+    if (
+      typeof burnSubtitleIndex === "number" &&
+      isFinite(burnSubtitleIndex) &&
+      burnSubtitleIndex > 0
+    ) {
+      body.burn_subtitle_index = burnSubtitleIndex;
     }
     if (typeof startSeconds === "number" && isFinite(startSeconds) && startSeconds > 0) {
       body.start_seconds = startSeconds;
@@ -1575,7 +1586,6 @@
       "data-action": "select-subtitle",
       "data-subtitle-key": String(opts.key),
       "data-focus-key": "subtitle:" + String(opts.key),
-      "aria-describedby": opts.describedBy || null,
     });
     return el("label", { class: "subtitle-option", for: id }, [
       input,
@@ -1587,63 +1597,38 @@
     const list = Array.isArray(pb.subtitles) ? pb.subtitles : [];
     if (!list.length) return null;
 
-    const deliverable = list.filter(subtitleDeliverable);
-    const blocked = list.filter(function (sub) {
-      return !subtitleDeliverable(sub);
-    });
-
     const options = [
       subtitleOptionNode({
         key: "off",
         label: "Off",
-        checked: pb.subtitleSelection === "off" || deliverable.length === 0,
+        checked: pb.subtitleSelection === "off",
         disabled: false,
       }),
     ];
 
-    for (const sub of deliverable) {
+    for (const sub of list) {
       const key = subtitleKey(sub);
+      /* An image track has no URL to hand a <track>, so the only way it can be
+         shown is burned into the picture. Offer it anyway and say so in the
+         label: the choice is real, it just costs a server-side re-encode rather
+         than an instant toggle. */
+      const label = subtitleBurnable(sub)
+        ? subtitleLabel(sub) + " (burned in)"
+        : subtitleLabel(sub);
       options.push(
         subtitleOptionNode({
           key: key,
-          label: subtitleLabel(sub),
+          label: label,
           checked: pb.subtitleSelection === key,
           disabled: !live,
         })
       );
     }
 
-    for (const sub of blocked) {
-      options.push(
-        subtitleOptionNode({
-          key: "blocked-" + subtitleKey(sub),
-          label: subtitleLabel(sub),
-          checked: false,
-          disabled: true,
-          describedBy: "subtitle-blocked-reason",
-        })
-      );
-    }
-
-    const body = [el("div", { class: "subtitle-options" }, options)];
-    if (blocked.length) {
-      body.push(
-        el("p", {
-          class: "subtitle-reason",
-          id: "subtitle-blocked-reason",
-          text:
-            "Image-based subtitles are not supported, so these cannot be selected: " +
-            blocked.map(subtitleLabel).join(", ") +
-            ".",
-        })
-      );
-    }
-
-    return el(
-      "fieldset",
-      { class: "subtitle-group" },
-      [el("legend", { class: "ctx-heading", text: "Subtitles" })].concat(body)
-    );
+    return el("fieldset", { class: "subtitle-group" }, [
+      el("legend", { class: "ctx-heading", text: "Subtitles" }),
+      el("div", { class: "subtitle-options" }, options),
+    ]);
   }
 
   function renderPlaybackSection(entity, objects, isLeaf) {
@@ -2765,6 +2750,36 @@
     return !!sub && typeof sub.url === "string" && sub.url.length > 0;
   }
 
+  /**
+   * Image-based tracks (PGS/VobSub) arrive without a URL because no browser can
+   * render them from a sidecar; a burn is the only way to show one. That makes
+   * them exactly the tracks `subtitleDeliverable` rejects.
+   */
+  /* An image track is one the server flagged `text: false`. It has no URL to
+     hand a <track>, so the only way it can be shown is burned into the picture -
+     which is why absence of a URL is *not* the test: a server with subtitle
+     conversion switched off also hands out no URLs, and those tracks are text
+     and would be refused rather than burned. */
+  function subtitleBurnable(sub) {
+    return !!sub && sub.text === false;
+  }
+
+  /** The server track the menu's key names, or null when it is gone. */
+  function subtitleFor(pb, key) {
+    const list = pb && Array.isArray(pb.subtitles) ? pb.subtitles : [];
+    for (const sub of list) {
+      if (subtitleKey(sub) === key) return sub;
+    }
+    return null;
+  }
+
+  /** The index the server is burning in now, or 0 when no burn is active. */
+  function burnedSubtitleIndex(pb) {
+    const decision = pb && pb.decision;
+    const value = decision ? Number(decision.burned_subtitle_index) : NaN;
+    return isFinite(value) && value > 0 ? value : 0;
+  }
+
   function subtitleLabel(sub) {
     if (sub && typeof sub.label === "string" && sub.label) return sub.label;
     if (sub && typeof sub.language === "string" && sub.language) return sub.language;
@@ -2829,6 +2844,12 @@
     } else {
       pb.subtitleSelection = defaultKey !== null ? defaultKey : "off";
     }
+    /* A burn is not a <track>, so its key never appears in `keys` and the
+       default fallback above cannot see it. The decision is the only record
+       that one is running, and it wins: otherwise the menu would read Off while
+       the picture already has subtitles baked into it. */
+    const burning = burnedSubtitleIndex(pb);
+    if (burning > 0) pb.subtitleSelection = String(burning);
     pb.subtitlePreference = null;
     applySubtitleModes();
   }
@@ -2847,9 +2868,55 @@
     }
   }
 
+  /**
+   * Adopt a subtitle choice from the menu.
+   *
+   * A text track toggles a <track> the element already owns. An image track has
+   * no URL to toggle, so choosing one asks the server to burn it in — and a
+   * burn changes what is encoded, so like an audio-track switch it has to
+   * re-negotiate at the current position. Leaving a burn is the same switch in
+   * reverse: the subtitles are already part of the picture, so "Off" and a
+   * plain text track both need a session that is encoded without it.
+   */
   function selectSubtitle(key) {
     const pb = state.playback;
     const next = key || "off";
+    const track = next === "off" ? null : subtitleFor(pb, next);
+
+    /* The menu never produces an unknown key; treat one like the old guard. */
+    if (next !== "off" && !track) return;
+
+    if (subtitleBurnable(track)) {
+      const index = Number(track.index);
+      if (!isFinite(index) || index <= 0) return;
+      if (!pb.url || pb.qualityBusy) return;
+      /* Asking for the burn already running would only re-buffer for nothing. */
+      if (index === burnedSubtitleIndex(pb)) return;
+      /* Set the choice before re-negotiating: the preference carries it across
+         the switch, exactly as it does for a text track. */
+      pb.subtitleSelection = next;
+      resumeSession({
+        startSeconds: currentSourceTime(pb),
+        maxHeight: pb.maxHeight,
+        audioTrackIndex: pb.audioTrackIndex,
+        burnSubtitleIndex: index,
+      });
+      return;
+    }
+
+    if (burnedSubtitleIndex(pb) > 0) {
+      if (!pb.url || pb.qualityBusy) return;
+      pb.subtitleSelection = next;
+      resumeSession({
+        startSeconds: currentSourceTime(pb),
+        maxHeight: pb.maxHeight,
+        audioTrackIndex: pb.audioTrackIndex,
+        /* 0 is the contract's "no burn", which stops the re-encode. */
+        burnSubtitleIndex: 0,
+      });
+      return;
+    }
+
     if (next !== "off" && !subtitleTrackRefs.some(function (ref) { return ref.key === next; })) return;
     pb.subtitleSelection = next;
     applySubtitleModes();
@@ -3946,9 +4013,14 @@
     /* Height and audio are chosen independently, so swapping one carries the
        other across the re-negotiation unless the caller asked otherwise. */
     const audioTrackIndex = "audioTrackIndex" in opts ? opts.audioTrackIndex : pb.audioTrackIndex;
+    /* A burn is a property of the encoded stream too, so it rides along unless
+       the caller is the one switching subtitles and named a different one. */
+    const burnSubtitleIndex =
+      "burnSubtitleIndex" in opts ? opts.burnSubtitleIndex : burnedSubtitleIndex(pb);
     const wasPlaying = !playerVideo.paused && !playerVideo.ended;
     const previousMaxHeight = pb.maxHeight;
     const previousAudioTrackIndex = pb.audioTrackIndex;
+    const previousSubtitleSelection = pb.subtitleSelection;
     const previousSessionId = pb.sessionId;
     /* The tracks are about to be rebuilt from the new response, which carries
        the server's own `default` disposition again; carry the viewer's actual
@@ -3972,7 +4044,7 @@
     try {
       const result = await api.playback(
         entity.id,
-        playbackRequestBody(startSeconds, maxHeight, audioTrackIndex)
+        playbackRequestBody(startSeconds, maxHeight, audioTrackIndex, burnSubtitleIndex)
       );
       /* Navigation or Stop may have replaced the session meanwhile. */
       if (state.playback !== pb) return;
@@ -3994,6 +4066,9 @@
       pb.qualityBusy = false;
       pb.maxHeight = previousMaxHeight;
       pb.audioTrackIndex = previousAudioTrackIndex;
+      /* A failed burn switch left the old stream playing, so the menu must not
+         keep claiming the choice that never took effect. */
+      pb.subtitleSelection = previousSubtitleSelection;
       pb.status = "error";
       pb.error = playbackErrorMessage(entity, error);
       setActionStatus(pb.error, "error");
@@ -4017,6 +4092,8 @@
       maxHeight: maxHeight,
       /* Only the height is changing; keep the track the viewer picked. */
       audioTrackIndex: pb.audioTrackIndex,
+      /* A burn is part of the stream being re-encoded, so it survives too. */
+      burnSubtitleIndex: burnedSubtitleIndex(pb),
     });
   }
 
@@ -4032,6 +4109,8 @@
       startSeconds: currentSourceTime(pb),
       maxHeight: pb.maxHeight,
       audioTrackIndex: index,
+      /* Only the audio track is changing, so an active burn stays. */
+      burnSubtitleIndex: burnedSubtitleIndex(pb),
     });
   }
 

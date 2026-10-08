@@ -203,6 +203,19 @@ func (m *MediaInfo) AudioTrackByIndex(index int) (AudioTrack, bool) {
 	return AudioTrack{}, false
 }
 
+// SubtitleTrackByIndex returns the subtitle track with this ffmpeg stream index.
+func (m *MediaInfo) SubtitleTrackByIndex(index int) (SubtitleTrack, bool) {
+	if m == nil {
+		return SubtitleTrack{}, false
+	}
+	for _, track := range m.Subtitles {
+		if track.Index == index {
+			return track, true
+		}
+	}
+	return SubtitleTrack{}, false
+}
+
 // AudioTrackLabel names a track for a human, using whatever the file provides
 // and falling back to the codec, which is always there.
 func AudioTrackLabel(track AudioTrack) string {

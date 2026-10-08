@@ -30,7 +30,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | Adaptive bitrate | Done. A manifest that omits `max_height` gets a master playlist with up to three rungs, each with its own ceiling; naming a height gets one rendition |
 | HDR and Dolby Vision | Detected from the source's colour tags; **tone mapped to SDR** for clients that cannot show it, and passed through at 10 bits for those that can. Dolby Vision profile 8 keeps its HDR10 base layer; profile 5 is flagged as approximate |
 | Hardware acceleration | NVENC, QuickSync, VideoToolbox, VAAPI and AMF, each **verified by running it with the real options** at startup; rejected encoders report why; software fallback |
-| Subtitles | Done. Text tracks extracted to WebVTT, cached and served |
+| Subtitles | Done. Text tracks extracted to WebVTT, cached and served; image tracks (PGS, VobSub) burned into the picture on request |
 | Observability | Done. The KPI registry is exposed in Prometheus format at `/metrics` |
 | Web UI | Three-column spatial layout, served by the binary; HLS via a vendored hls.js; player controls overlaid on the video (transport, seek, subtitles, volume, quality, fullscreen) |
 | Authentication | Optional gate: trusted-proxy identity (Tailscale / Cloudflare Access) or a bearer token |
@@ -257,7 +257,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.10.0`).
+identifier (currently `0.11.0`).
 
 ## HTTP API
 
@@ -371,6 +371,7 @@ Errors are `{"code": "...", "message": "..."}` with a matching status code.
   "max_audio_channels": 2,
   "supports_hdr": false,
   "audio_track_index": 0,
+  "burn_subtitle_index": 0,
   "supports_hls": true,
   "subtitles": true
 }
@@ -491,6 +492,41 @@ downmixed as usual.
 An `audio_track_index` naming a track the file does not have is a `400` listing
 the indices that do exist, because the client already had that list. A player can
 therefore offer the choice without probing anything itself.
+
+### Image subtitles
+
+Text tracks are served to the browser as WebVTT. Image-based tracks (PGS, VobSub)
+carry pictures rather than text, so no browser can render one as a subtitle
+track; the only way to show them is to composite the bitmap into the video while
+re-encoding. `burn_subtitle_index` in the playback request names the ffmpeg
+stream index to burn in (`media_info.subtitles` reports each track, with
+`text: false` marking the image ones). The decision then carries
+`burned_subtitle_index`, forces a transcode and pins **one** rendition: the
+bitmap is composited once in a single filter graph, so a ladder would mean
+burning only one rung.
+
+The composite scales the subtitle to the picture with `scale2ref`, so a
+downscaled re-encode places and sizes it correctly, and it is applied *after* the
+plan's own filters — which is what makes it right for a tone map, since a
+subtitle bitmap is SDR white and must be laid over the finished SDR picture
+rather than converted with it. The subtitle is decoded from a second opening of
+the input, because asking one input for both the video and the subtitle stream in
+the same graph does not deliver subtitle frames.
+
+Three honest limitations:
+
+- **Burning is irreversible for the session.** Turning the subtitles off asks the
+  server for a session without the burn, which is another re-encode, not a
+  toggle. The player does this at the current position.
+- **A text track named for burning is not burned.** It is delivered as a
+  selectable track instead — better in every way — and the reasons say so.
+- **A stream index the file does not have is a `400`** listing the tracks it
+  does, and a text track named for burning is a `400` too, because that is a
+  category error rather than an unsupported one.
+
+`internal/testfixtures/pgs` writes the PGS fixture the tests use, because no
+image-subtitle sample ships with the project and ffmpeg cannot encode a bitmap
+subtitle from text; `scripts/pgsgen` exposes it for browser fixtures.
 
 ### Adaptive bitrate
 
@@ -622,6 +658,7 @@ internal/library/sqlite/  the SQLite adapter for that port
 internal/metadata/      provider interface, TMDB client, mock, enrichment worker
 internal/streaming/     capability negotiation, probing, HLS session manager
 internal/subtitles/     WebVTT extraction and caching
+internal/testfixtures/pgs/  a PGS (.sup) writer for image-subtitle fixtures
 internal/images/        artwork proxy and cache
 internal/observability/ KPI registry and Prometheus exposition
 internal/access/        the access gate
@@ -629,6 +666,7 @@ internal/api/           HTTP layer
 web/                    the Spatial Web UI, including vendored hls.js
                         and the generated BoxIcons registry (web/icons.js)
 scripts/ui-verify/      browser harnesses for playback and subtitles
+scripts/pgsgen/         writes a PGS (.sup) fixture for those harnesses
 scripts/make-demo-media.sh  generates a throwaway demo library
 deploy/                 the systemd unit and the deployment runbook
 Dockerfile              the container image (multi-stage, ffmpeg included)

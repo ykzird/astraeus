@@ -51,7 +51,13 @@ Status as of the current build. Evidence for each claim is the test suite
       stream index, the file's `default` track delivered when the client does not
       choose, and every audio decision (codec, channels, bitrate share) made about
       the chosen track. A chosen track repackages rather than direct-plays
-- [ ] Serving image-based subtitles (PGS/VobSub) — needs OCR or bitmap overlay
+- [x] Image-based subtitles (PGS, VobSub) delivered by burning the bitmap into
+      the picture: `burn_subtitle_index` names the stream, the decision forces a
+      single-rendition transcode, and the composite is applied after the colour
+      chain so a tone map cannot wash the subtitle out. Verified at the pixel
+      level by a Go integration test (a generated PGS fixture, burned versus not)
+      and in a browser (10/10 harness checks). OCR — text instead of a picture —
+      remains open; see "Not covered yet"
 - [x] `max_bitrate_kbps` acted on rather than echoed: the audio's share is
       reserved and the video held to the remainder as a VBV ceiling, uniformly
       across encoder families. Verified end to end — the same 9 Mbps source came
@@ -106,8 +112,9 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Segmented playback in Chromium and Firefox via a locally vendored hls.js
       (1.7.3, lazy-loaded), verified in a real browser
 - [x] Subtitle tracks rendered and selectable in the player, defaulting to Off
-      unless the server marks a default; image-based tracks shown but disabled; the
-      choice survives a quality change or a seek
+      unless the server marks a default; image-based tracks offered as "burned in"
+      (a real re-negotiation, labelled with its cost); the choice survives a
+      quality change or a seek
 - [x] Transport overlaid on the video rather than in the sidebar, with fullscreen on
       the player container, volume and mute (remembered), and a quality menu that
       re-negotiates at the current position
@@ -195,8 +202,15 @@ Status as of the current build. Evidence for each claim is the test suite
     encoders are: the 10-bit probe runs on whatever host starts the server, but
     no NVIDIA, Intel or AMD GPU is reachable here. On this machine the probe
     verified five software encoders at 10-bit.
-- Image-based subtitles (PGS, VobSub) are detected and reported but not
-  delivered — that needs OCR or bitmap overlay support.
+- Image-based subtitles are burned into the picture rather than converted to
+  text: the subtitle is exact, but it needs a re-encode, cannot be toggled
+  without one, and cannot be searched or restyled. OCR (tesseract) would deliver
+  text that survives all three, at the cost of a runtime dependency and OCR
+  errors — neither is implemented.
+- The burn-in path is verified for **PGS** and only for software encoders. VobSub
+  shares the track classification and the same overlay path, but no VobSub sample
+  exists on this host, so it is reasoned about rather than observed; a hardware
+  encoder's upload filter has never been combined with the burn graph.
 - Browser clients are capped at 1080p, 8-bit and stereo by default, and do not
   declare HDR support, so a PQ film is tone mapped for them by design. There is
   no surround passthrough and no per-client override beyond sending a capability

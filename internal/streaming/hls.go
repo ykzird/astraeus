@@ -673,6 +673,16 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 	}
 	device := encoderDevice{RenderNode: cfg.Server.RenderNode}
 
+	// Burning an image subtitle is composited by one filter graph, so it is a
+	// single-rendition affair. Negotiation never builds a ladder for a burn; a
+	// hand-built decision that does is refused here rather than silently
+	// burning only part of the picture.
+	burning := decision.BurnedSubtitleIndex > 0 && decision.VideoAction == ActionTranscode
+	if burning && len(plans) > 1 {
+		return nil, fmt.Errorf("burning subtitle stream %d needs a single rendition, got %d",
+			decision.BurnedSubtitleIndex, len(plans))
+	}
+
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "error",
@@ -683,6 +693,17 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 	}
 	args = append(args, encoderInputArgs(encoder, device)...)
 	args = append(args, "-i", inputPath)
+	if burning {
+		// The subtitle stream is decoded from a second copy of the input. Asking
+		// one input for [0:v:0] and [0:s:N] together in the same graph did not
+		// deliver subtitle frames in testing, so the file is opened again; the
+		// second opening only ever supplies the subtitle, and it is seeked with
+		// the same offset so the cue timeline lines up with the picture.
+		if startSeconds > 0 {
+			args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
+		}
+		args = append(args, "-i", inputPath)
+	}
 
 	audioMap := audioMapSpec(decision)
 	switch decision.VideoAction {
@@ -693,10 +714,19 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		}
 		args = append(args, "-c:v", "copy")
 	case ActionTranscode:
+		if burning {
+			args = append(args, "-filter_complex", burnFilterGraph(encoder, plans[0], decision.BurnedSubtitleIndex))
+		}
 		// One -map per rendition: the same source stream feeds every rung, and
 		// what differs is the options that follow it.
 		for index, plan := range plans {
-			args = append(args, "-map", "0:v:0")
+			if burning {
+				// The picture is the filter graph's output, not the source
+				// stream: the burned subtitle is already part of it.
+				args = append(args, "-map", "[v]")
+			} else {
+				args = append(args, "-map", "0:v:0")
+			}
 			if decision.AudioAction != ActionNone {
 				args = append(args, "-map", audioMap)
 			}
@@ -705,7 +735,11 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 			// the encoder writes into the stream. No -color_primaries option is
 			// passed because ffmpeg ignores it in favour of the frame's own
 			// properties.
-			args = append(args, encoderOutputArgs(encoder, plan, device, len(plans), index)...)
+			if burning {
+				args = append(args, encoderBurnedVideoArgs(encoder, plan)...)
+			} else {
+				args = append(args, encoderOutputArgs(encoder, plan, device, len(plans), index)...)
+			}
 			// Cut on the requested segment boundary. Without this ffmpeg only
 			// cuts at encoder keyframes - a ~10s default GOP - so -hls_time is
 			// advisory and the first segment, and therefore first playback,
@@ -764,6 +798,32 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		filepath.Join(dir, MediaPlaylistName),
 	)
 	return args, nil
+}
+
+// burnFilterGraph composites an image subtitle stream into the picture.
+//
+// The subtitle comes from the second input and is scaled to the picture with
+// scale2ref, so a downscaled re-encode places and sizes it correctly without
+// the graph needing to know the source's aspect ratio. The compositing happens
+// *after* the plan's own filters, which is what makes it right for a tone map:
+// a subtitle bitmap is SDR white, and it must be laid over the finished SDR
+// picture rather than passed through the HDR-to-SDR conversion with it.
+func burnFilterGraph(encoder string, plan videoPlan, subtitleIndex int) string {
+	var graph strings.Builder
+	graph.WriteString("[0:v:0]")
+	if filters := videoFilters(encoder, plan); len(filters) > 0 {
+		graph.WriteString(strings.Join(filters, ","))
+	} else {
+		graph.WriteString("null")
+	}
+	graph.WriteString("[base];")
+	// The index is the *global* stream index the probe reports, not the
+	// subtitle-relative form ffmpeg would read from ":s:N": a file whose audio
+	// tracks come first would otherwise burn the wrong stream.
+	fmt.Fprintf(&graph, "[1:%d]format=rgba[burn0];", subtitleIndex)
+	graph.WriteString("[burn0][base]scale2ref=flags=neighbor[burn][base2];")
+	graph.WriteString("[base2][burn]overlay=format=auto[v]")
+	return graph.String()
 }
 
 // audioMapSpec renders the -map specifier for the audio stream this session

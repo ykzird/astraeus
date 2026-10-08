@@ -1,10 +1,11 @@
 # Handoff
 
-**As of the round-3 work of 2026-10-08 — per-viewer playback progress. Version
-0.10.0. 95 tracked files.** (`git log` names the commits; the previous handoff was
-`6a5cf89`, and below that round 2 landed HDR/Dolby Vision, packaging, the
-bitrate ceiling, the adaptive ladder, audio track selection, resumable playback,
-the continue-watching list and response hardening.)
+**As of the round-4 work of 2026-10-08 — image subtitles by burn-in. Version
+0.11.0. 99 tracked files.** (`git log` names the commits; the previous handoff was
+`f5a8973`, which landed per-viewer playback progress. Round 2 landed HDR/Dolby
+Vision, packaging, the bitrate ceiling, the adaptive ladder, audio track
+selection, resumable playback, the continue-watching list and response
+hardening.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -119,6 +120,13 @@ mise exec -- go test -run 'TestPlaybackProgress|TestListProgress' ./internal/api
 mise exec -- go test -v -run 'PerViewer|LocalOne|WidensProgress|UngatedServer|FinishingIsOnly' \
   ./internal/api/ ./internal/library/sqlite/
 
+# Image subtitles. The integration test writes a PGS fixture (nothing else can -
+# ffmpeg will not encode a bitmap subtitle from text), burns it in with the real
+# ffmpeg, and compares the produced segment's pixels against the same source
+# without the burn. The unit tests pin the negotiation and the command line.
+mise exec -- go test -tags=integration -run BurnIn -v ./internal/streaming/
+mise exec -- go test -run 'BurnsAnImageSubtitle|DoesNotBurnATextSubtitle|BurnIndexThatDoesNotExist' ./internal/streaming/ ./internal/api/
+
 # Both resume paths in a real browser - direct play seeks the element itself,
 # segmented delivery is started at the offset by the server - plus the
 # continue-watching list gaining and dropping the entry. Use a fixture longer
@@ -127,6 +135,13 @@ mise exec -- go test -v -run 'PerViewer|LocalOne|WidensProgress|UngatedServer|Fi
 # do not: their HDR ladder starts slower than the harness waits.
 CDP_PORT=9413 timeout 200 node scripts/ui-verify/resume-verify.mjs http://127.0.0.1:8923 <directPlayEntityId> 30
 CDP_PORT=9413 timeout 200 node scripts/ui-verify/resume-verify.mjs http://127.0.0.1:8923 <segmentedEntityId> 30
+
+# Image subtitles in a real browser: the menu offers the image track, choosing it
+# re-negotiates with burn_subtitle_index, and the decision comes back with
+# burned_subtitle_index. Needs an entity with a PGS track; scripts/pgsgen and the
+# harness README build one. What is composited into the picture is the Go
+# integration test's job, not this harness's.
+CDP_PORT=9413 timeout 200 node scripts/ui-verify/burn-verify.mjs http://127.0.0.1:8924 <imageSubtitleEntityId>
 
 # The real thing, against the 17 GB film: a browser profile gets bt709/bt709,
 # an HDR manifest gets 10-bit bt2020/PQ. Copy real.db first; *.db is local state.
@@ -322,6 +337,35 @@ well as in the report path — applied after the `LIMIT`, a finished row consume
 one of the slots and a listing of one comes back empty, which is the bug the
 adapter test caught.
 
+**Image subtitles** landed as of 0.11.0, closing the last subtitle gap. PGS and
+VobSub carry pictures, so no browser can render one as a track; the server
+composites the bitmap into the picture instead. A client sends
+`burn_subtitle_index` (the ffmpeg stream index, which `media_info.subtitles`
+reports with `text: false` for image tracks); the decision comes back with
+`burned_subtitle_index`, forces a transcode, and pins **one** rendition, because
+the bitmap is composited once in a single filter graph. Two details are
+load-bearing and were found by experiment rather than reasoning: the subtitle is
+decoded from a **second opening of the input** (asking one input for `[0:v:0]`
+and `[0:s:N]` in the same graph delivered no subtitle frames), and the composite
+goes **after** the plan's own filters so a tone map cannot wash the subtitle out
+(a bitmap is SDR white). The subtitle is scaled to the picture with `scale2ref`,
+so a downscaled re-encode places it correctly. A text track named for burning is
+not burned — it is delivered as a track, and the reasons say so. Burning is
+irreversible for the session, so turning subtitles off re-negotiates.
+
+Verified at the **pixel level**: a Go integration test writes a PGS fixture with
+`internal/testfixtures/pgs` (no image-subtitle sample exists on this host and
+ffmpeg will not encode a bitmap subtitle from text), burns it in with the real
+ffmpeg, and asserts the produced segment carries the 400x60 rectangle while the
+same source without the burn has none. The API and negotiation are unit-tested,
+and the player was verified in a browser with `burn-verify.mjs` at **10/10** —
+the menu offers the track as "(burned in)", the captured request carries the
+index, the captured decision reports it, the control reflects it, playback
+continues, and Off re-negotiates without a burn. `player-chrome-verify.mjs`
+scores 20/22 on the demo clips both before and after the front-end change, so
+the two auto-hide checks it fails there are a property of three-second fixtures,
+not a regression; `subtitle-verify.mjs` is 10/10.
+
 **Per-viewer progress** landed as of 0.10.0, which closes the largest
 simplification the product had left. `PlaybackProgress` gained a `ViewerID`, the
 `playback_progress` table's primary key widened from `(entity_id)` to
@@ -403,15 +447,21 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **Image subtitles** (PGS/VobSub are detected, reported and refused): OCR or a
-   bitmap overlay, and the only subtitle gap left.
-2. **Rate limiting and OpenTelemetry**, then **UI unit tests** (the front end is
+1. **Rate limiting and OpenTelemetry**, then **UI unit tests** (the front end is
    one 133 KB file with no seam — `web/core.js` for the pure timeline maths is the
    cheapest first cut). CSP, security headers and the artwork leak are done as of
-   0.9.0, and per-user progress as of 0.10.0.
+   0.9.0, per-user progress as of 0.10.0, and image subtitles by burn-in as of
+   0.11.0.
+2. **OCR for image subtitles, if the burn-in cost is unwanted.** A burn is exact
+   but needs a re-encode, cannot be toggled without one, and cannot be searched or
+   restyled. OCR (tesseract is already installed on the development host) would
+   deliver text that survives all three, at the cost of a runtime dependency and
+   OCR errors. `internal/testfixtures/pgs` and `scripts/pgsgen` now make the
+   fixture side of that work cheap; a PGS parser does not exist yet.
 3. **A ladder a client can pin the top of.** Today pinning a height means one
    rendition, so the quality menu caps quality rather than expressing a preference
-   within a ladder — the negotiation model is thinner than it looks there.
+   within a ladder — the negotiation model is thinner than it looks there. A burn
+   deliberately pins one rendition, so the two interact.
 4. **Release automation and a TLS example.** Packaging landed (see §6), but
    nothing is tagged or published, the CI workflow has never run, and there is no
    reverse-proxy configuration beside the unit.
@@ -464,6 +514,22 @@ Priority order, with the reasoning. Take it top-down.
   the captured tail, and two immediate re-runs passed 32/32 on the same code.
   Treat a single failure there as worth re-running before chasing it — but do
   capture the whole output, because `tail` is what lost the name of the check.
+- **Image subtitles are verified for PGS, for software encoders, at one
+  rendition.** The fixture is hand-written by `internal/testfixtures/pgs` because
+  no real PGS or VobSub sample exists on this host, so what was exercised is
+  ffmpeg's PGS decoder on a synthetic rectangle — not a real Blu-ray subtitle with
+  its palette, cropping and partial object updates. VobSub shares the track
+  classification and the same overlay path but has never been decoded here at
+  all. `scale2ref`/`overlay` has only been run with libx264: a hardware encoder's
+  upload filter has never been combined with the burn graph, and a ladder is
+  refused for a burn rather than composited per rung. A real PGS sample would be
+  the cheapest way to strengthen all of this.
+- **The burn fixture's cue timing is approximate.** Hand-written display sets are
+  shifted by up to a second when ffmpeg muxes them from `.sup` into Matroska,
+  which is why the integration test uses a five-second cue and asserts on a
+  segment well inside it. The burn path does not depend on that, but a test that
+  asserted exact cue boundaries would fail for a reason that is the fixture's, not
+  the server's.
 - **Progress is per viewer, but the viewer is only as real as the gate.** In
   `proxy` mode it is a forwarded identity and two people keep separate places; in
   `token` mode the gate names every API client `token`, so those clients share

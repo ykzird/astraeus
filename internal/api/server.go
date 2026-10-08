@@ -582,6 +582,33 @@ func audioTrackIndexList(tracks []streaming.AudioTrack) string {
 	return strings.Join(indices, ", ")
 }
 
+// subtitleTrackIndexList names the subtitle streams a file has, so a client that
+// asked to burn a stream index the file does not have is told what it could ask
+// for instead.
+func subtitleTrackIndexList(tracks []streaming.SubtitleTrack) string {
+	if len(tracks) == 0 {
+		return "none"
+	}
+	indices := make([]string, 0, len(tracks))
+	for _, track := range tracks {
+		kind := "text"
+		if !track.Text {
+			kind = "image"
+		}
+		label := track.Language
+		if track.Title != "" {
+			label = track.Title
+		}
+		if label == "" {
+			label = track.Codec
+		} else {
+			label = fmt.Sprintf("%s %s", label, track.Codec)
+		}
+		indices = append(indices, fmt.Sprintf("%d (%s, %s)", track.Index, label, kind))
+	}
+	return strings.Join(indices, ", ")
+}
+
 // handlePlayback negotiates how to deliver an entity to the calling client and
 // returns the URL to use. The client describes itself in the optional request
 // body; without one, the browser profile is assumed.
@@ -663,6 +690,27 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "unknown_audio_track",
 				fmt.Sprintf("this file has no audio track with stream index %d; available: %s",
 					capability.AudioTrackIndex, audioTrackIndexList(info.AudioTracks)))
+			return
+		}
+	}
+
+	// A subtitle stream named for burning must exist and be a picture. An index
+	// the file does not have is a typo, and a text track is a category error -
+	// it can be delivered as a selectable track, which is strictly better than
+	// burning it in - so both are 400s that say which, rather than a session
+	// that quietly does something other than what was asked.
+	if capability.BurnSubtitleIndex > 0 {
+		track, ok := info.SubtitleTrackByIndex(capability.BurnSubtitleIndex)
+		switch {
+		case !ok:
+			writeError(w, http.StatusBadRequest, "unknown_subtitle_track",
+				fmt.Sprintf("this file has no subtitle track with stream index %d; available: %s",
+					capability.BurnSubtitleIndex, subtitleTrackIndexList(info.Subtitles)))
+			return
+		case track.Text:
+			writeError(w, http.StatusBadRequest, "subtitle_not_image",
+				fmt.Sprintf("subtitle track %d is text-based (%s) and is delivered as a selectable track; only image subtitles (PGS, VobSub) are burned in",
+					track.Index, track.Codec))
 			return
 		}
 	}

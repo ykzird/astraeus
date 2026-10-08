@@ -396,48 +396,75 @@ func videoStreamSuffix(streams, index int) string {
 //     machine without the hardware says so instead of quietly using its CPU.
 func encoderOutputArgs(encoder string, plan videoPlan, dev encoderDevice, streams, index int) []string {
 	suffix := videoStreamSuffix(streams, index)
-	option := func(name string) string { return name + suffix }
+	args := encoderVideoArgs(encoder, suffix)
+	if filters := encoderFilterArgs(encoder, plan, suffix); len(filters) > 0 {
+		args = append(args, filters...)
+	}
+	return append(args, encoderTrailerArgs(encoder, plan, suffix)...)
+}
 
-	filters := videoFilters(encoder, plan)
-	var args []string
+// encoderBurnedVideoArgs is the video half of a burn session's options. The
+// picture filters are missing on purpose: when an image subtitle is burned in,
+// the whole chain lives in a -filter_complex graph, and ffmpeg refuses to attach
+// -vf to the same output. A burn is always a single rendition, so there is no
+// stream specifier either.
+func encoderBurnedVideoArgs(encoder string, plan videoPlan) []string {
+	return append(encoderVideoArgs(encoder, ""), encoderTrailerArgs(encoder, plan, "")...)
+}
+
+// encoderVideoArgs is the codec and rate-control half of the video options,
+// which a burn session shares with an ordinary one.
+func encoderVideoArgs(encoder, suffix string) []string {
+	option := func(name string) string { return name + suffix }
 	switch {
 	case strings.HasSuffix(encoder, "_nvenc"):
-		args = []string{option("-c:v"), encoder, option("-preset"), nvencPreset,
+		return []string{option("-c:v"), encoder, option("-preset"), nvencPreset,
 			option("-tune"), "hq", option("-rc"), "vbr", option("-cq"), "22"}
 	case strings.HasSuffix(encoder, "_qsv"):
-		args = []string{option("-c:v"), encoder, option("-preset"), "veryfast", option("-global_quality"), "22"}
+		return []string{option("-c:v"), encoder, option("-preset"), "veryfast", option("-global_quality"), "22"}
 	case strings.HasSuffix(encoder, "_vaapi"):
-		args = []string{option("-c:v"), encoder}
+		return []string{option("-c:v"), encoder}
 	case strings.HasSuffix(encoder, "_amf"):
-		args = []string{option("-c:v"), encoder, option("-quality"), "balanced",
+		return []string{option("-c:v"), encoder, option("-quality"), "balanced",
 			option("-rc"), "cqp", option("-qp_i"), "22", option("-qp_p"), "22", option("-qp_b"), "22"}
 	case strings.HasSuffix(encoder, "_videotoolbox"):
-		args = []string{option("-c:v"), encoder, option("-q:v"), "60"}
+		return []string{option("-c:v"), encoder, option("-q:v"), "60"}
 	case encoder == "libx264" || encoder == "libx265":
-		args = []string{option("-c:v"), encoder, option("-preset"), "veryfast", option("-crf"), "21"}
+		return []string{option("-c:v"), encoder, option("-preset"), "veryfast", option("-crf"), "21"}
 	case encoder == "libvpx-vp9":
-		args = []string{option("-c:v"), encoder, option("-crf"), "31", option("-b:v"), "0"}
+		return []string{option("-c:v"), encoder, option("-crf"), "31", option("-b:v"), "0"}
 	case encoder == "libsvtav1" || encoder == "libaom-av1":
-		args = []string{option("-c:v"), encoder, option("-crf"), "30"}
+		return []string{option("-c:v"), encoder, option("-crf"), "30"}
 	default:
-		args = []string{option("-c:v"), encoder}
+		return []string{option("-c:v"), encoder}
 	}
+}
 
-	if len(filters) > 0 {
-		// -vf for a single rendition, where it has always been used, and the
-		// specifier form only where a specifier is needed: -vf:0 is easy to get
-		// wrong, and -filter:v:N is the spelling that was verified.
-		filterFlag := "-vf"
-		if suffix != "" {
-			filterFlag = "-filter:v" + suffix
-		}
-		args = append(args, filterFlag, strings.Join(filters, ","))
+// encoderFilterArgs renders the picture filter chain as the option spelling the
+// output needs.
+func encoderFilterArgs(encoder string, plan videoPlan, suffix string) []string {
+	filters := videoFilters(encoder, plan)
+	if len(filters) == 0 {
+		return nil
 	}
+	// -vf for a single rendition, where it has always been used, and the
+	// specifier form only where a specifier is needed: -vf:0 is easy to get
+	// wrong, and -filter:v:N is the spelling that was verified.
+	filterFlag := "-vf"
+	if suffix != "" {
+		filterFlag = "-filter:v" + suffix
+	}
+	return []string{filterFlag, strings.Join(filters, ",")}
+}
+
+// encoderTrailerArgs is the ceiling and pixel format, which follow the filters.
+func encoderTrailerArgs(encoder string, plan videoPlan, suffix string) []string {
+	var args []string
 	if cap := bitrateCapArgs(plan, suffix); len(cap) > 0 {
 		args = append(args, cap...)
 	}
 	if format := outputPixelFormat(encoder, plan); format != "" {
-		args = append(args, option("-pix_fmt"), format)
+		args = append(args, "-pix_fmt"+suffix, format)
 	}
 	return args
 }

@@ -321,8 +321,16 @@ chosen track forces at least a remux, because direct play hands the player the
 whole file and the player would pick its own track; the picture is copied, so the
 cost is repackaging rather than re-encoding.
 
-Not yet implemented: image-based subtitles. Subtitle tracks are probed, and
-text-based tracks are extracted to WebVTT on demand (§9.5).
+Image-based subtitles (PGS, VobSub) are delivered by **burning them into the
+picture**. Text is not the only subtitle format, and a browser has no way to
+render a timed bitmap, so the only way to show one is to composite it into the
+video while re-encoding. A client asks for it with `burn_subtitle_index` on the
+playback request; the decision then reports `burned_subtitle_index`, forces a
+transcode, and pins one rendition, because the bitmap is composited once in one
+filter graph rather than per ladder rung. A text track named for burning is not
+burned - it is delivered as a selectable track, which is better in every way -
+and the reasons say so. Burning is irreversible for the session by design, so
+turning the subtitles off re-negotiates a session without the composite.
 
 ### 9.4 Interface
 
@@ -369,8 +377,12 @@ Three capabilities were added after the phases above were written:
     time, and served at `/api/objects/{id}/subtitles/{track}.vtt`. The playback
     response lists every track and only advertises a URL for the ones that can
     actually be delivered; image-based tracks (PGS, VobSub) are reported as
-    `text: false` and refused with `415`, since converting them would require
-    OCR.
+    `text: false` and delivered by **burn-in** instead (§9.3): the picture is
+    re-encoded with the bitmap composited into it. The subtitle is decoded from a
+    second opening of the input, scaled to the picture with `scale2ref` so a
+    downscaled re-encode places it correctly, and overlaid after the plan's own
+    filters - which is what makes it right for a tone map, since a subtitle
+    bitmap is SDR white and must not be tone mapped with the picture.
 *   **Periodic scanning.** The scanner previously ran only when invoked. It now
     runs on an interval (`--scan-interval`, default 6h) across every library,
     with `POST /api/scan` and the CLI as the manual override. A failure for one

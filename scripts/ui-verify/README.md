@@ -28,6 +28,7 @@ node subtitle-verify.mjs      http://127.0.0.1:8810 <captionedEpisodeId> <movieI
 node player-chrome-verify.mjs http://127.0.0.1:8810 <entityId>
 node real-media-verify.mjs    http://127.0.0.1:8810 <entityId> [timeoutSeconds]
 node resume-verify.mjs        http://127.0.0.1:8810 <entityId> [resumeSeconds]
+node burn-verify.mjs          http://127.0.0.1:8810 <imageSubtitleEntityId>
 ```
 
 `CDP_PORT` overrides the debugging port (default 9333).
@@ -112,6 +113,24 @@ entity is too short.
   it on, and Off disables every track;
 - navigating away removes the tracks.
 
+`burn-verify.mjs`
+
+- the entity really has an image subtitle track, according to the server's own
+  `subtitles[]` (`text: false`), rather than the harness guessing from markup;
+- that track is offered in the menu and labelled as burned in;
+- choosing it re-negotiates, and the captured request carries
+  `burn_subtitle_index` equal to the track's index while the captured decision
+  carries the same `burned_subtitle_index`;
+- the menu shows the burned track as the current choice, which only the decision
+  can do — a burn is not a `<track>`;
+- playback continues across the switch, and choosing Off re-negotiates with no
+  burn index and gets a decision without one.
+
+It wraps `window.fetch` before the page loads to capture the playback request and
+response, because a repainted radio cannot distinguish a real re-negotiation from
+a stuck menu. What is composited into the picture is asserted by the Go
+integration test instead — a browser cannot be asked what is baked into a frame.
+
 ## Notes
 
 The bundled demo clips are about three seconds long, so assertions are written
@@ -135,3 +154,19 @@ ffmpeg -f lavfi -i "testsrc2=size=1280x720:rate=24" \
        -movflags +faststart "fixture.mp4"
 ffmpeg -i "fixture.mp4" -c copy "fixture.mkv"
 ```
+
+`burn-verify.mjs` needs an entity with a PGS track, and nothing generates one but
+this repository. `scripts/pgsgen` writes the `.sup`; mux it into a clip long
+enough to watch, then scan it:
+
+```sh
+go run ./scripts/pgsgen -out fixture.sup -start-ms 500 -end-ms 55000
+ffmpeg -f lavfi -i "color=c=0x202020:s=640x360:r=15" -t 60 \
+       -c:v libx264 -preset ultrafast -pix_fmt yuv420p base.mp4
+ffmpeg -i base.mp4 -i fixture.sup -map 0:v -map 1:s -c:v copy -c:s copy \
+       "Image Subtitles (2026).mkv"
+./astraeus-server scan --db burn.db --path "$PWD" --kind movies --name Burn
+```
+
+A dark picture is deliberate: the fixture draws a white rectangle, so a burned
+segment is unmistakable in a frame.

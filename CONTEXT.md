@@ -19,6 +19,7 @@ This document defines the ubiquitous language for the Spatial Media Environment 
 * **StreamSession**: An active, stateful connection between a client and the server for delivering a `MediaEntity`.
 * **ClientCapability**: A description of the client's technical capabilities (codecs, resolutions, protocols).
 * **TranscodeJob**: A background task managed by the server to convert a `MediaObject` from its original format into a format that satisfies a `StreamSession`'s requirements. A `StreamSession` may be mediated by a `TranscodeJob` if the `MediaObject` cannot be played directly.
+* **Burn-in**: Compositing an image-based subtitle (a `SubtitleTrack` with `Text` false) into the video, because a browser cannot render a timed bitmap as a subtitle track. A burn-in makes the `StreamSession` a single-rendition re-encode, and it is irreversible for that session.
 
 ### Playback
 * **PlaybackProgress**: the position a `User` reached in a `LeafEntity`, recorded per user and entity so a `StreamSession` can resume there. A `LeafEntity` whose `PlaybackProgress` reaches the closing fraction of its duration is **Finished**, and its progress is cleared rather than kept.

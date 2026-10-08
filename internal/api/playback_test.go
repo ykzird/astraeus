@@ -615,3 +615,69 @@ func TestPlayback_NoAudioChoiceUsesTheDefaultTrack(t *testing.T) {
 		t.Errorf("target audio stream = %d, want the default track's 3", response.Decision.TargetAudioStreamIndex)
 	}
 }
+
+// TestPlayback_BurnsAnImageSubtitle covers the request field end to end: an
+// image track is composited into the picture by a re-encode, a text track is
+// refused with a message that points at track selection, and an index the file
+// does not have is refused with the list of what it does have.
+func TestPlayback_BurnsAnImageSubtitle(t *testing.T) {
+	t.Parallel()
+
+	info := &streaming.MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []streaming.AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+		Subtitles: []streaming.SubtitleTrack{
+			{Index: 2, Codec: "subrip", Text: true, Language: "en"},
+			{Index: 3, Codec: "hdmv_pgs_subtitle", Text: false, Language: "fr"},
+		},
+	}
+	env := newTestEnv(t, withProber(stubProber{info: info}), withStreams(&fakeStreams{}))
+	entity, _ := seedPlayableEntity(t, env, "Blade Runner 2049 (2017).mkv", "matroska bytes")
+
+	body := `{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],` +
+		`"supports_hls":true,"subtitles":true,"burn_subtitle_index":3}`
+
+	recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback", body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	response := decodeBody[playbackResponse](t, recorder)
+	if response.Decision.BurnedSubtitleIndex != 3 {
+		t.Errorf("burned index = %d, want 3", response.Decision.BurnedSubtitleIndex)
+	}
+	if response.Decision.VideoAction != streaming.ActionTranscode {
+		t.Errorf("video action = %q, want a transcode", response.Decision.VideoAction)
+	}
+
+	// A text track named for burning is a category error, not a burn.
+	recorder = env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback",
+		`{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],`+
+			`"supports_hls":true,"burn_subtitle_index":2}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("text-track burn status = %d, want 400 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Body.String(); !strings.Contains(got, "subtitle_not_image") {
+		t.Errorf("expected subtitle_not_image, got %s", got)
+	}
+
+	// An index the file does not have names the tracks it does.
+	recorder = env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback",
+		`{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],`+
+			`"supports_hls":true,"burn_subtitle_index":9}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unknown-track burn status = %d, want 400 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	got := recorder.Body.String()
+	if !strings.Contains(got, "unknown_subtitle_track") || !strings.Contains(got, "3 (fr hdmv_pgs_subtitle, image)") {
+		t.Errorf("the refusal should list the tracks the file has, got %s", got)
+	}
+
+	// A negative index is a malformed capability.
+	recorder = env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback",
+		`{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],`+
+			`"supports_hls":true,"burn_subtitle_index":-1}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Errorf("negative index status = %d, want 400 (body %s)", recorder.Code, recorder.Body.String())
+	}
+}
