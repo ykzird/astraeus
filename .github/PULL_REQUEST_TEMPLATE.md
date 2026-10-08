@@ -23,8 +23,9 @@ paste the command and its output here
 - [ ] A regression test fails before the fix (if this is a bug fix)
 - [ ] The artefact is asserted, not the command line (if colour, format or
       pixels are the point)
-- [ ] `README.md`, `SPECIFICATION.md`, `TODO.md`, `CONTEXT.md` and
-      `docs/handoff.md` are updated in this same pull request
+- [ ] `README.md` (the user's way in), the relevant page under `docs/`,
+      `SPECIFICATION.md`, `TODO.md`, `CONTEXT.md` and `docs/handoff.md` are
+      updated in this same pull request
 - [ ] No secrets, keys or tokens are included
 
 Closes #

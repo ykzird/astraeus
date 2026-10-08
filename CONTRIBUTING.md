@@ -39,9 +39,10 @@ failing a machine that does not have it.
   build and see it fail; if it passes, it is not testing the bug.
 - **A failing test after a deliberate behaviour change usually asserts the old
   bug.** Check which of the two is wrong before "fixing" the code.
-- **Docs are part of the change.** `README.md`, `SPECIFICATION.md`, `TODO.md`,
-  `CONTEXT.md` and `docs/handoff.md` are kept in sync in the same commit, and
-  `TODO.md` records gaps honestly rather than aspirationally.
+- **Docs are part of the change.** `README.md` stays the user's way in and the
+  detail lives under `docs/` — [docs/index.md](docs/index.md) maps it. Keep
+  `SPECIFICATION.md`, `TODO.md`, `CONTEXT.md` and `docs/handoff.md` in sync in the
+  same commit, and let `TODO.md` record gaps honestly rather than aspirationally.
 - **Never claim a capability you have not verified.** If something cannot be
   done, say so in a reason or a doc rather than quietly disabling it.
 - **The front end never injects HTML.** There is no `innerHTML` in `web/`; the
