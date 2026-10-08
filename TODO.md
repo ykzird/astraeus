@@ -60,11 +60,10 @@ Status as of the current build. Evidence for each claim is the test suite
       ffmpeg process, a master playlist the client is pointed at, and per-stream
       specifiers so each rung really is its own size. A client that pins a height
       still gets a single rendition
-- [x] `max_bitrate_kbps` honoured as a ceiling, with the audio's share reserved
 - [ ] Dolby Vision profile 5 *correct* conversion (IPTPQc2 needs a Dolby Vision
       tone mapper; the software chain produces approximate colour and says so)
 
-## Phase 3: API & Security — API complete, security outstanding
+## Phase 3: API & Security — API and hardening complete; rate limiting and tracing are not
 
 - [x] Capability manifests validated: an unknown codec name is refused with `400`
       before it can reach ffmpeg, and a codec this host cannot encode is a `409` with
@@ -78,6 +77,9 @@ Status as of the current build. Evidence for each claim is the test suite
       address, for Tailscale / Cloudflare Access) and `token` mode (constant-time
       bearer token), with per-request identity logging and grant/deny metrics.
       Fails closed on misconfiguration.
+- [x] Resumable playback over the API: `PUT`/`DELETE /api/entities/{id}/progress`,
+      the stored position on the entity detail, and `GET /api/progress` for what is
+      worth continuing
 - [x] Security headers and a content security policy with no `unsafe-inline` or
       `unsafe-eval`, driven by what the UI actually needs; verified in a browser
       (third-party image and inline script refused, 32/32 harness checks pass)
@@ -108,10 +110,14 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Controls that fade while playing and return on interaction, never hiding while
       paused, while focused, or while the pointer rests on them
 - [ ] Subtitle appearance controls (size, colour, background)
-- [ ] Poster/backdrop artwork: TMDB artwork is proxied and cached server-side
-      and every entity payload carries `poster_url`/`backdrop_url`, but the UI
-      does not consume them yet — it only renders an absolute
-      `backdrop_path`/`poster_path` and otherwise falls back to generated art
+- [x] Poster/backdrop artwork: the UI renders `poster_url`/`backdrop_url`, which
+      are this server's own proxy, and never the metadata provider's absolute URL
+      — `img-src 'self'` makes that structural. With no proxy configured the
+      generated gradient stands in, which leaks nothing
+- [x] Resume and continue watching in the player: Play resumes at the stored
+      position, the position is reported while watching and cleared when the
+      viewer starts over or finishes, and the navigation lists what is worth
+      continuing
 
 ## Phase 5: Packaging — the pieces exist, nothing is released
 
