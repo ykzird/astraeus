@@ -17,7 +17,7 @@ paste the command and its output here
 
 ## Checklist
 
-- [ ] `go vet ./...`, `go test -race ./...` and `node --test web/` pass
+- [ ] `go vet ./...`, `go test -race ./...` and `node --test web/*.test.js` pass
 - [ ] Integration tests run if the change touches ffmpeg, streaming or subtitles
       (`go test -tags=integration -race ./...`)
 - [ ] A regression test fails before the fix (if this is a bug fix)

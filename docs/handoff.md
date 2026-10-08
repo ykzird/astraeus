@@ -70,7 +70,7 @@ Traps that have cost time:
 mise exec -- go test -tags=integration -race -count=1 ./...
 
 # The front end's pure timeline core. Node's own runner; no npm install.
-node --test web/
+node --test web/*.test.js
 
 # A demo library (a film plus a three-episode show, one with a real subtitle track).
 # It needs ./astraeus-server built first. Defaults: media outside the repo, db at ./demo.db.
@@ -628,7 +628,7 @@ and the clock — moved out of `app.js` into `web/core.js`, a dependency-free UM
 file with no DOM, network or module state. `app.js` aliases those functions at the
 top of its IIFE, so every call site still reads as it did, and reads the module as
 `window.AstraeusCore` (loaded by `index.html` before `app.js`). `web/core.test.js`
-tests it with **Node's own runner and asserts** (`node --test web/`), so there is
+tests it with **Node's own runner and asserts** (`node --test web/*.test.js`), so there is
 no npm install, no lockfile and no framework — the same stance the CDP harnesses
 take. CI gained the step. Seven tests cover the clock at every scale and its
 refusal to print `NaN`, the offset arithmetic including a missing element clock,
@@ -896,7 +896,7 @@ Priority order, with the reasoning. Take it top-down.
   the menu nodes themselves have no seam a Node test can reach, and the CDP
   harnesses that do cover them need Chromium and a running server: they are run
   by hand on this host, are Chromium-only (Firefox is not installed), and CI runs
-  `node --test web/` but not them.
+  `node --test web/*.test.js` but not them.
 - **Tracing is verified for traces over OTLP/HTTP against one backend.** The
   encoder was accepted by Jaeger all-in-one (pulled and run here), but no other
   OTLP backend has been tried, and only the attribute types this code emits were

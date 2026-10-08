@@ -21,7 +21,7 @@ go build ./...
 go vet ./...
 go test -race -count=1 ./...              # unit
 go test -tags=integration -race ./...     # also runs real ffmpeg/ffprobe
-node --test web/                          # the front end's pure core
+node --test web/*.test.js                          # the front end's pure core
 node --check web/app.js
 ```
 

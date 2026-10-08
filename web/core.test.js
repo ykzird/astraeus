@@ -1,6 +1,6 @@
 // Unit tests for the front end's pure core. Run with:
 //
-//	node --test web/
+//	node --test web/*.test.js
 //
 // No dependency is involved: the test runner and the asserts are Node's own, and
 // core.js exports itself as a CommonJS module when there is no browser.
