@@ -116,6 +116,10 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Contextual sidebar (metadata, decision reasons, produced window, queue)
 - [x] Navigation sidebar (libraries, scan, enrich, incomplete filter)
 - [x] Glassmorphism panels + neobrutalist interaction elements
+- [x] The front end's pure timeline maths extracted to `web/core.js` and unit
+      tested with Node's own runner (`node --test web/`), so the source↔media
+      time conversion, the produced window and the clock have a seam that a
+      browser is not needed to test
 - [x] Served by the binary from `--web-dir`, same origin as the API
 - [x] Direct-play playback in the browser: real `<video>`, working seek, and
       honest reporting of the negotiation decision
@@ -260,9 +264,11 @@ Status as of the current build. Evidence for each claim is the test suite
 - The container image ships ffmpeg's VAAPI support but not the vendor userspace
   drivers, so GPU transcoding in a container needs extra packages. NVENC needs
   the NVIDIA container runtime.
-- The web UI has no unit tests. It is one large file with no module seam, so its
-  logic is only covered by the CDP harnesses in `scripts/ui-verify/`, which need a
-  browser and a running server.
+- The web UI's unit tests cover `web/core.js` only — the pure timeline maths and
+  clock formatting. The DOM-building and player-control code in `app.js` is still
+  covered only by the CDP harnesses in `scripts/ui-verify/`, which need a browser
+  and a running server and are run by hand; the seam that made `core.js` testable
+  has not been extended further into the render path.
 - The content security policy has no `report-uri`: there is no collector to send
   reports to, and a policy that reports nowhere is theatre. A deployment that
   wants violation reporting has to add both ends.

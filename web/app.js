@@ -18,6 +18,11 @@
 (function () {
   "use strict";
 
+  /* The pure timeline maths and clock formatting live in core.js so they can be
+     unit-tested without a browser (web/core.test.js). Aliasing them here keeps
+     every call site below reading exactly as it did when they were local. */
+  const { formatClock, mediaTime, pad2, producedWindow, sourceTime } = window.AstraeusCore;
+
   /* ── 1. DOM references ───────────────────────────────────────────────── */
 
   const dom = {
@@ -151,11 +156,6 @@
 
   function plural(n, singular, pluralForm) {
     return n === 1 ? singular : pluralForm || singular + "s";
-  }
-
-  function pad2(value) {
-    const text = String(value);
-    return /^\d+$/.test(text) ? text.padStart(2, "0") : text;
   }
 
   function basename(filePath) {
@@ -1553,18 +1553,6 @@
     return "mode-unknown";
   }
 
-  function formatClock(seconds) {
-    if (typeof seconds !== "number" || !isFinite(seconds) || seconds < 0) return "0:00";
-    const total = Math.floor(seconds);
-    const hours = Math.floor(total / 3600);
-    const minutes = Math.floor((total % 3600) / 60);
-    const secs = total % 60;
-    if (hours > 0) {
-      return hours + ":" + pad2(minutes) + ":" + pad2(secs);
-    }
-    return minutes + ":" + pad2(secs);
-  }
-
   /* ── Subtitle selector ───────────────────────────────────────────────── */
 
   function subtitleOptionId(key) {
@@ -1649,7 +1637,7 @@
        through these helpers, or a session resumed an hour in reports the
        produced part as if it began at the opening titles. */
     const sourceTotal = isCurrent ? sourceDurationOf(pb) : 0;
-    const produced = live ? producedWindow(pb) : null;
+    const produced = live ? producedWindowOf(pb) : null;
     const producedTo = produced ? produced.to : 0;
     const durationText =
       growing && producedTo > 0
@@ -2254,15 +2242,12 @@
 
   /** Where the playhead is, in source seconds. */
   function currentSourceTime(pb) {
-    const media = isFinite(playerVideo.currentTime) ? playerVideo.currentTime : 0;
-    return pb.sessionStart + media;
+    return sourceTime(playerVideo.currentTime, pb.sessionStart);
   }
 
   /** The part of the source this session can already reach without re-buffering. */
-  function producedWindow(pb) {
-    const bounds = seekableBounds();
-    if (!(bounds.end > 0)) return null;
-    return { from: pb.sessionStart + bounds.start, to: pb.sessionStart + bounds.end };
+  function producedWindowOf(pb) {
+    return producedWindow(seekableBounds(), pb.sessionStart);
   }
 
   /* ── Resuming and progress reports ───────────────────────────────────────
@@ -2671,7 +2656,7 @@
        when this session has only produced part of it. */
     const total = mediaLive ? sourceDurationOf(pb) : 0;
     const now = mediaLive ? currentSourceTime(pb) : 0;
-    const produced = mediaLive ? producedWindow(pb) : null;
+    const produced = mediaLive ? producedWindowOf(pb) : null;
 
     if (seek) {
       seek.disabled = !mediaLive || pb.qualityBusy === true || !(total > 0);
@@ -3849,10 +3834,10 @@
   function seekPreview(sourceSeconds) {
     const pb = state.playback;
     if (!pb.url || !isFinite(sourceSeconds)) return;
-    const produced = producedWindow(pb);
+    const produced = producedWindowOf(pb);
     const reachable =
       !pb.segmented || (produced && sourceSeconds >= produced.from && sourceSeconds <= produced.to);
-    if (reachable) setMediaTime(sourceSeconds - pb.sessionStart);
+    if (reachable) setMediaTime(mediaTime(sourceSeconds, pb.sessionStart));
   }
 
   /**
@@ -3873,12 +3858,12 @@
     /* The server rejects a start at or past the end of the media. */
     if (total > 0 && wanted > total - 0.5) wanted = Math.max(0, total - 0.5);
 
-    const produced = producedWindow(pb);
+    const produced = producedWindowOf(pb);
     const reachable =
       !pb.segmented || (produced && wanted >= produced.from && wanted <= produced.to);
 
     if (reachable) {
-      setMediaTime(wanted - pb.sessionStart);
+      setMediaTime(mediaTime(wanted, pb.sessionStart));
       return wanted;
     }
     resumeSession({ startSeconds: wanted });

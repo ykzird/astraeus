@@ -257,7 +257,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.13.0`).
+identifier (currently `0.14.0`).
 
 ## HTTP API
 
@@ -712,6 +712,16 @@ go test -tags=integration ./...          # also runs real ffmpeg/ffprobe
 The integration tests generate their own clips, run ffprobe against them, and
 drive a real HLS session end to end. They skip themselves when ffmpeg is absent.
 
+```sh
+node --test web/                         # the front end's pure core
+node --check web/app.js                  # the rest of the UI parses
+```
+
+The front end has no build step, so its timeline arithmetic lives in
+[`web/core.js`](web/core.js) — plain functions, no DOM — and is unit-tested with
+Node's own runner. No npm install and no lockfile are involved. The DOM-heavy
+remainder of `web/app.js` is covered by the browser harnesses below.
+
 Playback and subtitle behaviour in a browser is covered separately by the CDP
 harnesses in [`scripts/ui-verify/`](scripts/ui-verify/), which assert what the
 `<video>` element actually does rather than what the server intended. Both the
@@ -734,7 +744,8 @@ internal/observability/ KPI registry and Prometheus exposition
 internal/access/        the access gate
 internal/api/           HTTP layer
 web/                    the Spatial Web UI, including vendored hls.js
-                        and the generated BoxIcons registry (web/icons.js)
+                        and the generated BoxIcons registry (web/icons.js);
+                        web/core.js is the unit-tested pure timeline maths
 scripts/ui-verify/      browser harnesses for playback and subtitles
 scripts/pgsgen/         writes a PGS (.sup) fixture for those harnesses
 scripts/make-demo-media.sh  generates a throwaway demo library

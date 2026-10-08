@@ -361,6 +361,14 @@ than retried into a growing queue. Metrics and logs are *not* sent over OTLP:
 metrics stay on `/metrics` and logs stay on stderr. Scans and metadata lookups
 are not spanned yet.
 
+The front end's timeline arithmetic has a tested seam. `web/core.js` holds the
+pure functions — source↔media time, the produced window, the clock — with no DOM,
+network or module state, and is unit-tested with Node's own runner (`node --test
+web/`), which needs no npm install. `app.js` reads it as `window.AstraeusCore` and
+keeps everything that touches the DOM; that remainder is covered by the CDP
+harnesses rather than by unit tests, because a render function's contract is what
+a browser shows.
+
 Authentication is implemented as an access gate in front of the whole server
 (§7.1's model: identity is established at the edge, not by a built-in user
 database). `--auth-mode proxy` believes an identity header — `Tailscale-User-Login`

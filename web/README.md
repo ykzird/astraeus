@@ -9,6 +9,8 @@ locally vendored assets (`vendor/hls.min.js` and the icon paths in `icons.js`).
 | `index.html` | The static shell: topbar + breadcrumbs, the three-column grid (nav / canvas / context), the error banner and the toast region. Every dynamic region is filled by `app.js`. |
 | `styles.css` | The whole visual language. CSS custom properties in `:root` separate the two systems: the **GLASS** tokens (`--glass-*`) for translucent blurred surfaces, and the **BRUTAL** tokens (`--brutal-*`, `--shadow-hard*`) for high-contrast tactile controls. |
 | `icons.js` | The icon registry (**generated**, not hand-edited): the 10 [BoxIcons](https://icon-sets.iconify.design/bx/) this UI uses, as frozen path data, plus `AstraeusIcons.icon(name)` returning an `<svg>`. Fetched from the Iconify API at authoring time and vendored — nothing is requested from a third-party origin at runtime. BoxIcons is MIT; regenerate with `node scripts/fetch-icons.mjs`. See `vendor/icons.md` for provenance and `../THIRD_PARTY_NOTICES.md` for the licence notices. |
+| `core.js` | The pure timeline maths and clock formatting — source↔media time, the produced window, `formatClock` — with no DOM, network or module state. Loaded before `app.js`, which reads it as `window.AstraeusCore`. |
+| `core.test.js` | Unit tests for `core.js`, run with `node --test web/`. Node's own runner and asserts; no npm dependency. |
 | `app.js` | Hash router, API client with per-request timeouts, render functions for the navigation list, breadcrumbs, canvas and context panel, and the player (negotiation, overlay controls, fullscreen, seek binding, subtitles, delivery-decision reporting). |
 
 `app.js` is deliberately organised in numbered sections so the two halves — the
@@ -22,6 +24,7 @@ and the API is same-origin at `/api/…`:
 ```
 GET /            -> index.html
 GET /app.js      -> app.js
+GET /core.js     -> core.js
 GET /styles.css  -> styles.css
 GET /api/...     -> JSON API
 ```
@@ -193,3 +196,7 @@ explanation instead of a silently dead player.
   on it until the user moves, and touch devices never latch at all: the bar
   simply times out after an interaction. While pinned by focus or hover it
   re-checks on a timer, so it cannot end up stuck open.
+* Only `core.js` has unit tests. The DOM-building and player-control code in
+  `app.js` is covered by the CDP harnesses in `../scripts/ui-verify/`, which
+  drive a real browser, and those are only run by hand — nothing in CI runs them,
+  because they need Chromium and a running server.

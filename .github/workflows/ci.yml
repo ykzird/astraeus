@@ -58,7 +58,14 @@ jobs:
       # The front end has no build step, so a parse check is the whole of what
       # can be verified about it without a browser.
       - name: Parse the web UI
-        run: node --check web/app.js
+        run: |
+          node --check web/app.js
+          node --check web/core.js
+
+      # The pure timeline core is unit-tested with Node's own runner, so this
+      # needs no npm install and no lockfile.
+      - name: Test the web core
+        run: node --test web/
 
   image:
     name: Build the container image

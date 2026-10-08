@@ -136,8 +136,10 @@
 
     <div id="toasts" class="toasts" aria-live="polite"></div>
 
-    <!-- Icon registry first: app.js reads window.AstraeusIcons. -->
+    <!-- Icon registry first: app.js reads window.AstraeusIcons. Then the pure
+         timeline core, which app.js reads as window.AstraeusCore. -->
     <script src="icons.js"></script>
+    <script src="core.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

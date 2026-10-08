@@ -1,11 +1,11 @@
 # Handoff
 
-**As of the round-6 work of 2026-10-08 — OpenTelemetry trace export. Version
-0.13.0. 105 tracked files.** (`git log` names the commits; the previous handoff
-was `9458674`, which added API rate limiting. Round 4 delivered image subtitles
-by burn-in, round 3 per-viewer progress, and round 2 HDR/Dolby Vision, packaging,
-the bitrate ceiling, the adaptive ladder, audio track selection, resumable
-playback, the continue-watching list and response hardening.)
+**As of the round-7 work of 2026-10-08 — front-end unit tests. Version 0.14.0.
+107 tracked files.** (`git log` names the commits; the previous handoff was
+`ca241ab`, which added trace export. Round 5 was API rate limiting, round 4 image
+subtitles by burn-in, round 3 per-viewer progress, and round 2 HDR/Dolby Vision,
+packaging, the bitrate ceiling, the adaptive ladder, audio track selection,
+resumable playback, the continue-watching list and response hardening.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -62,6 +62,9 @@ Traps that have cost time:
 ```sh
 # Everything, including the tests that shell out to real ffmpeg.
 mise exec -- go test -tags=integration -race -count=1 ./...
+
+# The front end's pure timeline core. Node's own runner; no npm install.
+node --test web/
 
 # A demo library (a film plus a three-episode show, one with a real subtitle track).
 # It needs ./astraeus-server built first. Defaults: media outside the repo, db at ./demo.db.
@@ -341,6 +344,24 @@ HEVC tagged `bt2020nc`/`smpte2084`/`bt2020` for a manifest declaring HDR.
 Verified in a real browser against real 4K content: 28/28 chrome, 13/13 player,
 10/10 subtitles. Full Go suite green with race and integration.
 
+**Front-end unit tests** landed as of 0.14.0, which closes the largest remaining
+untested surface. The player's timeline arithmetic — the source↔media time
+conversion (`source = media + sessionStart` and its inverse), the produced window,
+and the clock — moved out of `app.js` into `web/core.js`, a dependency-free UMD
+file with no DOM, network or module state. `app.js` aliases those functions at the
+top of its IIFE, so every call site still reads as it did, and reads the module as
+`window.AstraeusCore` (loaded by `index.html` before `app.js`). `web/core.test.js`
+tests it with **Node's own runner and asserts** (`node --test web/`), so there is
+no npm install, no lockfile and no framework — the same stance the CDP harnesses
+take. CI gained the step. Seven tests cover the clock at every scale and its
+refusal to print `NaN`, the offset arithmetic including a missing element clock,
+the round trip, and the produced window's null case. Verified in a browser that
+the extraction regressed nothing: `player-chrome-verify.mjs` is **20/22**, exactly
+its pre-change baseline on the same three-second demo clips (the two auto-hide
+checks fail there both before and after), with no console errors — which is what
+a missing `window.AstraeusCore` would have produced — and `subtitle-verify.mjs`
+is 10/10.
+
 **OpenTelemetry trace export** landed as of 0.13.0: `internal/tracing` is a
 hand-rolled OTLP/HTTP JSON encoder and batcher, opt-in with `--otel-endpoint`
 (or `OTEL_EXPORTER_OTLP_ENDPOINT`). The choice mirrors the Prometheus
@@ -519,30 +540,23 @@ filter chain). The unit passes `systemd-analyze verify` and scores 1.6 (OK) on
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **UI unit tests.** The front end is one 133 KB file with no seam, and that is
-   now the largest untested surface in the project: everything else has unit or
-   integration coverage. `web/core.js` for the pure timeline maths is the
-   cheapest first cut, and the CDP harnesses already pin the behaviour a unit
-   test would protect. CSP, security headers and the artwork leak are done as of
-   0.9.0; per-user progress 0.10.0; image subtitles by burn-in 0.11.0; rate
-   limiting 0.12.0; trace export 0.13.0.
-2. **OCR for image subtitles, if the burn-in cost is unwanted.** A burn is exact
+1. **OCR for image subtitles, if the burn-in cost is unwanted.** A burn is exact
    but needs a re-encode, cannot be toggled without one, and cannot be searched or
    restyled. OCR (tesseract is already installed on the development host) would
    deliver text that survives all three, at the cost of a runtime dependency and
    OCR errors. `internal/testfixtures/pgs` and `scripts/pgsgen` now make the
    fixture side of that work cheap; a PGS parser does not exist yet.
-3. **A ladder a client can pin the top of.** Today pinning a height means one
+2. **A ladder a client can pin the top of.** Today pinning a height means one
    rendition, so the quality menu caps quality rather than expressing a preference
    within a ladder — the negotiation model is thinner than it looks there. A burn
    deliberately pins one rendition, so the two interact.
-4. **Release automation and a TLS example.** Packaging landed (see §6), but
+3. **Release automation and a TLS example.** Packaging landed (see §6), but
    nothing is tagged or published, the CI workflow has never run, and there is no
    reverse-proxy configuration beside the unit.
-5. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
+4. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
    the gate remains instance-wide: it admits a request, it does not decide what
    the request may see, so every admitted viewer sees the whole library.
-6. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
+5. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
@@ -583,6 +597,13 @@ Priority order, with the reasoning. Take it top-down.
   be refused at runtime and show up as a console error in the harness — which is
   the point of the policy, but it means a front-end change that adds one will
   fail verification rather than merely being flagged.
+- **Only `web/core.js` has unit tests; the rest of the UI is still covered by
+  hand-run browser harnesses.** The testable seam stopped at the pure timeline
+  arithmetic. The render functions, the player controls and the burn-in menu have
+  no seam a Node test can reach, and the CDP harnesses that do cover them need
+  Chromium and a running server: they are run by hand on this host, are
+  Chromium-only (Firefox is not installed), and CI runs `node --test web/` but
+  not them.
 - **Tracing is verified for traces over OTLP/HTTP against one backend.** The
   encoder was accepted by Jaeger all-in-one (pulled and run here), but no other
   OTLP backend has been tried, and only the attribute types this code emits were
