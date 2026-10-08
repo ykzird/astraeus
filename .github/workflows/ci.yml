@@ -92,6 +92,28 @@ jobs:
       - name: Test the web core
         run: node --test web/*.test.js
 
+      # deploy/README.md's systemd runbook is followed from an extracted release
+      # archive: it copies the project's documents into /usr/local/share/doc and
+      # installs the unit out of deploy/. That makes the archive's layout part of
+      # the release contract, and a tag is a late place to discover it broke.
+      # Build one for the runner's own platform and check every path the runbook
+      # names is inside, so a change that drops one fails here instead.
+      - name: Check the release layout
+        run: |
+          scripts/build-release.sh 0.0.0-layout-check linux/amd64
+          archive=dist/astraeus-server_0.0.0-layout-check_linux_amd64.tar.gz
+          # Directory entries carry a trailing slash and a leading top-level
+          # component; normalise both away so the names match the runbook's.
+          layout="$(mktemp)"
+          tar tzf "$archive" | sed 's|^[^/]*/||; s|/$||' | sort -u > "$layout"
+          status=0
+          for f in astraeus-server web README.md SPECIFICATION.md TODO.md \
+                   CONTEXT.md CONTRIBUTING.md SECURITY.md LICENSE \
+                   THIRD_PARTY_NOTICES.md docs deploy deploy/astraeus.service; do
+            grep -qx "$f" "$layout" || { echo "missing from the release archive: $f"; status=1; }
+          done
+          exit "$status"
+
   secrets:
     name: Scan for secrets
     runs-on: ubuntu-latest
