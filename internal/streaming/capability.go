@@ -22,6 +22,15 @@ type ClientCapability struct {
 	// accept; zero means unrestricted.
 	MaxWidth  int `json:"max_width"`
 	MaxHeight int `json:"max_height"`
+	// PreferredHeight asks for an adaptive ladder topped at this height rather
+	// than one fixed rendition. It is a quality choice expressed as a
+	// preference: the client would rather not go above it, but its player may
+	// step down when the network cannot sustain the top rung. MaxHeight
+	// alongside it is a hard ceiling the ladder stays under; MaxHeight on its
+	// own keeps its historical meaning of pinning exactly one rendition, so a
+	// client that wants determinism is not forced onto a ladder. Zero means no
+	// preference, and the ladder tops at the client's box limit or the source.
+	PreferredHeight int `json:"preferred_height"`
 	// MaxBitrateKbps caps the acceptable bitrate; zero means unrestricted.
 	MaxBitrateKbps int `json:"max_bitrate_kbps"`
 	// MaxBitDepth is the deepest video the client can decode. Browsers cannot
@@ -106,7 +115,7 @@ func (c ClientCapability) Validate() error {
 	}
 	if c.MaxWidth < 0 || c.MaxHeight < 0 || c.MaxBitrateKbps < 0 ||
 		c.MaxBitDepth < 0 || c.MaxAudioChannels < 0 || c.AudioTrackIndex < 0 ||
-		c.BurnSubtitleIndex < 0 {
+		c.BurnSubtitleIndex < 0 || c.PreferredHeight < 0 {
 		return fmt.Errorf("capability limits must not be negative")
 	}
 	// A client that can render HDR can decode 10-bit: PQ and HLG are stored at
@@ -132,6 +141,25 @@ func (c ClientCapability) Validate() error {
 	return nil
 }
 
+// heightCeiling is the tallest video the client will accept: its declared box
+// and its stated preference, whichever is tighter. A preference has to count as
+// a limit, not just as advice, or a client asking for a 720p ladder would be
+// handed a 4K direct play because it declared no max_height.
+func (c ClientCapability) heightCeiling() int {
+	ceiling := c.MaxHeight
+	if c.PreferredHeight > 0 && (ceiling <= 0 || c.PreferredHeight < ceiling) {
+		ceiling = c.PreferredHeight
+	}
+	return ceiling
+}
+
+// pinsOneRendition reports whether the client asked for exactly one encode.
+// max_height alone does; a preferred_height asks for a ladder instead, with
+// max_height (when it is also set) acting as that ladder's ceiling.
+func (c ClientCapability) pinsOneRendition() bool {
+	return c.MaxHeight > 0 && c.PreferredHeight <= 0
+}
+
 // firstUnknown returns the first value that is not part of the known
 // vocabulary, or "" when they all are.
 func firstUnknown(values, known []string, normalise func(string) string) string {
@@ -155,6 +183,7 @@ func (c ClientCapability) Normalise() ClientCapability {
 		AudioCodecs:       normaliseAll(c.AudioCodecs, NormaliseAudioCodec),
 		MaxWidth:          c.MaxWidth,
 		MaxHeight:         c.MaxHeight,
+		PreferredHeight:   c.PreferredHeight,
 		MaxBitrateKbps:    c.MaxBitrateKbps,
 		MaxBitDepth:       c.MaxBitDepth,
 		AudioTrackIndex:   c.AudioTrackIndex,

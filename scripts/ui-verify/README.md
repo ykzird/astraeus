@@ -30,6 +30,7 @@ node real-media-verify.mjs    http://127.0.0.1:8810 <entityId> [timeoutSeconds]
 node resume-verify.mjs        http://127.0.0.1:8810 <entityId> [resumeSeconds]
 node burn-verify.mjs          http://127.0.0.1:8810 <imageSubtitleEntityId>
 node ocr-verify.mjs           http://127.0.0.1:8810 <imageSubtitleEntityId> [caption]
+node quality-verify.mjs       http://127.0.0.1:8810 <transcodingEntityId>
 ```
 
 `CDP_PORT` overrides the debugging port (default 9333).
@@ -157,6 +158,22 @@ binary that does not exist to exercise the burn path:
 
 It needs a server with tesseract installed, and an entity with a PGS track
 carrying real text (the `-text` fixture below).
+
+`quality-verify.mjs`
+
+- the session really is being re-encoded, so the quality menu exists at all (it
+  is withheld for direct play) — the harness fails with a note rather than
+  passing vacuously when given an entity that direct-plays;
+- every height is labelled `Up to Np`, because the choice is a ceiling the
+  player may stay under rather than a guarantee of that rendition;
+- choosing one sends `preferred_height` and **not** `max_height`, which is the
+  difference between capping a ladder and pinning a single encode;
+- the decision that comes back carries several `renditions` topped at the chosen
+  height;
+- playback continues across the switch, and the console stays clean.
+
+It needs an entity the browser profile must transcode — the bundled demo's HEVC
+film is one, and so is any file whose codec the profile cannot decode.
 
 ## Notes
 

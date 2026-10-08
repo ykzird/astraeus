@@ -840,6 +840,80 @@ func TestManager_LadderProducesAMasterPlaylistAndItsRungs(t *testing.T) {
 	}
 }
 
+// TestManager_LadderTopsAtThePreferredHeight is the artefact-level check for a
+// quality choice expressed as a preference: the client asked for a ladder it
+// will not exceed, and every rung's produced segment really is the height that
+// was advertised. Asserting the decision's rungs alone would pass for a session
+// that never built them or built them all at one size.
+func TestManager_LadderTopsAtThePreferredHeight(t *testing.T) {
+	requireFFmpeg(t)
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	source := generateTallClip(t, dir, "tall.mkv")
+
+	prober := NewFFProbe("ffprobe")
+	info, err := prober.Probe(ctx, source)
+	if err != nil {
+		t.Fatalf("probing the fixture: %v", err)
+	}
+	if info.Height < 720 {
+		t.Fatalf("the fixture is %dx%d, too short for a preferred top below its height", info.Width, info.Height)
+	}
+
+	// A preferred height and no max_height: that is a request for a ladder,
+	// topped below the source, in a codec the source does not use.
+	capability := ClientCapability{
+		Containers:       []string{"hls"},
+		VideoCodecs:      []string{"h264"},
+		AudioCodecs:      []string{"aac"},
+		MaxBitDepth:      8,
+		MaxAudioChannels: 6,
+		SupportsHLS:      true,
+		PreferredHeight:  480,
+	}
+
+	server := DetectServerCapability(ctx, "ffmpeg", "ffprobe", "")
+	decision := NegotiateForServer(info, capability, server)
+	if len(decision.Renditions) < 2 {
+		t.Fatalf("expected a ladder, got %+v (mode %q, reasons: %s)",
+			decision.Renditions, decision.Mode, strings.Join(decision.Reasons, "; "))
+	}
+	if decision.Renditions[0].Height != 480 {
+		t.Fatalf("the top rung is %d, want the preferred 480", decision.Renditions[0].Height)
+	}
+	if decision.TargetHeight != 480 {
+		t.Errorf("target height = %d, want the top rung 480", decision.TargetHeight)
+	}
+
+	manager, session, _ := startSession(t, dir, source, decision)
+	defer manager.Stop(session.ID)
+
+	if got := session.PlaylistFile(); got != MasterPlaylistName {
+		t.Fatalf("the client was pointed at %q, want %q", got, MasterPlaylistName)
+	}
+	if segment := waitForSegment(t, session.Dir, 90*time.Second); segment == "" {
+		t.Fatal("no segment was produced")
+	}
+
+	// Each rung has to be the size it was advertised as, measured from the
+	// segment ffmpeg actually produced rather than from the argument list.
+	for index, rung := range decision.Renditions {
+		segmentPath := filepath.Join(session.Dir, fmt.Sprintf("seg%d_00000.ts", index))
+		if _, err := os.Stat(segmentPath); err != nil {
+			t.Errorf("rung %d produced no segment: %v", index, err)
+			continue
+		}
+		produced, err := prober.Probe(ctx, segmentPath)
+		if err != nil {
+			t.Fatalf("probing rung %d: %v", index, err)
+		}
+		if produced.Height != rung.Height {
+			t.Errorf("rung %d is %dx%d, want height %d", index, produced.Width, produced.Height, rung.Height)
+		}
+	}
+}
+
 // generateTwoAudioClip renders an MP4 whose two audio tracks differ in a way that
 // survives being copied: track 1 is stereo, track 2 is mono and is marked the
 // file's default. Both are AAC, so a browser takes either one as it is and what

@@ -148,8 +148,12 @@ The seek bar spans the **whole film**, not just what has been produced:
   session can jump without re-buffering.
 
 The quality menu offers **Auto** plus the ladder heights below the source
-(1080/720/480/360), and re-negotiates with that `max_height` at the current
-source time. It is withheld entirely for `direct_play`, where nothing is
+(1080/720/480/360), and re-negotiates with that height as a `preferred_height`
+at the current source time. Each option reads "Up to Np" because the choice is a
+ceiling, not a guarantee: the server returns a ladder topped there and hls.js may
+settle lower when the network cannot sustain the top rung. **Auto** sends no
+height at all, which asks the server to adapt as far as the browser's own box
+allows. The menu is withheld entirely for `direct_play`, where nothing is
 re-encoded. A switch means a short re-buffer: the control shows a busy state and
 the player says "Resuming…" rather than looking broken.
 

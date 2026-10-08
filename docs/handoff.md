@@ -1,13 +1,13 @@
 # Handoff
 
-**As of the round-8 work of 2026-10-08 — OCR for PGS image subtitles. Version
-0.15.0. 114 tracked files.** (`git log` names the commits; the previous handoff
-was `7f18ac3`, which swept the docs and recorded where the harness compacts.
-Round 7 was front-end unit tests, round 6 trace export, round 5 API rate
-limiting, round 4 image subtitles by burn-in, round 3 per-viewer progress, and
-round 2 HDR/Dolby Vision, packaging, the bitrate ceiling, the adaptive ladder,
-audio track selection, resumable playback, the continue-watching list and
-response hardening.)
+**As of the round-9 work of 2026-10-08 — a quality choice that caps a ladder.
+Version 0.16.0. 115 tracked files.** (`git log` names the commits; the previous
+handoff was `3d14775`, which added OCR for PGS image subtitles. Round 8 was OCR,
+round 7 front-end unit tests, round 6 trace export, round 5 API rate limiting,
+round 4 image subtitles by burn-in, round 3 per-viewer progress, and round 2
+HDR/Dolby Vision, packaging, the bitrate ceiling, the adaptive ladder, audio
+track selection, resumable playback, the continue-watching list and response
+hardening.)
 
 Written for whoever picks this up next — a person or an agent. The durable parts
 (architecture, conventions, environment, how to verify) should stay true for a
@@ -113,8 +113,16 @@ mise exec -- go test -tags=integration -run 'ToneMapsHDR|KeepsHDR' -v ./internal
 mise exec -- go test -tags=integration -run BitrateCeiling -v ./internal/streaming/
 
 # Builds a ladder and asserts the master playlist names every rung and that each
-# rung's produced segment really is the height it was advertised as.
+# rung's produced segment really is the height it was advertised as. The second
+# test is the preferred-height case: a `preferred_height` request must produce a
+# ladder topped there, measured from the segments, not from the argument list.
 mise exec -- go test -tags=integration -run TestManager_Ladder -v ./internal/streaming/
+
+# The negotiation contract for a capped quality choice, and the trap it would
+# otherwise fall into: a preference has to limit the output, not merely advise
+# the ladder, or a 4K source with a 720 preference is direct-played whole.
+mise exec -- go test -run 'PreferredHeight|BurnKeepsOneRendition|BuildsALadderOnly' ./internal/streaming/
+mise exec -- go test -run 'PreferredHeight|SubtitleEndpoint|AdvertisesImageTrack' ./internal/api/
 
 # Serves a file with two audio tracks and asserts the *delivered segment* carries
 # the chosen one, which is the check a command-line assertion would miss.
@@ -403,6 +411,50 @@ chrome, 13/13 player, 10/10 subtitles. Full Go suite green with race and
 integration. Those numbers belong to that content: the bundled demo clips score
 lower on the auto-hide checks for fixture reasons (§8).
 
+**A quality choice that caps a ladder** landed as of 0.16.0, which fixes a
+negotiation model that was thinner than its field name. Until now
+`max_height` did two jobs: it clipped the target height *and* it switched the
+ladder off, so a viewer picking 720p on the quality menu got exactly one encode
+and their player had nowhere to step down to when the network could not sustain
+it. `preferred_height` is the new, additive request: a ladder topped at that
+height, which the client's player is free to adapt below. `max_height` on its own
+keeps its meaning — one rendition, which is the deterministic request and the
+cheap one, since a ladder is up to three encodes — and alongside a preference it
+is the hard ceiling the ladder stays under. That last rule is what lets a
+manifest say "my screen is 1080" and "I chose 720" at once, two facts the player
+had been conflating into one field. A burn still pins one rendition whatever the
+heights say, because the bitmap is composited once; the preference then chooses
+that single encode's height, and a reason says so.
+
+The design question was whether to repurpose `max_height` as the ceiling (which
+is what its name suggests, and what every other `max_*` field in the manifest
+is) or to add a field. Repurposing would have been a breaking change and would
+have deleted the only way to bound a session to one encode; adding
+`preferred_height` keeps the pin available and is the reason the change is
+additive. Two details were load-bearing. A preference has to be **a limit, not
+advice**: a check for the trap (a 4K source the client could otherwise
+direct-play, with a 720 preference) is a unit test, because treating the
+preference as advice would deliver the 4K original whole. And a field added to
+`ClientCapability` has to be carried by `Normalise()`, which rebuilds the struct
+field by field — the tests caught it missing, and the symptom was every
+preference silently ignored.
+
+Verified where it matters. The negotiation contract is unit-tested: a preference
+builds a ladder topped there, `max_height` beside it is the ceiling, `max_height`
+alone still pins, a burn keeps one rendition, and a negative height is refused.
+The artefact test is the one that counts: `TestManager_LadderTopsAtThePreferredHeight`
+asks for a 480 cap on a 720 source and asserts each **produced segment's measured
+height** — 480/320/240 — because an argument-list assertion would pass for a
+session that built three copies of one rung. The browser was checked with the new
+`quality-verify.mjs` at **8/8**: the menu reads "Up to 480p", choosing it sends
+`preferred_height: 480` and no `max_height`, the decision comes back with three
+rungs topped at 480, and playback continues. `player-chrome-verify.mjs` was run
+against a *transcoding* entity (the demo's HEVC film) rather than a direct-play
+one, so its quality checks actually execute instead of being skipped; it scored
+**22/28**, and all six failures are the checks after its 600-second seek, which a
+four-second asset cannot satisfy (§8). The quality-menu check itself passes there
+with the new labels.
+
 **OCR for PGS image subtitles** landed as of 0.15.0, which turns the last
 picture-only subtitle format into text a browser can toggle, restyle and search.
 `internal/subtitles` gained a hand-written PGS decoder (`pgs.go`: PCS/ODS/PDS
@@ -609,19 +661,22 @@ The player got a menu beside the quality control; the fixture for it is the
 dual-audio movie `scripts/make-demo-media.sh` now generates, which is HEVC so the
 clip also transcodes and both menus are present at once.
 
-The **adaptive bitrate ladder** landed as of 0.5.0. The contract is one sentence:
-a manifest that pins `max_height` is asking for one rendition, and one that omits
-it is asking to adapt. A ladder is up to three rungs (the target height, two
-thirds, half) encoded by one ffmpeg process, each with its own VBV ceiling from a
-conventional table scaled by the client's limit, and the client is handed
-`master.m3u8`. Per-rung settings need stream specifiers (`-c:v:0`, `-filter:v:0`,
-`-pix_fmt:0`, `-force_key_frames:0`); without them every option lands on the first
-rung and the "ladder" is two copies of one stream — which is exactly what the
-first experiment produced, and why the integration test asserts each rung's
-*measured* height rather than the argument list. Verified on the real 17 GB film:
-a 3-rung ladder at 1920x820 / 1278x546 / 960x410, delivered through the allowlist,
-with the browser harness still at **28/28** — including the quality menu, which
-pins a height and so exercises the single-rendition path beside it.
+The **adaptive bitrate ladder** landed as of 0.5.0. Its contract then was one
+sentence: a manifest that pins `max_height` is asking for one rendition, and one
+that omits it is asking to adapt. (Round 9, 0.16.0, added `preferred_height` so a
+client can ask for a ladder it will not exceed; see the 0.16.0 paragraph above.
+`max_height` alone still means one rendition.) A ladder is up to three rungs (the
+target height, two thirds, half) encoded by one ffmpeg process, each with its own
+VBV ceiling from a conventional table scaled by the client's limit, and the client
+is handed `master.m3u8`. Per-rung settings need stream specifiers (`-c:v:0`,
+`-filter:v:0`, `-pix_fmt:0`, `-force_key_frames:0`); without them every option
+lands on the first rung and the "ladder" is two copies of one stream — which is
+exactly what the first experiment produced, and why the integration test asserts
+each rung's *measured* height rather than the argument list. Verified on the real
+17 GB film: a 3-rung ladder at 1920x820 / 1278x546 / 960x410, delivered through
+the allowlist, with the browser harness still at **28/28** — including the quality
+menu, which at the time pinned a height and so exercised the single-rendition path
+beside it.
 
 The bitrate axis landed too, as of 0.4.0: a client's `max_bitrate_kbps` reserves
 the audio's share and holds the video to the remainder as a VBV ceiling, applied
@@ -647,23 +702,19 @@ the fixture's caption. The unit passes `systemd-analyze verify` and scores 1.6
 
 Priority order, with the reasoning. Take it top-down.
 
-1. **A ladder a client can pin the top of.** Today pinning a height means one
-   rendition, so the quality menu caps quality rather than expressing a preference
-   within a ladder — the negotiation model is thinner than it looks there. A burn
-   deliberately pins one rendition, so the two interact.
-2. **Release automation and a TLS example.** Packaging landed (see §6), but
+1. **Release automation and a TLS example.** Packaging landed (see §6), but
    nothing is tagged or published, the CI workflow has never run, and there is no
    reverse-proxy configuration beside the unit.
-3. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
+2. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
    VobSub (or DVB) track keeps its refusal and its burn because it lives in a
    different container with a different palette, and no such sample exists here.
    This is the natural continuation of round 8 and is smaller than it was: the
    pipeline, the routing and the fixture font all exist, so the work is one more
    decoder plus a fixture. See the OCR bullet in §8 for what is unverified.
-4. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
+3. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
    the gate remains instance-wide: it admits a request, it does not decide what
    the request may see, so every admitted viewer sees the whole library.
-5. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
+4. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
@@ -805,7 +856,22 @@ Priority order, with the reasoning. Take it top-down.
   itself is verified at the byte level by the Go integration test.
 - **Ladder cost on a weak host is unmeasured.** The development machine is a
   9700X and transcoded three rungs of 4K-to-820p without complaint. A host with a
-  quarter of that CPU would feel it, and there is no rung cap by host.
+  quarter of that CPU would feel it, and there is no rung cap by host. This is why
+  `max_height` alone still asks for one encode: a client that wants determinism,
+  or a host that cannot afford three, can pin a rendition instead of capping a
+  ladder.
+- **A `preferred_height` is a top rung, not a floor, and nothing reports where
+  the player actually settled.** The server builds the ladder and hands over the
+  master playlist; whether the player ever leaves the top rung is its own
+  decision, and no KPI or reason says which rung was watched. The integration test
+  verifies the rungs that are *produced*, not the rung a viewer saw. The browser
+  check (`quality-verify.mjs`) runs on the demo's four-second HEVC film, so it
+  proves the request and the decision, not sustained adaptation over minutes.
+- **`player-chrome-verify.mjs` cannot pass on the bundled demo library.** It
+  seeks to 600s, which no three-second clip can satisfy, so every check after the
+  seek fails for fixture reasons; run against the 17 GB film instead (see §3), or
+  expect a score in the low twenties on the demo assets. The quality menu check
+  itself passes there, with the labels this round introduced.
 - **No browser has been asked to play an HDR stream.** The HDR path is verified
   down to the produced segment (10-bit, `bt2020nc`/`smpte2084`/`bt2020`), not to
   a compositor showing it correctly — which is why the client has to declare

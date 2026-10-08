@@ -313,13 +313,17 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		}
 	}
 
-	// A ladder, when the client asked to adapt rather than pin a height. A burn
-	// is deliberately excluded: the subtitle is composited once, in one filter
-	// graph, so a burned session is a single rendition. Offering rungs here
-	// would mean either burning only the top one or compositing per rung, and
-	// neither is what the client asked for.
+	// A ladder, when the client asked to adapt rather than pin a height. An
+	// explicit preferred_height is such a request, and max_height alongside it
+	// is the ceiling the ladder stays under; max_height on its own still means
+	// one rendition, which is what a client that wants determinism asks for. A
+	// burn is deliberately excluded: the subtitle is composited once, in one
+	// filter graph, so a burned session is a single rendition. Offering rungs
+	// here would mean either burning only the top one or compositing per rung,
+	// and neither is what the client asked for.
 	laddered := false
-	if decision.Deliverable && decision.VideoAction == ActionTranscode && capability.MaxHeight <= 0 && !burning {
+	if decision.Deliverable && decision.VideoAction == ActionTranscode &&
+		!capability.pinsOneRendition() && !burning {
 		top := decision.TargetHeight
 		if top <= 0 {
 			top = info.Height
@@ -332,10 +336,28 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 			// ladder rather than an unset height.
 			decision.TargetHeight = ladder[0].Height
 			decision.TargetBitrateKbps = ladder[0].BitrateKbps
-			decision.Reasons = append(decision.Reasons,
-				fmt.Sprintf("the client did not pin a height, so it gets a %d-rung ladder from %dp down to %dp",
-					len(ladder), ladder[0].Height, ladder[len(ladder)-1].Height))
+			// The reason states what was asked for and then what was produced,
+			// so a top rung below the preference is legible: the first clause
+			// is the request, the second the outcome.
+			if capability.PreferredHeight > 0 {
+				decision.Reasons = append(decision.Reasons,
+					fmt.Sprintf("the client asked for a ladder topped at %dp rather than one fixed rendition, so it gets a %d-rung ladder from %dp down to %dp",
+						capability.PreferredHeight, len(ladder), ladder[0].Height, ladder[len(ladder)-1].Height))
+			} else {
+				decision.Reasons = append(decision.Reasons,
+					fmt.Sprintf("the client did not pin a height, so it gets a %d-rung ladder from %dp down to %dp",
+						len(ladder), ladder[0].Height, ladder[len(ladder)-1].Height))
+			}
 		}
+	}
+
+	// A preference that a burn has turned into one rendition deserves its own
+	// sentence: the client asked to adapt and got a single encode, and the burn
+	// reason alone does not say that the preference was what chose its height.
+	if burning && capability.PreferredHeight > 0 && decision.VideoAction == ActionTranscode {
+		decision.Reasons = append(decision.Reasons,
+			fmt.Sprintf("the burn is one composited picture, so the %dp preference selects a single rendition rather than a ladder",
+				capability.PreferredHeight))
 	}
 
 	// A single rendition gets an explicit ceiling, but only when the limit
@@ -396,13 +418,14 @@ func targetHeightFor(info *MediaInfo, capability ClientCapability) (int, bool) {
 	if info.Height <= 0 || info.Width <= 0 {
 		return 0, false
 	}
-	if capability.MaxHeight <= 0 && capability.MaxWidth <= 0 {
+	ceiling := capability.heightCeiling()
+	if ceiling <= 0 && capability.MaxWidth <= 0 {
 		return 0, false
 	}
 
 	limit := info.Height
-	if capability.MaxHeight > 0 && capability.MaxHeight < limit {
-		limit = capability.MaxHeight
+	if ceiling > 0 && ceiling < limit {
+		limit = ceiling
 	}
 	if capability.MaxWidth > 0 && info.Width > capability.MaxWidth {
 		if byWidth := capability.MaxWidth * info.Height / info.Width; byWidth < limit {
@@ -426,18 +449,26 @@ func targetHeightFor(info *MediaInfo, capability ClientCapability) (int, bool) {
 	return limit, true
 }
 
-// describeBox renders a client's resolution limit for a human.
+// describeBox renders a client's resolution limit for a human. A preferred
+// height is part of that limit: a client asking for a 720p ladder top has
+// constrained the output just as a 720 box would, and saying "no resolution
+// limit" while downscaling to 720 would be a lie.
 func describeBox(capability ClientCapability) string {
+	ceiling := capability.heightCeiling()
+
+	box := "no resolution limit"
 	switch {
-	case capability.MaxWidth > 0 && capability.MaxHeight > 0:
-		return fmt.Sprintf("%dx%d", capability.MaxWidth, capability.MaxHeight)
-	case capability.MaxHeight > 0:
-		return fmt.Sprintf("%dp", capability.MaxHeight)
+	case capability.MaxWidth > 0 && ceiling > 0:
+		box = fmt.Sprintf("%dx%d", capability.MaxWidth, ceiling)
+	case ceiling > 0:
+		box = fmt.Sprintf("%dp", ceiling)
 	case capability.MaxWidth > 0:
-		return fmt.Sprintf("%dpx wide", capability.MaxWidth)
-	default:
-		return "no resolution limit"
+		box = fmt.Sprintf("%dpx wide", capability.MaxWidth)
 	}
+	if capability.PreferredHeight > 0 {
+		box += ", asking for a ladder rather than one fixed rendition"
+	}
+	return box
 }
 
 // Rendition is one rung of an adaptive bitrate ladder: a height and the ceiling

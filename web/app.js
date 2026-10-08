@@ -475,9 +475,10 @@
    * the full profile goes on every request, mirroring
    * streaming.BrowserCapability() on the server.
    *
-   * `maxHeight` is omitted for Auto, leaving the browser's real horizontal
-   * ceiling (1920) as the only limit — the server derives the height from the
-   * source's aspect ratio.
+   * `preferredHeight` is omitted for Auto, which asks the server for a ladder
+   * topped at the browser's own horizontal ceiling (1920) — the server derives
+   * the height from the source's aspect ratio. A chosen height is a ceiling the
+   * player may step down from, not a guarantee of that exact rendition.
    *
    * `audioTrackIndex` is omitted for Auto as well: the contract reserves both
    * a missing field and 0 for "the server's choice", so neither is ever sent.
@@ -486,7 +487,7 @@
    * picture. It shares the audio field's convention — absent and 0 both mean
    * "do not burn" — so it is only ever sent for a real global stream index.
    */
-  function playbackRequestBody(startSeconds, maxHeight, audioTrackIndex, burnSubtitleIndex) {
+  function playbackRequestBody(startSeconds, preferredHeight, audioTrackIndex, burnSubtitleIndex) {
     const body = {
       containers: ["mp4", "webm", "hls"],
       video_codecs: ["h264", "vp9", "av1"],
@@ -502,7 +503,7 @@
       supports_hls: true,
       subtitles: true,
     };
-    if (typeof maxHeight === "number" && maxHeight > 0) body.max_height = maxHeight;
+    if (typeof preferredHeight === "number" && preferredHeight > 0) body.preferred_height = preferredHeight;
     if (typeof audioTrackIndex === "number" && isFinite(audioTrackIndex) && audioTrackIndex > 0) {
       body.audio_track_index = audioTrackIndex;
     }
@@ -557,8 +558,9 @@
       /* The whole film's duration, from media_info — not what this session has
          produced. The seek bar spans this. */
       sourceDuration: 0,
-      /* Requested height cap (null = Auto) and what the server actually chose. */
-      maxHeight: null,
+      /* Preferred ladder ceiling (null = Auto) and what the server actually
+         chose. A choice caps the ladder; it never pins one rendition. */
+      preferredHeight: null,
       targetHeight: 0,
       /* Requested audio stream index (null = Auto) and the index the server
          actually chose for this session; the menu reports the latter. */
@@ -2874,7 +2876,7 @@
       pb.subtitleSelection = next;
       resumeSession({
         startSeconds: currentSourceTime(pb),
-        maxHeight: pb.maxHeight,
+        preferredHeight: pb.preferredHeight,
         audioTrackIndex: pb.audioTrackIndex,
         burnSubtitleIndex: index,
       });
@@ -2886,7 +2888,7 @@
       pb.subtitleSelection = next;
       resumeSession({
         startSeconds: currentSourceTime(pb),
-        maxHeight: pb.maxHeight,
+        preferredHeight: pb.preferredHeight,
         audioTrackIndex: pb.audioTrackIndex,
         /* 0 is the contract's "no burn", which stops the re-encode. */
         burnSubtitleIndex: 0,
@@ -3109,9 +3111,9 @@
     });
     select.append(el("option", { value: "auto", text: "Auto" }));
     for (const height of options) {
-      select.append(el("option", { value: String(height), text: height + "p" }));
+      select.append(el("option", { value: String(height), text: "Up to " + height + "p" }));
     }
-    const wanted = pb.maxHeight ? String(pb.maxHeight) : "auto";
+    const wanted = pb.preferredHeight ? String(pb.preferredHeight) : "auto";
     select.value = options.some(function (height) { return String(height) === wanted; })
       ? wanted
       : "auto";
@@ -3259,7 +3261,7 @@
     select.disabled = busy || !playbackIsLive(pb);
     select.setAttribute("aria-busy", busy ? "true" : "false");
     select.title = busy ? "Switching quality…" : "Playback quality";
-    const wanted = pb.maxHeight ? String(pb.maxHeight) : "auto";
+    const wanted = pb.preferredHeight ? String(pb.preferredHeight) : "auto";
     if (select.value !== wanted) {
       const has = Array.prototype.some.call(select.options, function (option) {
         return option.value === wanted;
@@ -3708,7 +3710,7 @@
       const result = await api.playback(entity.id, playbackRequestBody(resumeSeconds, null));
       /* Navigation or Stop may have replaced the session during the request. */
       if (state.playback !== session) return;
-      applyPlaybackResult(session, result, entity, { startSeconds: resumeSeconds, maxHeight: null });
+      applyPlaybackResult(session, result, entity, { startSeconds: resumeSeconds, preferredHeight: null });
       startSessionMedia(session, entity, true);
       /* Direct play applies the offset client-side, so its sessionStart is 0
          and the requested offset is the one to name; segmented delivery names
@@ -3932,7 +3934,7 @@
     }
     pb.sourceDuration = mediaInfoDuration(pb);
     pb.targetHeight = decision && Number(decision.target_height) > 0 ? Number(decision.target_height) : 0;
-    pb.maxHeight = requested && "maxHeight" in requested ? requested.maxHeight : null;
+    pb.preferredHeight = requested && "preferredHeight" in requested ? requested.preferredHeight : null;
     /* What the server actually selected this session, which is what the audio
        menu reports; absent or 0 means the entity has no audio track. */
     const targetAudio = decision ? Number(decision.target_audio_stream_index) : NaN;
@@ -3986,7 +3988,7 @@
       typeof opts.startSeconds === "number" && isFinite(opts.startSeconds)
         ? Math.max(0, opts.startSeconds)
         : currentSourceTime(pb);
-    const maxHeight = "maxHeight" in opts ? opts.maxHeight : pb.maxHeight;
+    const preferredHeight = "preferredHeight" in opts ? opts.preferredHeight : pb.preferredHeight;
     /* Height and audio are chosen independently, so swapping one carries the
        other across the re-negotiation unless the caller asked otherwise. */
     const audioTrackIndex = "audioTrackIndex" in opts ? opts.audioTrackIndex : pb.audioTrackIndex;
@@ -3995,7 +3997,7 @@
     const burnSubtitleIndex =
       "burnSubtitleIndex" in opts ? opts.burnSubtitleIndex : burnedSubtitleIndex(pb);
     const wasPlaying = !playerVideo.paused && !playerVideo.ended;
-    const previousMaxHeight = pb.maxHeight;
+    const previousPreferredHeight = pb.preferredHeight;
     const previousAudioTrackIndex = pb.audioTrackIndex;
     const previousSubtitleSelection = pb.subtitleSelection;
     const previousSessionId = pb.sessionId;
@@ -4021,27 +4023,27 @@
     try {
       const result = await api.playback(
         entity.id,
-        playbackRequestBody(startSeconds, maxHeight, audioTrackIndex, burnSubtitleIndex)
+        playbackRequestBody(startSeconds, preferredHeight, audioTrackIndex, burnSubtitleIndex)
       );
       /* Navigation or Stop may have replaced the session meanwhile. */
       if (state.playback !== pb) return;
       applyPlaybackResult(pb, result, entity, {
         startSeconds: startSeconds,
-        maxHeight: maxHeight,
+        preferredHeight: preferredHeight,
         audioTrackIndex: audioTrackIndex,
       });
       pb.qualityBusy = false;
       startSessionMedia(pb, entity, wasPlaying);
       toast(
         "Resuming “" + pb.title + "” at " + formatClock(pb.sessionStart) +
-          (maxHeight ? " · " + maxHeight + "p" : "") + "…",
+          (preferredHeight ? " · " + preferredHeight + "p" : "") + "…",
         "info"
       );
     } catch (error) {
       if (state.playback !== pb) return;
       /* A failed switch is not fatal: say so and keep the session selectable. */
       pb.qualityBusy = false;
-      pb.maxHeight = previousMaxHeight;
+      pb.preferredHeight = previousPreferredHeight;
       pb.audioTrackIndex = previousAudioTrackIndex;
       /* A failed burn switch left the old stream playing, so the menu must not
          keep claiming the choice that never took effect. */
@@ -4061,12 +4063,12 @@
   function startQualitySwitch(value) {
     const pb = state.playback;
     if (!pb.url || pb.qualityBusy) return;
-    const maxHeight = value === "auto" ? null : Number(value);
-    if (maxHeight !== null && !(maxHeight > 0)) return;
-    if (maxHeight === pb.maxHeight) return;
+    const preferredHeight = value === "auto" ? null : Number(value);
+    if (preferredHeight !== null && !(preferredHeight > 0)) return;
+    if (preferredHeight === pb.preferredHeight) return;
     resumeSession({
       startSeconds: currentSourceTime(pb),
-      maxHeight: maxHeight,
+      preferredHeight: preferredHeight,
       /* Only the height is changing; keep the track the viewer picked. */
       audioTrackIndex: pb.audioTrackIndex,
       /* A burn is part of the stream being re-encoded, so it survives too. */
@@ -4084,7 +4086,7 @@
     if (index === pb.targetAudioStreamIndex) return;
     resumeSession({
       startSeconds: currentSourceTime(pb),
-      maxHeight: pb.maxHeight,
+      preferredHeight: pb.preferredHeight,
       audioTrackIndex: index,
       /* Only the audio track is changing, so an active burn stays. */
       burnSubtitleIndex: burnedSubtitleIndex(pb),

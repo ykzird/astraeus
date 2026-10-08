@@ -122,6 +122,25 @@ func TestClientCapability_Validate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "negative preferred height",
+			capability: ClientCapability{
+				VideoCodecs:     []string{"h264"},
+				AudioCodecs:     []string{"aac"},
+				Containers:      []string{"mp4"},
+				PreferredHeight: -1,
+			},
+			wantErr: true,
+		},
+		{
+			name: "a preferred height is a valid manifest",
+			capability: ClientCapability{
+				VideoCodecs:     []string{"h264"},
+				AudioCodecs:     []string{"aac"},
+				Containers:      []string{"mp4"},
+				PreferredHeight: 720,
+			},
+		},
 	}
 
 	for _, tt := range tests {

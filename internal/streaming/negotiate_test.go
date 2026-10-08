@@ -1463,6 +1463,138 @@ func TestNegotiate_BuildsALadderOnlyWhenNoHeightIsPinned(t *testing.T) {
 	}
 }
 
+// TestNegotiate_PreferredHeightBuildsALadderToppedThere is the contract for a
+// quality choice expressed as a preference: the client will not go above the
+// height it asked for, but its player is free to step down, so it gets a ladder
+// rather than one encode. max_height on its own keeps its historical meaning of
+// pinning exactly one rendition, and alongside a preference it is the ceiling
+// that ladder stays under.
+func TestNegotiate_PreferredHeightBuildsALadderToppedThere(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "vp9", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, BitrateKbps: 6_000,
+	}
+
+	adaptive := hdrCapability()
+	adaptive.SupportsHDR = false
+	adaptive.MaxBitDepth = 8
+	adaptive.MaxWidth = 0
+	adaptive.MaxHeight = 0
+
+	preferred := adaptive
+	preferred.PreferredHeight = 720
+
+	decision := Negotiate(info, preferred)
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want transcode: %s", decision.Mode, strings.Join(decision.Reasons, "; "))
+	}
+	if len(decision.Renditions) < 2 {
+		t.Fatalf("a preferred height must still build a ladder, got %+v", decision.Renditions)
+	}
+	if decision.Renditions[0].Height != 720 {
+		t.Errorf("the top rung is %d, want the preferred 720", decision.Renditions[0].Height)
+	}
+	if decision.TargetHeight != 720 {
+		t.Errorf("target height = %d, want the top rung 720", decision.TargetHeight)
+	}
+	for i := 1; i < len(decision.Renditions); i++ {
+		if decision.Renditions[i].Height >= decision.Renditions[i-1].Height {
+			t.Errorf("the ladder does not descend: %+v", decision.Renditions)
+		}
+	}
+	if reasons := strings.Join(decision.Reasons, "; "); !strings.Contains(reasons, "720p") {
+		t.Errorf("the reasons should name the preference: %s", reasons)
+	}
+
+	// max_height alongside a preference is the ceiling the ladder stays under.
+	capped := adaptive
+	capped.MaxHeight = 1080
+	capped.PreferredHeight = 480
+	cappedDecision := Negotiate(info, capped)
+	if len(cappedDecision.Renditions) < 2 {
+		t.Fatalf("a capped preference must still ladder, got %+v", cappedDecision.Renditions)
+	}
+	if cappedDecision.Renditions[0].Height != 480 {
+		t.Errorf("the top rung is %d, want the preferred 480 under the 1080 ceiling",
+			cappedDecision.Renditions[0].Height)
+	}
+
+	// And max_height on its own keeps its historical meaning: one rendition.
+	pinned := adaptive
+	pinned.MaxHeight = 720
+	if got := Negotiate(info, pinned); len(got.Renditions) != 0 {
+		t.Errorf("max_height alone must still pin one rendition, got %+v", got.Renditions)
+	}
+}
+
+// TestNegotiate_PreferredHeightIsALimitNotAdvice is the trap a preference would
+// otherwise fall into: on a source the client could direct-play untouched, a
+// preference that only advised the ladder would leave the 4K original delivered
+// whole. It has to constrain the output like any other limit.
+func TestNegotiate_PreferredHeightIsALimitNotAdvice(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 3840, Height: 2160, BitDepth: 8, BitrateKbps: 20_000,
+	}
+	capability := ClientCapability{
+		Containers:       []string{"mp4", "hls"},
+		VideoCodecs:      []string{"h264"},
+		AudioCodecs:      []string{"aac"},
+		MaxBitDepth:      8,
+		MaxAudioChannels: 2,
+		SupportsHLS:      true,
+		PreferredHeight:  720,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want a transcode: a 720p preference cannot be honoured by direct play (%s)",
+			decision.Mode, strings.Join(decision.Reasons, "; "))
+	}
+	if decision.TargetHeight != 720 {
+		t.Errorf("target height = %d, want 720", decision.TargetHeight)
+	}
+	if len(decision.Renditions) < 2 || decision.Renditions[0].Height != 720 {
+		t.Errorf("renditions = %+v, want a ladder topped at 720", decision.Renditions)
+	}
+}
+
+// TestNegotiate_BurnKeepsOneRenditionWithAPreference pins the interaction the
+// two features have: a burn is one composited picture, so a preference cannot
+// turn it into a ladder, and the reasons say why the preference chose a single
+// height instead of a top rung.
+func TestNegotiate_BurnKeepsOneRenditionWithAPreference(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+		Subtitles:   []SubtitleTrack{{Index: 3, Codec: "hdmv_pgs_subtitle", Text: false}},
+	}
+	capability := ClientCapability{
+		Containers: []string{"matroska"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true, Subtitles: true,
+		BurnSubtitleIndex: 3, PreferredHeight: 1080,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want a transcode", decision.Mode)
+	}
+	if len(decision.Renditions) != 0 {
+		t.Errorf("a burn is one composited picture, so a preference cannot make it a ladder: %+v",
+			decision.Renditions)
+	}
+	if reasons := strings.Join(decision.Reasons, "; "); !strings.Contains(reasons, "preference selects a single rendition") {
+		t.Errorf("the reasons should explain why the preference did not ladder: %s", reasons)
+	}
+}
+
 // TestNegotiate_LadderRespectsTheBitrateLimit checks that a ladder is scaled by
 // the client's total limit rather than ignoring it.
 func TestNegotiate_LadderRespectsTheBitrateLimit(t *testing.T) {

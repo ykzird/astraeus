@@ -75,6 +75,16 @@ Status as of the current build. Evidence for each claim is the test suite
       ffmpeg process, a master playlist the client is pointed at, and per-stream
       specifiers so each rung really is its own size. A client that pins a height
       still gets a single rendition
+- [x] **A quality choice that caps the ladder instead of pinning it**:
+      `preferred_height` asks for a ladder topped there, so the player can step
+      down under pressure, while `max_height` alone keeps meaning exactly one
+      rendition (the deterministic, single-encode request). `max_height` beside a
+      preference is the hard ceiling, so a manifest can say "my screen is 1080"
+      and "I chose 720" at once. The quality menu sends the preference and labels
+      its choices "Up to Np". Verified at the rung level: the integration test
+      builds a 480-topped ladder and asserts each produced segment's *measured*
+      height, and a unit test pins that a 4K source with a 720 preference is not
+      direct-played untouched
 - [ ] Dolby Vision profile 5 *correct* conversion (IPTPQc2 needs a Dolby Vision
       tone mapper; the software chain produces approximate colour and says so)
 
@@ -177,15 +187,15 @@ Status as of the current build. Evidence for each claim is the test suite
 
 ## Known gaps
 
-- A ladder is built only when the client omits `max_height`. A player that pins a
-  height — a viewer choosing a setting from the quality menu — gets exactly one
-  rendition, so the menu caps quality rather than expressing a preference within a
-  ladder. Letting a client pin a *top* rung while still adapting below it would be
-  the more capable design.
 - A ladder multiplies the work: each rung is a separate encode of the same source,
   so three rungs cost roughly three times one. There is no per-host cap on how many
   rungs to offer, and no use of the client's bandwidth estimate to skip rungs it
-  could not afford anyway.
+  could not afford anyway. That cost is why `max_height` alone still means one
+  rendition: a client that wants determinism, or a host that cannot afford three
+  encodes, can ask for a pin and get one.
+- A `preferred_height` is honoured as a top rung, not as a floor. If the player's
+  own adaptive logic settles below it, that is the player's choice and the server
+  does not second-guess it; nothing reports which rung a client actually watched.
 - A VBV ceiling bounds the average rather than every instant, so over a segment
   shorter than the buffer the delivered rate can exceed the client's limit. That
   is standard rate-control behaviour, not a bug, but it is a limit on how literal

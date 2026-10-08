@@ -25,7 +25,7 @@ Whatever you pick, four facts decide whether the install is sound:
 ## Container
 
 ```sh
-docker build -t astraeus-media:0.15.0 .
+docker build -t astraeus-media:0.16.0 .
 
 # The image's default command serves on :8642 with every writable path inside
 # /data. This one has no access gate, so keep it on loopback.
@@ -33,7 +33,7 @@ docker run -d --name astraeus \
   -p 127.0.0.1:8642:8642 \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.15.0
+  astraeus-media:0.16.0
 ```
 
 Flags are passed through the entrypoint, so the server's own options can be
@@ -63,7 +63,7 @@ docker run -d --name astraeus \
   -e ASTRAEUS_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
-  astraeus-media:0.15.0 \
+  astraeus-media:0.16.0 \
   serve --addr 0.0.0.0:8642 --web-dir /app/web \
         --db /data/astraeus.db --stream-root /data/streams \
         --image-cache /data/images --subtitle-cache /data/subtitles \

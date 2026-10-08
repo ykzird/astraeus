@@ -27,7 +27,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | Segmented streaming | Done. HLS via ffmpeg, passthrough or transcode |
 | Resume / watch state | Done. A viewer's position is stored per viewer and entity, reported while watching, and resumed when Play is pressed again; watched-through films forget theirs |
 | Audio tracks | Done. Every track is probed and listed; a client picks one by stream index, and the file's own default is delivered when it does not |
-| Adaptive bitrate | Done. A manifest that omits `max_height` gets a master playlist with up to three rungs, each with its own ceiling; naming a height gets one rendition |
+| Adaptive bitrate | Done. A manifest that asks for a `preferred_height` gets a master playlist with up to three rungs topped there; `max_height` alone pins one rendition; omitting both adapts to the client's own ceiling |
 | HDR and Dolby Vision | Detected from the source's colour tags; **tone mapped to SDR** for clients that cannot show it, and passed through at 10 bits for those that can. Dolby Vision profile 8 keeps its HDR10 base layer; profile 5 is flagged as approximate |
 | Hardware acceleration | NVENC, QuickSync, VideoToolbox, VAAPI and AMF, each **verified by running it with the real options** at startup; rejected encoders report why; software fallback |
 | Subtitles | Done. Text tracks extracted to WebVTT, cached and served; **PGS image tracks read into text by OCR** when tesseract is installed (toggleable and searchable), and burned into the picture otherwise; VobSub stays burn-only |
@@ -260,7 +260,7 @@ astraeus-server version
 Run any command with `-h` for its flags. Shared flags: `--db`, `--tmdb-key`,
 `--log-level`, `--log-format`. Flags are per-command: there is no global `--db`,
 so it has to follow the subcommand. `astraeus-server version` prints the build
-identifier (currently `0.15.0`).
+identifier (currently `0.16.0`).
 
 `serve` flags that are easy to miss because they are named in the sections below
 rather than here:
@@ -390,6 +390,7 @@ Errors are `{"code": "...", "message": "..."}` with a matching status code.
   "audio_codecs": ["aac", "opus"],
   "max_width": 1920,
   "max_height": 1080,
+  "preferred_height": 0,
   "max_bitrate_kbps": 120000,
   "max_bit_depth": 8,
   "max_audio_channels": 2,
@@ -581,11 +582,24 @@ subtitle from text; `scripts/pgsgen` exposes it for browser fixtures, and
 
 ### Adaptive bitrate
 
-**Pinning a height asks for one rendition; omitting it asks to adapt.** That is
-the whole contract, and it is what makes the quality menu and a ladder coexist: a
-manifest with no `max_height` gets a **ladder**, and one that names a height gets
-exactly that height, which is what the player's quality menu sends when a viewer
-picks a setting.
+**A quality choice is a ceiling, and a pin is a separate request.** Three height
+fields, three meanings:
+
+- `preferred_height` — "adapt, but do not go above this." The client gets a
+  **ladder topped at that height** (clipped by its own box and the source), and
+  its player is free to step down when the network cannot sustain the top rung.
+  This is what the quality menu sends when a viewer picks a setting.
+- `max_height` **alone** — "give me exactly this." One rendition, no ladder. It
+  is the deterministic request, and on a small host it is also the cheap one: a
+  ladder is up to three encodes, a pin is one.
+- **neither** — "adapt as far as my box allows." A ladder topped at the client's
+  own ceiling or the source.
+
+`max_height` alongside `preferred_height` is the hard ceiling that ladder stays
+under, so a manifest can say "my screen is 1080" and "I chose 720" at once. A
+`burn_subtitle_index` still pins one rendition whatever the heights say, because
+the bitmap is composited once; the preference then chooses that single encode's
+height.
 
 A ladder has up to three rungs — the target height, two thirds of it, and half —
 each with its own encoder settings, its own VBV ceiling from a conventional
@@ -594,7 +608,8 @@ boundaries. One ffmpeg process produces all of them, and the client is handed
 `master.m3u8`; a player that understands HLS then switches rungs on its own. The
 decision reports the rungs as `renditions`, and `target_height` and
 `target_bitrate_kbps` describe the top one, so a client that reads only those
-still sees a coherent answer.
+still sees a coherent answer. Every decision explains itself in `reasons`,
+including which height field chose the top rung.
 
 Rungs that would be too small to encode or too close to the rung above to be a
 real choice are dropped, and a source with no room below it gets no ladder at

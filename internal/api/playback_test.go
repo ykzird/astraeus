@@ -212,6 +212,51 @@ func TestPlayback_DeclaredCapabilityDrivesTheDecision(t *testing.T) {
 	}
 }
 
+// TestPlayback_PreferredHeightAsksForALadder pins the request field end to end,
+// including its JSON name: a quality choice expressed as a preference must come
+// back as an adaptive ladder topped at that height, while max_height keeps
+// pinning a single rendition.
+func TestPlayback_PreferredHeightAsksForALadder(t *testing.T) {
+	t.Parallel()
+
+	prober := stubProber{info: &streaming.MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "aac", Width: 3840, Height: 2160,
+	}}
+	streams := &fakeStreams{}
+	env := newTestEnv(t, withProber(prober), withStreams(streams))
+
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mp4", "bytes")
+
+	body := `{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],"preferred_height":720,"supports_hls":true}`
+	recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback", body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+
+	response := decodeBody[playbackResponse](t, recorder)
+	if response.Mode != streaming.ModeTranscode {
+		t.Fatalf("mode = %q, want %q", response.Mode, streaming.ModeTranscode)
+	}
+	if len(response.Decision.Renditions) < 2 {
+		t.Fatalf("renditions = %+v, want a ladder for a preferred height", response.Decision.Renditions)
+	}
+	if response.Decision.Renditions[0].Height != 720 {
+		t.Errorf("the top rung is %d, want the preferred 720", response.Decision.Renditions[0].Height)
+	}
+	if response.Decision.TargetHeight != 720 {
+		t.Errorf("target height = %d, want the top rung 720", response.Decision.TargetHeight)
+	}
+
+	// And max_height on its own still means one rendition: the historical
+	// contract a client asking for determinism relies on.
+	pinnedBody := `{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],"max_height":720,"supports_hls":true}`
+	recorder = env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback", pinnedBody)
+	pinned := decodeBody[playbackResponse](t, recorder)
+	if len(pinned.Decision.Renditions) != 0 {
+		t.Errorf("max_height alone produced %+v, want one rendition", pinned.Decision.Renditions)
+	}
+}
+
 func TestPlayback_UndeliverableIsAConflict(t *testing.T) {
 	t.Parallel()
 
