@@ -253,10 +253,22 @@ func TestDetectServerCapability(t *testing.T) {
 	if len(capability.VideoEncoders) == 0 {
 		t.Error("no usable video encoders were detected")
 	}
-	// With no device directory there must be no hardware acceleration claim.
-	if capability.HardwareAcceleration != "" {
-		t.Errorf("hardware acceleration = %q, want none without a device",
-			capability.HardwareAcceleration)
+	// QuickSync needs a device and VAAPI needs a render node; with no device
+	// directory neither can have been verified, whatever the host's GPU is.
+	for _, family := range capability.HardwareAcceleration {
+		if family == "qsv" || family == "vaapi" {
+			t.Errorf("family %q was claimed without a device directory", family)
+		}
+	}
+	if capability.RenderNode != "" {
+		t.Errorf("render node = %q, want none without a device directory", capability.RenderNode)
+	}
+	// Anything ffmpeg lists but the host cannot use has to say why, or a broken
+	// driver is indistinguishable from no GPU.
+	for _, rejected := range capability.RejectedEncoders {
+		if rejected.Encoder == "" || rejected.Reason == "" {
+			t.Errorf("rejection recorded without an encoder and a reason: %+v", rejected)
+		}
 	}
 }
 
@@ -436,9 +448,11 @@ func TestDetectServerCapability_RejectsEncodersThatCannotRun(t *testing.T) {
 
 	capability := DetectServerCapability(context.Background(), "ffmpeg", "ffprobe", deviceDir)
 
-	// The invariant: never advertise an encoder that cannot encode.
+	// The invariant: never advertise an encoder that cannot encode, using the
+	// same device the detection found.
+	device := encoderDevice{RenderNode: capability.RenderNode}
 	for _, encoder := range capability.VideoEncoders {
-		if !encoderWorks(context.Background(), "ffmpeg", encoder, deviceDir) {
+		if !encoderWorks(context.Background(), "ffmpeg", encoder, device) {
 			t.Errorf("capability advertises %q, which cannot actually encode", encoder)
 		}
 	}
@@ -446,7 +460,7 @@ func TestDetectServerCapability_RejectsEncodersThatCannotRun(t *testing.T) {
 	// This host cannot drive QuickSync, so it must not be offered even though
 	// it is listed by ffmpeg.
 	if containsFold(capability.VideoEncoders, "h264_qsv") {
-		if !encoderWorks(context.Background(), "ffmpeg", "h264_qsv", deviceDir) {
+		if !encoderWorks(context.Background(), "ffmpeg", "h264_qsv", device) {
 			t.Error("h264_qsv is advertised although it cannot create a session")
 		}
 	}
@@ -456,15 +470,20 @@ func TestDetectServerCapability_RejectsEncodersThatCannotRun(t *testing.T) {
 		t.Errorf("libx264 is missing from the capability report: %v", capability.VideoEncoders)
 	}
 
-	// Any claimed hardware path must be backed by an encoder that is offered.
-	switch capability.HardwareAcceleration {
-	case "qsv":
-		if !containsFold(capability.VideoEncoders, "h264_qsv") && !containsFold(capability.VideoEncoders, "hevc_qsv") {
-			t.Error("hardware acceleration claims qsv with no working qsv encoder")
+	// Every claimed family must be backed by an encoder of that family which is
+	// actually offered. Writing it per family would need updating whenever one
+	// is added, which is exactly how a claim drifts away from reality.
+	for _, family := range capability.HardwareAcceleration {
+		backed := false
+		for _, encoder := range capability.VideoEncoders {
+			if got, ok := hardwareFamilyOf(encoder); ok && got.name == family {
+				backed = true
+				break
+			}
 		}
-	case "vaapi":
-		if !containsFold(capability.VideoEncoders, "h264_vaapi") && !containsFold(capability.VideoEncoders, "hevc_vaapi") {
-			t.Error("hardware acceleration claims vaapi with no working vaapi encoder")
+		if !backed {
+			t.Errorf("hardware acceleration claims %q with no working encoder of that family: %v",
+				family, capability.VideoEncoders)
 		}
 	}
 }

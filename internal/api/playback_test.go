@@ -401,7 +401,7 @@ func TestSystemCapabilities(t *testing.T) {
 	capability := streaming.ServerCapability{
 		FFmpegAvailable:      true,
 		FFprobeAvailable:     true,
-		HardwareAcceleration: "qsv",
+		HardwareAcceleration: []string{"qsv"},
 		VideoEncoders:        []string{"h264_qsv", "libx264"},
 		HLS:                  true,
 	}
@@ -413,8 +413,8 @@ func TestSystemCapabilities(t *testing.T) {
 	}
 
 	response := decodeBody[systemCapabilitiesResponse](t, recorder)
-	if response.HardwareAcceleration != "qsv" {
-		t.Errorf("hardware acceleration = %q, want qsv", response.HardwareAcceleration)
+	if len(response.HardwareAcceleration) != 1 || response.HardwareAcceleration[0] != "qsv" {
+		t.Errorf("hardware acceleration = %v, want [qsv]", response.HardwareAcceleration)
 	}
 	if !response.NegotiationEnabled || !response.SegmentingEnabled {
 		t.Errorf("expected both negotiation and segmenting to be reported as enabled: %+v", response)

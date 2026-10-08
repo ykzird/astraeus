@@ -214,7 +214,7 @@ exit 0
 		SegmentSeconds: 4,
 		Server: ServerCapability{
 			VideoEncoders:        []string{"h264_qsv", "libx264"},
-			HardwareAcceleration: "qsv",
+			HardwareAcceleration: []string{"qsv"},
 		},
 		Metrics: metrics,
 		Logger:  newTestLogger(),
@@ -249,7 +249,7 @@ func TestWouldUseHardware(t *testing.T) {
 	t.Parallel()
 
 	quickSync := ManagerConfig{
-		Server: ServerCapability{VideoEncoders: []string{"h264_qsv", "libx264"}, HardwareAcceleration: "qsv"},
+		Server: ServerCapability{VideoEncoders: []string{"h264_qsv", "libx264"}, HardwareAcceleration: []string{"qsv"}},
 	}
 	software := ManagerConfig{
 		Server: ServerCapability{VideoEncoders: []string{"libx264"}},
@@ -279,12 +279,15 @@ func TestWithoutHardware(t *testing.T) {
 	cfg := withoutHardware(ManagerConfig{
 		Server: ServerCapability{
 			VideoEncoders:        []string{"h264_qsv", "hevc_vaapi", "libx264"},
-			HardwareAcceleration: "qsv",
+			HardwareAcceleration: []string{"qsv"},
 		},
 	})
 
-	if cfg.Server.HardwareAcceleration != "" {
-		t.Errorf("hardware acceleration = %q, want it cleared", cfg.Server.HardwareAcceleration)
+	if len(cfg.Server.HardwareAcceleration) != 0 {
+		t.Errorf("hardware acceleration = %v, want it cleared", cfg.Server.HardwareAcceleration)
+	}
+	if cfg.Server.RenderNode != "" {
+		t.Errorf("render node = %q, want it cleared alongside the encoders", cfg.Server.RenderNode)
 	}
 	for _, encoder := range cfg.Server.VideoEncoders {
 		if isHardwareEncoder(encoder) {

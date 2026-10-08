@@ -289,7 +289,20 @@ func runServe(args []string) error {
 		"ffmpeg", deps.Server.FFmpegAvailable,
 		"ffprobe", deps.Server.FFprobeAvailable,
 		"hardware_acceleration", deps.Server.HardwareAcceleration,
-		"video_encoders", len(deps.Server.VideoEncoders))
+		"video_encoders", len(deps.Server.VideoEncoders),
+		"render_node", deps.Server.RenderNode)
+
+	// Say which hardware encoders were tried and why any of them was turned
+	// down. This is the first thing to read when hardware transcoding is
+	// expected and the server is quietly using its CPU instead.
+	for _, rejected := range deps.Server.RejectedEncoders {
+		app.logger.Warn("hardware encoder rejected",
+			"encoder", rejected.Encoder, "reason", rejected.Reason)
+	}
+	if len(deps.Server.RejectedEncoders) > 0 && len(deps.Server.HardwareAcceleration) == 0 {
+		app.logger.Warn("no hardware encoder is usable on this host; transcoding will use the CPU",
+			"rejected", len(deps.Server.RejectedEncoders))
+	}
 
 	if deps.Server.FFprobeAvailable {
 		deps.Prober = streaming.NewCachingProber(streaming.NewFFProbe(*ffprobeBin))

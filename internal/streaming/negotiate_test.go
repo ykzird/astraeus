@@ -209,11 +209,18 @@ func TestEncoderFor(t *testing.T) {
 	t.Parallel()
 
 	software := ServerCapability{VideoEncoders: []string{"libx264", "libx265"}}
-	quickSync := ServerCapability{VideoEncoders: []string{"h264_qsv", "hevc_qsv", "libx264", "libvpx-vp9"}, HardwareAcceleration: "qsv"}
-	vaapiOnly := ServerCapability{VideoEncoders: []string{"h264_vaapi"}, HardwareAcceleration: "vaapi"}
+	quickSync := ServerCapability{VideoEncoders: []string{"h264_qsv", "hevc_qsv", "libx264", "libvpx-vp9"}, HardwareAcceleration: []string{"qsv"}}
+	vaapiOnly := ServerCapability{VideoEncoders: []string{"h264_vaapi"}, HardwareAcceleration: []string{"vaapi"}}
 	// An encoder can be compiled into ffmpeg without a usable device being
-	// present; that must not be mistaken for a working hardware path.
-	compiledButUnusable := ServerCapability{VideoEncoders: []string{"h264_qsv", "libx264"}}
+	// present. Detection rejects it and records why, so it is absent from
+	// VideoEncoders - which is the only list selection reads, and the reason a
+	// rejected encoder cannot be chosen by mistake.
+	rejectedHardware := ServerCapability{
+		VideoEncoders: []string{"libx264"},
+		RejectedEncoders: []EncoderRejection{
+			{Encoder: "h264_qsv", Reason: "Error creating a MFX session: -9."},
+		},
+	}
 	none := ServerCapability{}
 
 	tests := []struct {
@@ -227,7 +234,7 @@ func TestEncoderFor(t *testing.T) {
 		{name: "quick sync hevc", codec: "hevc", server: quickSync, want: "hevc_qsv"},
 		{name: "vaapi fallback", codec: "h264", server: vaapiOnly, want: "h264_vaapi"},
 		{name: "hardware is skipped for a codec it cannot do", codec: "vp9", server: quickSync, want: "libvpx-vp9"},
-		{name: "compiled-in hardware without a device falls back to software", codec: "h264", server: compiledButUnusable, want: "libx264"},
+		{name: "rejected hardware falls back to software", codec: "h264", server: rejectedHardware, want: "libx264"},
 		{name: "unknown codec", codec: "theora", server: software, want: ""},
 		{name: "nothing available", codec: "h264", server: none, want: ""},
 		{name: "a software encoder that is not present is never assumed", codec: "h264", server: ServerCapability{VideoEncoders: []string{"libx265"}}, want: ""},
@@ -247,7 +254,7 @@ func TestBuildFFmpegArgs(t *testing.T) {
 	t.Parallel()
 
 	software := ManagerConfig{SegmentSeconds: 6, Server: ServerCapability{VideoEncoders: []string{"libx264"}}}
-	quickSync := ManagerConfig{SegmentSeconds: 4, Server: ServerCapability{VideoEncoders: []string{"h264_qsv", "libx264"}, HardwareAcceleration: "qsv"}}
+	quickSync := ManagerConfig{SegmentSeconds: 4, Server: ServerCapability{VideoEncoders: []string{"h264_qsv", "libx264"}, HardwareAcceleration: []string{"qsv"}}}
 
 	tests := []struct {
 		name      string
@@ -393,16 +400,24 @@ func TestNamedSegmentRe_RejectsTraversal(t *testing.T) {
 func TestBuildFFmpegArgs_PinsBrowserCompatiblePixelFormat(t *testing.T) {
 	t.Parallel()
 
+	// Every family has to end up 8-bit, because no browser decodes 10-bit H.264
+	// through Media Source Extensions. Software and most hardware encoders are
+	// told directly; VAAPI gets there through its upload filter instead, since
+	// it consumes hardware surfaces and a -pix_fmt would ask for software frames.
 	tests := []struct {
 		name       string
 		encoder    string
+		codec      string
 		wantPixFmt string
 	}{
-		{name: "software h264", encoder: "libx264", wantPixFmt: "yuv420p"},
-		{name: "software hevc", encoder: "libx265", wantPixFmt: "yuv420p"},
-		{name: "quick sync", encoder: "h264_qsv", wantPixFmt: "nv12"},
-		{name: "vaapi", encoder: "h264_vaapi", wantPixFmt: "nv12"},
-		{name: "vp9", encoder: "libvpx-vp9", wantPixFmt: "yuv420p"},
+		{name: "software h264", encoder: "libx264", codec: "h264", wantPixFmt: "yuv420p"},
+		{name: "software hevc", encoder: "libx265", codec: "hevc", wantPixFmt: "yuv420p"},
+		{name: "vp9", encoder: "libvpx-vp9", codec: "vp9", wantPixFmt: "yuv420p"},
+		{name: "nvenc", encoder: "h264_nvenc", codec: "h264", wantPixFmt: "nv12"},
+		{name: "quick sync", encoder: "h264_qsv", codec: "h264", wantPixFmt: "nv12"},
+		{name: "amf", encoder: "h264_amf", codec: "h264", wantPixFmt: "nv12"},
+		{name: "videotoolbox", encoder: "h264_videotoolbox", codec: "h264", wantPixFmt: "nv12"},
+		{name: "vaapi pins the format in its filter", encoder: "h264_vaapi", codec: "h264", wantPixFmt: ""},
 	}
 
 	for _, tt := range tests {
@@ -411,21 +426,15 @@ func TestBuildFFmpegArgs_PinsBrowserCompatiblePixelFormat(t *testing.T) {
 
 			cfg := ManagerConfig{
 				SegmentSeconds: 6,
-				Server:         ServerCapability{VideoEncoders: []string{tt.encoder}, HardwareAcceleration: "qsv"},
-			}
-			if tt.encoder == "h264_vaapi" {
-				cfg.Server.HardwareAcceleration = "vaapi"
+				Server:         ServerCapability{VideoEncoders: []string{tt.encoder}},
 			}
 
 			args, err := BuildFFmpegArgs("/tmp/session", "/media/movie.mkv", Decision{
-				Mode:        ModeTranscode,
-				Deliverable: true,
-				VideoAction: ActionTranscode,
-				AudioAction: ActionTranscode,
-				TargetVideoCodec: map[string]string{
-					"libx264": "h264", "h264_qsv": "h264", "h264_vaapi": "h264",
-					"libx265": "hevc", "libvpx-vp9": "vp9",
-				}[tt.encoder],
+				Mode:             ModeTranscode,
+				Deliverable:      true,
+				VideoAction:      ActionTranscode,
+				AudioAction:      ActionTranscode,
+				TargetVideoCodec: tt.codec,
 				TargetAudioCodec: "aac",
 			}, cfg)
 			if err != nil {
@@ -433,6 +442,15 @@ func TestBuildFFmpegArgs_PinsBrowserCompatiblePixelFormat(t *testing.T) {
 			}
 
 			joined := strings.Join(args, " ")
+			if tt.wantPixFmt == "" {
+				if strings.Contains(joined, "-pix_fmt") {
+					t.Errorf("VAAPI should not be given -pix_fmt; its filter pins the format:\n%s", joined)
+				}
+				if !strings.Contains(joined, "format=nv12,hwupload") {
+					t.Errorf("VAAPI has no upload filter, so it would receive software frames:\n%s", joined)
+				}
+				return
+			}
 			if !strings.Contains(joined, "-pix_fmt "+tt.wantPixFmt) {
 				t.Errorf("args do not pin -pix_fmt %s, so a 10-bit source would stay 10-bit:\n%s",
 					tt.wantPixFmt, joined)

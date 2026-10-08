@@ -25,7 +25,7 @@ served by the binary and plays both direct and segmented streams. Concretely:
 | REST API | Done. Libraries, entities, scanning, enrichment, playback, artwork, subtitles |
 | Capability negotiation | Done. Direct play / remux / transcode, with reasons |
 | Segmented streaming | Done. HLS via ffmpeg, passthrough or transcode |
-| Hardware acceleration | Verified at startup (QuickSync / VAAPI); software fallback |
+| Hardware acceleration | NVENC, QuickSync, VideoToolbox, VAAPI and AMF, each **verified by running it with the real options** at startup; rejected encoders report why; software fallback |
 | Subtitles | Done. Text tracks extracted to WebVTT, cached and served |
 | Observability | Done. The KPI registry is exposed in Prometheus format at `/metrics` |
 | Web UI | Three-column spatial layout, served by the binary; HLS via a vendored hls.js; player controls overlaid on the video (transport, seek, subtitles, volume, quality, fullscreen) |
@@ -117,13 +117,42 @@ looked for.
 
 ### Hardware acceleration
 
-A hardware encoder is used only after it has **proved it can encode**: at
-startup each candidate is run against a fraction of a second of test video, and
-one that cannot open a session is dropped from the reported capabilities. This
-matters because neither signal alone is trustworthy. `ffmpeg -encoders` lists
-what was *compiled in*, and a populated `/dev/dri` says nothing about the GPU
-vendor — an AMD machine exposes a device directory exactly as an Intel one does,
-so QuickSync can look available on a host where it can never work.
+Five families are supported, preferred in this order: **NVENC** (NVIDIA),
+**QuickSync** (Intel), **VideoToolbox** (Apple), **VAAPI** (AMD and Intel on
+Linux) and **AMF** (AMD). A machine with more than one — an NVIDIA card beside an
+Intel iGPU — reports all of them and uses the first that works.
+
+A hardware encoder is used only after it has **proved it can encode**: at startup
+each candidate is run against a fraction of a second of test video, with *the
+same options a real session would use*, and one that cannot open a session is
+dropped from the reported capabilities. Verifying with the real flags is the part
+that matters. An encoder can be compiled in, be listed, and still reject the
+options it is given, and a probe that tested something else would pass while
+playback failed.
+
+Neither signal on its own is trustworthy. `ffmpeg -encoders` lists what was
+*compiled in* — this project's own development machine lists NVENC, AMF,
+QuickSync and VAAPI and can use none of them. A populated `/dev/dri` says nothing
+about the GPU vendor either, since an AMD machine exposes a device directory
+exactly as an Intel one does.
+
+**When hardware transcoding does not happen**, the reason is reported rather than
+hidden. Startup logs a line per rejected encoder with ffmpeg's own complaint, and
+`GET /api/system/capabilities` carries the same thing:
+
+```console
+$ ./astraeus-server serve --db astraeus.db
+WARN hardware encoder rejected encoder=h264_nvenc reason="exit status 255: Cannot load libcuda.so.1"
+WARN hardware encoder rejected encoder=h264_qsv reason="exit status 171: Error creating a MFX session: -9."
+WARN no hardware encoder is usable on this host; transcoding will use the CPU rejected=12
+```
+
+That is the difference between a fixable driver problem and a mystery. A machine
+with an NVIDIA card and no driver does not look like a machine with no GPU.
+
+VAAPI additionally needs a DRM render node; one is located at startup and passed
+to both the probe and every session, before the input, because `hwupload` has no
+device to upload to without it.
 
 If a hardware encoder is chosen and still fails at runtime, the session is
 retried once in software and `astraeus_transcode_fallbacks_total` counts it,

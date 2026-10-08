@@ -3,14 +3,10 @@ package streaming
 import (
 	"context"
 	"fmt"
-	"io"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 )
 
 // PlaybackMode is how the server intends to deliver a MediaObject.
@@ -250,12 +246,23 @@ func clientSupportsVideo(capability ClientCapability, codec string) bool {
 // ServerCapability describes what this server can actually do: which encoders
 // exist and whether a hardware acceleration path is usable.
 type ServerCapability struct {
-	FFmpegAvailable      bool     `json:"ffmpeg_available"`
-	FFprobeAvailable     bool     `json:"ffprobe_available"`
-	HardwareAcceleration string   `json:"hardware_acceleration,omitempty"`
+	FFmpegAvailable  bool `json:"ffmpeg_available"`
+	FFprobeAvailable bool `json:"ffprobe_available"`
+	// HardwareAcceleration names the hardware encoder families this host can
+	// actually use, best first. A machine can have more than one - an Intel
+	// iGPU beside an NVIDIA card - so it is a list. Selection does not read it:
+	// EncoderFor reads VideoEncoders, which holds only what was verified, so a
+	// family cannot be offered that the hardware check rejected.
+	HardwareAcceleration []string `json:"hardware_acceleration,omitempty"`
 	VideoEncoders        []string `json:"video_encoders,omitempty"`
-	AudioEncoders        []string `json:"audio_encoders,omitempty"`
-	HLS                  bool     `json:"hls"`
+	// RenderNode is the DRM render node VAAPI needs, empty when there is none.
+	RenderNode string `json:"render_node,omitempty"`
+	// RejectedEncoders lists the hardware encoders ffmpeg offers but this host
+	// cannot use, with ffmpeg's own complaint. Without it, a machine with an
+	// unusable GPU looks identical to one with no GPU at all.
+	RejectedEncoders []EncoderRejection `json:"rejected_encoders,omitempty"`
+	AudioEncoders    []string           `json:"audio_encoders,omitempty"`
+	HLS              bool               `json:"hls"`
 }
 
 // encoderLineRe matches one line of `ffmpeg -encoders` output. Requiring an
@@ -307,151 +314,32 @@ func DetectServerCapability(ctx context.Context, ffmpegBin, ffprobeBin, deviceDi
 
 	// Software encoders are trusted once listed; hardware encoders have to
 	// prove themselves, because the failure mode of a wrong guess is that no
-	// transcode works at all.
+	// transcode works at all. The probe uses the same options a real session
+	// would, so a flag this build rejects is caught here.
 	compiled := ParseEncoders(stdout.String())
 	capability.AudioEncoders = audioEncodersOnly(compiled)
 
+	capability.RenderNode = firstRenderNode(deviceDir)
+	device := encoderDevice{RenderNode: capability.RenderNode}
+
 	for _, encoder := range videoEncodersOnly(compiled) {
-		if isHardwareEncoder(encoder) && !encoderWorks(ctx, ffmpegBin, encoder, deviceDir) {
+		if !isHardwareEncoder(encoder) {
+			capability.VideoEncoders = append(capability.VideoEncoders, encoder)
+			continue
+		}
+		if err := probeEncoder(ctx, ffmpegBin, encoder, device); err != nil {
+			capability.RejectedEncoders = append(capability.RejectedEncoders, EncoderRejection{
+				Encoder: encoder,
+				Reason:  err.Error(),
+			})
 			continue
 		}
 		capability.VideoEncoders = append(capability.VideoEncoders, encoder)
 	}
 
-	switch {
-	case containsFold(capability.VideoEncoders, "h264_qsv"),
-		containsFold(capability.VideoEncoders, "hevc_qsv"):
-		capability.HardwareAcceleration = "qsv"
-	case containsFold(capability.VideoEncoders, "h264_vaapi"),
-		containsFold(capability.VideoEncoders, "hevc_vaapi"):
-		capability.HardwareAcceleration = "vaapi"
-	}
+	capability.HardwareAcceleration = hardwareFamilies(capability.VideoEncoders)
 
 	return capability
-}
-
-// encoderTime out bounds a single capability probe.
-const encoderProbeTimeout = 20 * time.Second
-
-// encoderWorks encodes a fraction of a second to nowhere. A missing driver, an
-// unusable device or the wrong GPU vendor all fail here, which is exactly the
-// condition that matters.
-func encoderWorks(ctx context.Context, ffmpegBin, encoder, deviceDir string) bool {
-	probeCtx, cancel := context.WithTimeout(ctx, encoderProbeTimeout)
-	defer cancel()
-
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", "testsrc=size=320x240:rate=5:duration=0.2",
-	}
-
-	if strings.HasSuffix(encoder, "_vaapi") {
-		// VAAPI needs a render node pointed at explicitly.
-		device, ok := firstRenderNode(deviceDir)
-		if !ok {
-			return false
-		}
-		args = append(args, "-vaapi_device", device, "-vf", "format=nv12,hwupload")
-	}
-
-	args = append(args, "-c:v", encoder, "-f", "null", "-")
-
-	probe := exec.CommandContext(probeCtx, ffmpegBin, args...)
-	probe.Stdout = io.Discard
-	probe.Stderr = io.Discard
-	return probe.Run() == nil
-}
-
-// firstRenderNode finds a DRM render node, which is what VAAPI requires.
-func firstRenderNode(deviceDir string) (string, bool) {
-	entries, err := os.ReadDir(deviceDir)
-	if err != nil {
-		return "", false
-	}
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "renderD") {
-			return filepath.Join(deviceDir, entry.Name()), true
-		}
-	}
-	return "", false
-}
-
-// audioEncodersOnly keeps the audio encoders this project knows how to ask for.
-// Unlike the video encoders these are not proved by running one: an audio
-// encoder that is listed is reliable, and proving each would slow startup for
-// no real gain.
-func audioEncodersOnly(encoders []string) []string {
-	known := map[string]bool{
-		"aac": true, "libopus": true, "libmp3lame": true, "libvorbis": true,
-		"ac3": true, "eac3": true, "flac": true, "libfdk_aac": true,
-	}
-	kept := make([]string, 0, len(encoders))
-	for _, encoder := range encoders {
-		if known[encoder] {
-			kept = append(kept, encoder)
-		}
-	}
-	sort.Strings(kept)
-	return kept
-}
-
-// videoEncodersOnly keeps the encoders this project can actually target.
-func videoEncodersOnly(encoders []string) []string {
-	known := map[string]bool{
-		"h264_qsv": true, "hevc_qsv": true,
-		"h264_vaapi": true, "hevc_vaapi": true,
-		"libx264": true, "libx265": true,
-		"libvpx-vp9": true, "libaom-av1": true, "libsvtav1": true,
-	}
-	kept := make([]string, 0, len(encoders))
-	for _, encoder := range encoders {
-		if known[encoder] {
-			kept = append(kept, encoder)
-		}
-	}
-	return kept
-}
-
-// EncoderFor returns the ffmpeg encoder to use for a target codec, preferring
-// hardware acceleration when the host offers a usable path.
-//
-// Note that an encoder appearing in `ffmpeg -encoders` only means it was
-// compiled in; a working QuickSync or VAAPI path additionally requires the
-// device, which is what ServerCapability.HardwareAcceleration records.
-func EncoderFor(codec string, server ServerCapability) string {
-	codec = NormaliseVideoCodec(codec)
-
-	preferred := map[string][]string{
-		"h264": {"h264_qsv", "h264_vaapi", "libx264"},
-		"hevc": {"hevc_qsv", "hevc_vaapi", "libx265"},
-		"vp9":  {"libvpx-vp9"},
-		"av1":  {"libsvtav1", "libaom-av1"},
-	}[codec]
-
-	hardwareSuffix := map[string]string{
-		"qsv":   "_qsv",
-		"vaapi": "_vaapi",
-	}[server.HardwareAcceleration]
-
-	for _, candidate := range preferred {
-		if isHardwareEncoder(candidate) {
-			if hardwareSuffix == "" || !strings.HasSuffix(candidate, hardwareSuffix) {
-				continue
-			}
-		}
-		// Every candidate has to be one the host actually reported. A software
-		// encoder is not a safe assumption either: this build of ffmpeg may not
-		// have it, and claiming otherwise turns a 409 into a 500.
-		if !containsFold(server.VideoEncoders, candidate) {
-			continue
-		}
-		return candidate
-	}
-	return ""
-}
-
-func isHardwareEncoder(name string) bool {
-	return strings.HasSuffix(name, "_qsv") || strings.HasSuffix(name, "_vaapi")
 }
 
 // knownVideoCodecs and knownAudioCodecs are the vocabulary a client may declare.

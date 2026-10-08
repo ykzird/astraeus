@@ -103,7 +103,6 @@ Status as of the current build. Evidence for each claim is the test suite
   pinned to 8-bit, so a 10-bit BT.2020/PQ source is converted to SDR naively and
   looks washed out or dark. There is no tone mapping and no colour metadata, and
   a client that could handle HDR is not told the source has it.
-- Hardware encoders are QSV and VAAPI only — no NVENC, AMF or VideoToolbox.
 - Image-based subtitles (PGS, VobSub) are detected and reported but not
   delivered — that needs OCR or bitmap overlay support.
 - Multi-audio-track selection is not implemented; the first audio stream wins.
@@ -122,10 +121,16 @@ Status as of the current build. Evidence for each claim is the test suite
   a previous run are swept at startup.
 - Probe results are cached per path for the process lifetime; a file replaced
   underneath the server keeps its old technical metadata until restart.
-- Hardware encoders are verified only at startup, and only with a bare test
-  encode: a driver that works for 320x240 could still fail at 4K, which is what
-  the runtime software fallback is for. VAAPI needs a render node and could not
-  be exercised on this development host, since its `/dev/dri` is not visible.
+- NVENC, AMF and VideoToolbox are implemented but have never been run against
+  real hardware: the development host is an AMD machine with none of the three
+  reachable. What is on this host is covered by tests that simulate the
+  detection path with a stub ffmpeg, and the startup probe validates the options
+  on whatever machine actually runs it. VAAPI is in the same position - its
+  `/dev/dri` is not visible here - which is how it came to be built without the
+  `-vaapi_device` its upload filter needs.
+- Hardware encoders are verified only at startup, and only at one resolution: a
+  driver that works for 320x180 could still fail at 4K, which is what the runtime
+  software fallback is for.
 - The hls.js fatal-error recovery path and the native-HLS (Safari) branch are
   implemented but have not been observed firing — no Safari was available, and a
   stream failure could not be forced on a live server.
