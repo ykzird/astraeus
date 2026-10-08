@@ -98,6 +98,12 @@ jobs:
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
+      # gh has to know which repository it is releasing into, and it infers that
+      # from the git remote. Without a checkout this job has no repository and
+      # `gh release create` dies with "fatal: not a git repository" - which is
+      # what the first tagged release did. Nothing else here needs the source,
+      # so this checkout exists for gh's benefit.
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: dist
