@@ -35,8 +35,10 @@ cgo, no build step for the front end. `README.md` is the user-facing way in and
 design, and `TODO.md` for the honest state of what is missing.
 
 An adversarial review of the codebase, the competitive landscape and the front
-end lives in `docs/adversarial-review.md`, with the two raw reports in
-`docs/review/`. Those are point-in-time and say so.
+end — `docs/adversarial-review.md` and the two reports in `docs/review/` — is no
+longer in the tree. They were point-in-time records that named types the code no
+longer has, so they belong in history rather than in the map a newcomer reads;
+`git log -- docs/adversarial-review.md` still finds them.
 
 ---
 
@@ -607,6 +609,19 @@ on the clean VM as `cp: cannot stat 'README.md'` through `cp: cannot stat
 'deploy'`. `scripts/build-release.sh` now stages them and fails the build if a
 path the runbook names is missing, and CI asserts the same layout on every pull
 request; PR #8.
+
+**The archive was then narrowed and the reviews removed from the tree** (round 12,
+after PR #8). Shipping `docs/` whole was too blunt: it put `handoff.md` and two
+internal audits into an artifact that gets extracted onto a user's host. The
+archive now carries only the pages a reader of the installed README needs —
+`docs/index.md`, `docs/playback.md`, `docs/configuration.md`, `docs/api.md` and
+`docs/development.md` — and `build-release.sh` fails the build if one of the
+working documents is ever staged again. `docs/adversarial-review.md` and
+`docs/review/` were point-in-time records that named types the code no longer
+has, so they left the tree altogether and now live only in history; §1 and
+`docs/index.md` no longer link to them. The one cost is deliberate and recorded:
+the installed `README.md` links to `docs/handoff.md`, which stays repository-only,
+so that link resolves in a checkout and not in an installed tree.
 
 `v0.17.0` was then re-cut onto the fixed commit and the whole workflow is green.
 The GitHub Release exists with both archives and `checksums.txt` and generated
@@ -1233,8 +1248,6 @@ documentation without hardware to check them against.
   HDR. Failing is deliberate — a wrong picture delivered silently is worse — but
   the error arrives as `500 stream_start_failed`, which does not name the
   mis-tagging. Worth improving if it is ever seen in the wild.
-- **`docs/review/*` name types that no longer exist** (`library.SQLiteRepository`,
-  `MetadataProvider`). They are point-in-time records with headers saying so.
 
 ---
 
@@ -1314,8 +1327,8 @@ half of the point, because the runbook is what a user follows. Install the
   Debian 12.15 with the distribution's **ffmpeg 5.1.9**, a third data point for
   the filter chain beside the host's 9.0 and the image's 5.1.9;
 - `sha256sum -c checksums.txt` before extracting — and the archive must carry
-  `deploy/` and the documents, or the runbook cannot be followed at all (that was
-  a real defect; see §6);
+  `deploy/` and the five user-facing pages of `docs/`, or the runbook cannot be
+  followed at all (that was a real defect; see §6);
 - `systemd-analyze verify` (clean), then start it;
 - `curl -s localhost:8642/api/health`, **after** the port opens;
 - `systemd-analyze security astraeus` for the real score — **1.6 (OK)**, matching

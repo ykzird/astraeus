@@ -77,21 +77,38 @@ for platform in "${platforms[@]}"; do
 
 	# deploy/README.md's systemd runbook is written to be followed from an
 	# extracted archive: it installs the unit out of deploy/ and copies the
-	# project's documents into /usr/local/share/doc/astraeus. Every path it
-	# names therefore has to be in here, or the runbook fails on a host that
-	# has nothing but the release.
+	# documents into /usr/local/share/doc/astraeus. Every path it names has to be
+	# in here, or the runbook fails on a host that has nothing but the release.
 	cp README.md SPECIFICATION.md TODO.md CONTEXT.md CONTRIBUTING.md SECURITY.md "$stage/"
-	cp -R docs deploy "$stage/"
+	cp -R deploy "$stage/"
+
+	# Of docs/, ship only the pages a reader of the installed README needs to use
+	# the thing. The repository's own working documents - handoff.md, and the
+	# reviews - are about building it, not using it, and installing an internal
+	# audit onto a user's host is noise they did not ask for.
+	mkdir -p "$stage/docs"
+	cp docs/index.md docs/playback.md docs/configuration.md docs/api.md \
+		docs/development.md "$stage/docs/"
 
 	# That runbook is this layout's acceptance test, so run it here. A missing
 	# file is a broken release, and this is the last point at which the build
 	# can say so rather than a user on a clean machine.
 	for f in astraeus-server web README.md SPECIFICATION.md TODO.md CONTEXT.md \
-		CONTRIBUTING.md SECURITY.md LICENSE THIRD_PARTY_NOTICES.md docs deploy; do
+		CONTRIBUTING.md SECURITY.md LICENSE THIRD_PARTY_NOTICES.md deploy \
+		deploy/astraeus.service docs/index.md docs/playback.md \
+		docs/configuration.md docs/api.md docs/development.md; do
 		[[ -e "$stage/$f" ]] || {
-			echo "build-release: $f is missing from $name, so the systemd runbook in deploy/README.md cannot be followed from this archive" >&2
+			echo "build-release: $f is missing from $name, so the runbook in deploy/README.md cannot be followed from this archive" >&2
 			exit 1
 		}
+	done
+
+	# And the working documents must not travel with a release.
+	for f in docs/handoff.md docs/adversarial-review.md docs/review; do
+		if [[ -e "$stage/$f" ]]; then
+			echo "build-release: $f must not ship in $name" >&2
+			exit 1
+		fi
 	done
 
 	tar -C "$dist" -czf "$dist/$name.tar.gz" "$name"
