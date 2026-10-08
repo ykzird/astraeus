@@ -507,8 +507,9 @@ the unit tests, builds one archive per platform with
 generated notes, and pushes a multi-arch image — `linux/amd64` and `linux/arm64`
 in one manifest — to GHCR with build provenance and an SBOM attested alongside
 it. The workflow is thin on purpose: all of the work is in the script, which runs
-by hand, and that is how it was verified. The repository still has no remote, so
-neither workflow has executed on GitHub.
+by hand, and that is how it was verified. CI has since run on GitHub — and found
+the ladder defect described above — but the release workflow still has not,
+because no tag has been pushed.
 
 Two decisions shaped it. **The version had to stop being a constant.** It is now
 a variable set from the tag with `-ldflags "-X main.version=..."`, so `go build`
@@ -1014,9 +1015,12 @@ Priority order, with the reasoning. Take it top-down.
   `systemd-analyze verify` and `security`, but never *started*: the development
   host has no reachable systemd manager, so the hardening directives
   (`ProtectSystem=strict`, `ReadWritePaths`, the syscall filter) are reasoned
-  about rather than observed. **Neither workflow has executed on GitHub** — the
-  repository has no remote — though every step in both was run by hand here, and
-  the release build was run end to end (archives, checksums, the injected
+  about rather than observed. **CI runs on GitHub; the release workflow does
+  not yet.** Every step of both was run by hand here before the repository was
+  public, and CI has since proved itself by failing on the runner's ffmpeg where
+  this host passed (see the ladder defect above). No tag has been pushed, so the
+  GitHub Release and the GHCR push remain untested. The release build was run end
+  to end (archives, checksums, the injected
   version, the labels, a real multi-arch build). The arm64 image needed QEMU for
   the runtime layer's `apt-get`; `tonistiigi/binfmt --install arm64` registered it
   on this host, which is a kernel-level change this repository did not make and
