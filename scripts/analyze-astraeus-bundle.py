@@ -346,6 +346,9 @@ def analyze(bundle: Bundle) -> Report:
     metrics_body = bundle.read("metrics/prometheus.txt")
     metrics_table(bundle, report)
 
+    # ---- ffmpeg command line --------------------------------------------
+    ffmpeg_argv_section(bundle, report)
+
     # ---- findings --------------------------------------------------------
     findings_section(bundle, report, log_lines, metrics_body)
 
@@ -432,9 +435,7 @@ def hardware_verdict(bundle: Bundle, report: Report, log_lines: list[str]) -> di
             report.conclude(
                 f"no hardware encoder proved usable; the server is transcoding on the CPU "
                 f"(the log names {rejected_count} rejected families)")
-        report.caveat("hardware was offered every chance to fail here: a family that is "
-                      "rejected is rejected for a stated reason, so the reasons below are "
-                      "the evidence")
+
 
     if render_node:
         report.line(f"**Render node:** `{render_node}`")
@@ -511,25 +512,30 @@ def gpu_visibility(bundle: Bundle, report: Report, log_lines: list[str], hw: dic
                           body, re.S | re.M)
         return match.group(1) if match else ""
 
-    def section_has_node(section_name: str, device: str) -> bool:
+    def section_failed(section_name: str) -> bool:
+        """True when the section records an ls error rather than a listing."""
         text = section(section_name, dri_body)
-        if not text or "No such file" in text or "cannot access" in text:
-            return False
-        return re.search(rf"/dev/{device}\b", text) is not None
+        if not text.strip():
+            return True
+        return "No such file" in text or "cannot access" in text
 
-    dri_in_container = section_has_node("/dev/dri", r"dri/[a-z]")
-    nvidia_in_container = section_has_node("/dev/nvidia*", r"nvidia\d")
+    def section_has(section_name: str, pattern: str) -> bool:
+        return (not section_failed(section_name)
+                and re.search(pattern, section(section_name, dri_body)) is not None)
 
-    # `--gpus all` injects nodes through DeviceRequests and does *not* populate
-    # HostConfig.Devices, so testing Devices alone reports a false negative.
-    # A GPU that the probe actually accepted outranks every inspect field.
-    gpu_requested = (has_json_value(devices_raw) or has_json_value(requests_raw)
-                     or "nvidia" in runtime.lower()
-                     or any("nvenc" in e for e in hw.get("accepted", []))
-                     or any(e.lower().endswith("_nvenc") for e in hw.get("encoders", [])))
-    dri_requested = (has_json_value(devices_raw) or has_json_value(requests_raw)
-                     or "vaapi" in hw.get("accepted", [])
-                     or any(e.lower().endswith("_vaapi") for e in hw.get("encoders", [])))
+    # `/dev/dri` is a directory, so its check is for any entry inside it; the
+    # NVIDIA check is for a numbered device node.
+    dri_in_container = section_has("/dev/dri", r"/dev/dri/\S")
+    nvidia_in_container = section_has("/dev/nvidia*", r"/dev/nvidia\d")
+
+    # Whether a GPU was actually requested, as opposed to merely being present
+    # on the host. `--gpus all` populates DeviceRequests and leaves Devices
+    # empty; `--runtime=nvidia` does neither, so the runtime name is included.
+    gpu_explicitly_requested = (has_json_value(requests_raw)
+                                or "nvidia" in runtime.lower())
+    dri_explicitly_requested = has_json_value(devices_raw) or has_json_value(requests_raw)
+    gpu_accepted = (any("nvenc" in e for e in hw.get("accepted", []))
+                    or any(e.lower().endswith("_nvenc") for e in hw.get("encoders", [])))
 
     if host_nodes and not dri_in_container:
         report.line("> **The host has a render node that the container cannot see.** "
@@ -537,27 +543,31 @@ def gpu_visibility(bundle: Bundle, report: Report, log_lines: list[str], hw: dic
                     "whatever the host driver offers. This is the first thing to fix.")
         report.conclude("the container was not given `/dev/dri`, so VAAPI is unavailable "
                         "even though the host exposes a render node")
-    elif host_nodes and dri_in_container and not dri_requested:
+    elif host_nodes and dri_in_container and not dri_explicitly_requested:
         report.line("- The container can see `/dev/dri`, and VAAPI was neither accepted nor "
                     "offered — check the rejections above for the driver-level reason "
                     "(an Intel host needs `intel-media-va-driver` / `mesa-va-drivers` inside "
                     "the container, which the image does not ship).")
 
     if host_nvidia:
-        if not nvidia_in_container and not gpu_requested:
-            report.line("> **The host has an NVIDIA GPU and the container was not given it.** "
-                        "The image is Debian with no CUDA userspace, so NVENC needs both "
-                        "`--gpus all` (or `--runtime=nvidia`) and the driver libraries the "
-                        "container toolkit injects. Without them `h264_nvenc` cannot load "
-                        "`libnvidia-encode.so`.")
-            report.conclude("the container was not given the NVIDIA GPU (`--gpus all` / the "
-                            "NVIDIA runtime), so NVENC is unavailable")
-        elif not nvidia_in_container and gpu_requested:
+        if nvidia_in_container:
+            report.line("- The container can see NVIDIA device nodes, so the toolkit is "
+                        "configured. Read the NVENC rejection above for what ffmpeg said.")
+        elif gpu_explicitly_requested:
             report.line("> The container was configured for a GPU but no `/dev/nvidia*` node "
-                        "appears inside it. Re-run `nvidia-smi` inside the container; if that "
-                        "fails, the toolkit or the project's container config is the suspect.")
+                        "appears inside it. Run `nvidia-smi` inside the container; if that "
+                        "fails, the container toolkit or the `--gpus` argument is the suspect.")
             report.conclude("a GPU was requested but the device nodes are absent inside the "
                             "container; the NVIDIA container toolkit is the suspect")
+        else:
+            report.line("> **The host has an NVIDIA GPU and the container was never given "
+                        "it.** There is no `--gpus` request and no `--device /dev/nvidia*`, "
+                        "so NVENC cannot work however the image is built.")
+            report.conclude("the container was not given the NVIDIA GPU (no `--gpus` / "
+                            "`--runtime=nvidia`), so NVENC is unavailable")
+        if gpu_accepted:
+            report.line("- NVENC was nonetheless accepted by the probe, so the GPU is "
+                        "reaching ffmpeg some other way.")
 
     if not host_nodes and not host_nvidia:
         report.line("- The host itself reports no render node and no NVIDIA device, so no "
@@ -568,10 +578,10 @@ def gpu_visibility(bundle: Bundle, report: Report, log_lines: list[str], hw: dic
         report.line("- `nvidia-smi` is not on the host, so there is no NVIDIA driver "
                     "userspace for any container to be given.")
     if (host_nodes or host_nvidia) and not hw.get("accepted"):
-        report.caveat("the host has a GPU but no hardware encoder was accepted, so the "
-                      "rejections above are the evidence to read: each one is ffmpeg's own "
-                      "complaint about that specific device — which is exactly the "
-                      "never-before-measured claim in the review")
+        report.caveat("the host has a GPU but the probe accepted nothing, so the bundle "
+                      "answers *why it failed* rather than *whether hardware works*. The "
+                      "rejection table is the deliverable, and it is the first real-hardware "
+                      "evidence the project has")
     report.line()
 
 
@@ -676,6 +686,76 @@ def metrics_table(bundle: Bundle, report: Report) -> None:
     report.line()
 
 
+def ffmpeg_argv_section(bundle: Bundle, report: Report) -> None:
+    """The running ffmpeg command line is the strongest artifact in a bundle.
+
+    Reading the flags the server actually passed settles several review findings
+    that were previously only reasoned about, and it is only present if the
+    collection happened while a session was live.
+    """
+    body = bundle.read("inside/identity-and-data.txt") or ""
+    match = re.search(r"^== processes ==$(.*)", body, re.S | re.M)
+    if not match:
+        return
+    # `ps` output is `PID ARGS`; the /proc fallback is `PID ARGS` too.
+    argvs = [ln.strip() for ln in match.group(1).splitlines()
+             if re.search(r"(^|\s)ffmpeg\b", ln)]
+    report.line("## Running ffmpeg command line")
+    report.line()
+    if not argvs:
+        report.line("No ffmpeg process was running when the bundle was collected, so the "
+                    "arguments the server actually passed are not in evidence. Collect again "
+                    "while a transcode is live to capture them — this is the strongest single "
+                    "artifact for the streaming findings.")
+        report.line()
+        return
+
+    argv = argvs[0]
+    report.line("A session was live, and this is the command the server built:")
+    report.line()
+    report.line("```")
+    report.line(argv[:2000])
+    report.line("```")
+    report.line()
+
+    def has(flag: str) -> bool:
+        return re.search(rf"(^|\s){re.escape(flag)}(\s|$)", argv) is not None
+
+    def value_of(flag: str) -> str | None:
+        found = re.search(rf"(^|\s){re.escape(flag)}\s+(\S+)", argv)
+        return found.group(2) if found else None
+
+    encoder = value_of("-c:v")
+    # (finding, flag-present, what to say about it). Presence is reported as an
+    # observation, not a verdict: software and VAAPI are deliberately given no
+    # forced-IDR flag, and no encoder gets a bitrate target on a CRF path.
+    checks: list[tuple[str, bool, str]] = [
+        ("S-17", has("-protocol_whitelist"),
+         "`-protocol_whitelist` is present, which is the hardening the review could not "
+         "reproduce a risk for"),
+        ("S-15", has("-forced-idr") or has("-forced_idr"),
+         "forced-IDR: the spelling matters (NVENC `-forced-idr`, QSV/AMF `-forced_idr`), and "
+         "software/VAAPI are deliberately given none"),
+        ("S-1", has("-b:v") or has("-maxrate"),
+         "a bitrate target or ceiling is passed, which is what made the limit bite"),
+        ("S-5", not has("scale_vaapi") or has("hwupload"),
+         "no software compositor is being handed hardware frames"),
+    ]
+    if encoder:
+        checks.append(("encoder choice", True, f"the video encoder chosen was `{encoder}`"))
+
+    report.line("| finding | observation | note |")
+    report.line("| --- | --- | --- |")
+    for finding, observed, description in checks:
+        report.line(f"| **{finding}** | `{'present' if observed else 'absent'}` | {description} |")
+    report.line()
+    if encoder and encoder not in ("libx264", "libx265", "libvpx-vp9", "libsvtav1",
+                                   "libaom-av1", "libopus", "aac"):
+        report.conclude(f"the live session used the hardware encoder `{encoder}`, and its "
+                        "argument list is in the bundle")
+    report.line()
+
+
 def findings_section(bundle: Bundle, report: Report, log_lines: list[str],
                      metrics_body: str | None) -> None:
     report.line("## Review findings this bundle bears on")
@@ -688,21 +768,17 @@ def findings_section(bundle: Bundle, report: Report, log_lines: list[str],
             hits.append((finding, title, needle, matched[:3]))
 
     # A-4 is a metrics finding, not a log one: the HTTP method is taken straight
-    # from the request, so any method a client invents becomes its own series.
+    # from the request, so every method a client invents becomes its own series.
+    # Report the count as a fact and only call it a problem when the set is
+    # larger than the methods a browser and a client actually send.
     methods = {labels.get("method", "") for name, labels, _ in parse_prometheus_series(metrics_body)
                if name == "astraeus_http_requests_total"}
     if methods:
-        unusual = sorted(m for m in methods if m not in {"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"})
-        report.line(f"HTTP methods present in `astraeus_http_requests_total`: "
-                    f"{', '.join(f'`{m}`' for m in sorted(methods))}.")
-        if unusual:
-            report.line()
-            report.line(f"> **A-4 is live.** The label set contains "
-                        f"{', '.join(f'`{m}`' for m in unusual)}, which no browser sends. Each "
-                        "one is a permanent series in the registry — a client can grow the "
-                        "label set without bound.")
-            report.conclude("A-4 is reproducible on this instance: unusual HTTP methods are "
-                            "already in the `astraeus_http_requests_total` label set")
+        report.line(f"`astraeus_http_requests_total` currently carries "
+                    f"{len(methods)} distinct `method` label value(s): "
+                    f"{', '.join(f'`{m}`' for m in sorted(methods))}. "
+                    "Nothing bounds that set — a client that sends a novel method adds a "
+                    "permanent series (A-4).")
         report.line()
 
     if not hits:

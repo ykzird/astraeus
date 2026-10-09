@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -628,4 +629,74 @@ func TestEntitiesOfShowsLibraryExposeHierarchy(t *testing.T) {
 	if episode.Name != "S01E01 - Pilot" {
 		t.Errorf("episode name = %q, want S01E01 - Pilot", episode.Name)
 	}
+}
+
+// TestMetrics_MethodCardinalityIsBounded is the end-to-end version of A-4, and it
+// is the shape the review measured.
+//
+// Three hundred requests with invented methods took /metrics from a few lines to
+// 5,441, and five raw-socket requests with 100 KB methods took it to 9.3 MB.
+// Neither series is ever freed, so the cost is permanent for the life of the
+// process. The test drives the real handler and reads the real exposition.
+func TestMetrics_MethodCardinalityIsBounded(t *testing.T) {
+	t.Parallel()
+
+	env := newTestEnv(t)
+
+	// Distinct invented verbs, the same shape the review used.
+	for i := 0; i < 300; i++ {
+		method := "M" + strconv.Itoa(i)
+		request := httptest.NewRequest(method, "/api/libraries", nil)
+		env.server.Handler().ServeHTTP(httptest.NewRecorder(), request)
+	}
+
+	body := scrapeMetrics(t, env)
+
+	// One series for every invented verb, or none: the request counter must not
+	// carry their names.
+	for i := 0; i < 300; i++ {
+		if strings.Contains(body, `method="M`+strconv.Itoa(i)+`"`) {
+			t.Fatalf("the metrics carry a series for the invented method M%d, so a client "+
+				"can create series at will", i)
+		}
+	}
+	if !strings.Contains(body, `method="other"`) {
+		t.Error("no request was recorded as `other`, so the invented verbs were dropped " +
+			"rather than labelled")
+	}
+}
+
+// TestMetrics_LongMethodDoesNotBlowUpTheScrape covers the second measurement: a
+// hundred-kilobyte method must not become a hundred-kilobyte label.
+func TestMetrics_LongMethodDoesNotBlowUpTheScrape(t *testing.T) {
+	t.Parallel()
+
+	env := newTestEnv(t)
+
+	// Before: a scrape of the baseline.
+	baseline := len(scrapeMetrics(t, env))
+
+	request := httptest.NewRequest(strings.Repeat("A", 100_000), "/api/libraries", nil)
+	env.server.Handler().ServeHTTP(httptest.NewRecorder(), request)
+
+	body := scrapeMetrics(t, env)
+	growth := len(body) - baseline
+	// The label is bounded, so the growth is a line or two - not 100 KB per
+	// request. A generous ceiling still catches the failure by three orders of
+	// magnitude.
+	if growth > 4096 {
+		t.Errorf("one request with a 100 KB method grew the scrape by %d bytes; the method "+
+			"became a label", growth)
+	}
+}
+
+// scrapeMetrics reads the exposition the server serves.
+func scrapeMetrics(t *testing.T, env *testEnv) string {
+	t.Helper()
+
+	recorder := env.do(t, http.MethodGet, "/metrics", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET /metrics = %d, want 200", recorder.Code)
+	}
+	return recorder.Body.String()
 }

@@ -360,19 +360,28 @@ mkdir -p "$STAGE/logs"
 say "[1/7] logs"
 $DOCKER logs --timestamps "$CONTAINER_ID" >"$STAGE/logs/container-stdout-stderr.log" 2>&1
 LOG_LINES="$(wc -l <"$STAGE/logs/container-stdout-stderr.log" | tr -d ' ')"
-$DOCKER logs --timestamps --tail "$LOG_TAIL" "$CONTAINER_ID" >"$STAGE/logs/container-tail.log" 2>&1
-$DOCKER logs --timestamps --tail "$LOG_TAIL" "$CONTAINER_ID" 2>&1 \
-    | grep -iE 'level=(WARN|ERROR)|panic|fatal|error' >"$STAGE/logs/errors-warnings.log" 2>&1 || true
-$DOCKER logs --timestamps --tail "$LOG_TAIL" "$CONTAINER_ID" 2>&1 \
-    | grep -iE 'hardware encoder rejected|no hardware encoder|render_node|encoder performed|image_subtitles|ocr|tesseract' \
-    >"$STAGE/logs/hardware-and-ocr.log" 2>&1 || true
+FULL_LOG="$STAGE/logs/container-stdout-stderr.log"
+# Derive the filtered views from the full capture rather than asking the daemon
+# again: `docker logs --tail` without --timestamps drops the stamps, and the
+# filtered files are the ones a person actually reads.
+tail -n "$LOG_TAIL" "$FULL_LOG" >"$STAGE/logs/container-tail.log"
+grep -iE 'level=(WARN|ERROR)|panic|fatal|"error"| error=' "$FULL_LOG" \
+    >"$STAGE/logs/errors-warnings.log" 2>/dev/null || true
+grep -iE 'hardware encoder rejected|no hardware encoder|render_node|server capability|image_subtitles|ocr|tesseract|ffmpeg' "$FULL_LOG" \
+    >"$STAGE/logs/hardware-and-ocr.log" 2>/dev/null || true
+grep -iE 'http request' "$FULL_LOG" >"$STAGE/logs/http-requests.log" 2>/dev/null || true
 {
     printf 'total_lines=%s\n' "$LOG_LINES"
     printf 'tail_lines=%s\n' "$LOG_TAIL"
-    printf 'first_line=%s\n' "$(head -1 "$STAGE/logs/container-stdout-stderr.log")"
-    printf 'last_line=%s\n' "$(tail -1 "$STAGE/logs/container-stdout-stderr.log")"
-    printf 'error_lines=%s\n' "$(wc -l <"$STAGE/logs/errors-warnings.log" | tr -d ' ')"
+    printf 'first_line=%s\n' "$(head -1 "$FULL_LOG")"
+    printf 'last_line=%s\n' "$(tail -1 "$FULL_LOG")"
+    printf 'warn_error_lines=%s\n' "$(wc -l <"$STAGE/logs/errors-warnings.log" | tr -d ' ')"
+    printf 'http_request_lines=%s\n' "$(wc -l <"$STAGE/logs/http-requests.log" | tr -d ' ')"
 } >"$STAGE/logs/summary.txt"
+if [ "$LOG_LINES" -eq 0 ]; then
+    warn "the container log is empty. If the daemon uses the journald or a plugin \
+logging driver, \`docker logs\` cannot read it; collect it from that driver instead."
+fi
 note "$LOG_LINES lines captured"
 
 # --- 4. HTTP endpoints -------------------------------------------------------
@@ -421,7 +430,7 @@ run inside/ffmpeg-devices.txt "$DOCKER" exec "$CONTAINER_ID" sh -c \
     'echo "== /dev/dri =="; ls -l /dev/dri 2>&1; echo "== /dev/dri/by-path =="; ls -l /dev/dri/by-path 2>&1; echo "== /dev/nvidia* =="; ls -l /dev/nvidia* 2>&1; echo "== render nodes =="; ls /dev/dri/renderD* 2>&1; echo "== nvidia nodes =="; ls /dev/nvidia[0-9]* 2>&1'
 run inside/tesseract-version.txt "$DOCKER" exec "$CONTAINER_ID" tesseract --version
 run inside/identity-and-data.txt "$DOCKER" exec "$CONTAINER_ID" sh -c \
-    'id; echo "--- /data ---"; ls -la /data; echo "--- /data/streams ---"; ls -la /data/streams 2>/dev/null | head -50; echo "--- /data/subtitles ---"; ls -la /data/subtitles 2>/dev/null | head -50; echo "--- ffmpeg processes ---"; ps -eo pid,ppid,etime,pcpu,pmem,args 2>/dev/null | grep -E "ffmpeg|astraeus" | grep -v grep'
+    'id; echo "== /data =="; ls -la /data; echo "== /data/streams =="; ls -la /data/streams 2>/dev/null | head -50; echo "== /data/subtitles =="; ls -la /data/subtitles 2>/dev/null | head -50; echo "== processes =="; if command -v ps >/dev/null 2>&1; then ps -eo pid,ppid,etime,pcpu,pmem,args; else echo "ps is not installed; reading /proc instead"; for d in /proc/[0-9]*; do [ -r "$d/cmdline" ] || continue; printf "%s " "${d#/proc/}"; tr "\0" " " <"$d/cmdline"; echo; done; fi'
 run inside/cgroup-memory.txt "$DOCKER" exec "$CONTAINER_ID" sh -c \
     'cat /sys/fs/cgroup/memory.max 2>/dev/null; cat /sys/fs/cgroup/memory.current 2>/dev/null; cat /sys/fs/cgroup/cpu.max 2>/dev/null; nproc'
 

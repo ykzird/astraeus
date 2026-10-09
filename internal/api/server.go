@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ykzird/astraeus/internal/access"
+	"github.com/ykzird/astraeus/internal/httplabel"
 	"github.com/ykzird/astraeus/internal/images"
 	"github.com/ykzird/astraeus/internal/jobs"
 	"github.com/ykzird/astraeus/internal/library"
@@ -329,15 +330,23 @@ func (s *Server) withRequestLogging(next http.Handler) http.Handler {
 		next.ServeHTTP(recorder, r)
 		elapsed := time.Since(start)
 
+		// The method is normalised before it becomes a label. net/http accepts any
+		// token as a method, so recording r.Method verbatim let a client create one
+		// series per invented verb - 300 requests made /metrics 5,441 lines, and
+		// the series are never freed (A-4 of the 2026-10-09 review).
+		method := httplabel.Method(r.Method)
 		s.metrics.IncCounter("astraeus_http_requests_total",
-			"HTTP requests served, by method and status code.",
-			map[string]string{"method": r.Method, "status": strconv.Itoa(recorder.status)})
+			"HTTP requests served, by method and status code. An unrecognised method is recorded as \"other\".",
+			map[string]string{"method": method, "status": strconv.Itoa(recorder.status)})
 		s.metrics.ObserveHistogram("astraeus_http_request_seconds",
-			"HTTP request duration.",
+			"HTTP request duration, by method.",
 			elapsed.Seconds(),
-			map[string]string{"method": r.Method})
+			map[string]string{"method": method})
 
 		attrs := []any{
+			// The raw method, not the normalised label: a log line is read by a
+			// person and is not a series, so "which verb did they actually send"
+			// is the useful thing to keep.
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", recorder.status,
