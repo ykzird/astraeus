@@ -240,6 +240,29 @@ func (r *Runner) Submit(key string, work func(context.Context) (any, error)) (*J
 	}
 }
 
+// RunOnce runs work under a key, or joins the work already running for it.
+//
+// It is the shape a caller that does not care about job handles wants: run this
+// unless somebody already is. A pass that joined rather than ran returns
+// (nil, nil) - not an error, because nothing failed; another caller is simply
+// already doing the work. That is what lets a background loop and an API endpoint
+// share one answer without either knowing about the other.
+func (r *Runner) RunOnce(key string, work func() (any, error)) (any, error) {
+	job, isNew, err := r.Submit(key, func(context.Context) (any, error) {
+		return work()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !isNew {
+		// Already queued or running. Joining it and waiting would make this
+		// caller's pass as long as the other one's for no benefit, and the
+		// periodic loop would then be late for its next tick.
+		return nil, nil
+	}
+	return job.Wait().Value, job.Wait().Err
+}
+
 // Job returns a job by id, or nil.
 func (r *Runner) Job(id string) *Job {
 	r.mu.Lock()

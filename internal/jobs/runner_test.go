@@ -381,3 +381,93 @@ func containsText(haystack, needle string) bool {
 	}
 	return false
 }
+
+// TestRunner_RunOnceJoinsInsteadOfRepeating is the regression test for the
+// overlap half of A-B7.
+//
+// The background enrichment loop and the API both drive the same worker, so a
+// tick that lands while a manual pass is running must do nothing rather than
+// walk the same incomplete entities and call the metadata provider once more for
+// each. RunOnce is the shared answer: it runs the work or joins it, and a caller
+// that joined is told nothing happened rather than being made to wait.
+func TestRunner_RunOnceJoinsInsteadOfRepeating(t *testing.T) {
+	t.Parallel()
+
+	runner := New(context.Background(), Config{Workers: 1}, nil)
+	t.Cleanup(runner.Close)
+
+	var runs int32
+	release := make(chan struct{})
+	work := func() (any, error) {
+		atomic.AddInt32(&runs, 1)
+		<-release
+		return "pass complete", nil
+	}
+
+	// The first caller runs it. RunOnce waits, so it has to be in a goroutine.
+	done := make(chan struct{})
+	var firstValue any
+	var firstErr error
+	go func() {
+		defer close(done)
+		firstValue, firstErr = runner.RunOnce("enrich:all", work)
+	}()
+
+	waitFor(t, "the first pass to start", func() bool {
+		return atomic.LoadInt32(&runs) == 1
+	})
+
+	// The loop ticks while it is in flight. It must join rather than queue a
+	// second pass and wait for its turn on the same worker - which is what makes
+	// a completed background pass able to queue a re-run before its predecessor
+	// has released the worker. `value` is nil because a joining caller did not
+	// run the work, so there is no result of its own to report.
+	value, err := runner.RunOnce("enrich:all", work)
+	if err != nil {
+		t.Errorf("joining an in-flight pass = %v, want no error: nothing failed", err)
+	}
+	if value != nil {
+		t.Errorf("joining an in-flight pass returned a result, want none: it did not run")
+	}
+
+	close(release)
+	<-done
+	if firstErr != nil {
+		t.Fatalf("the first pass failed: %v", firstErr)
+	}
+	if firstValue != "pass complete" {
+		t.Errorf("the pass that ran returned %v", firstValue)
+	}
+	if got := atomic.LoadInt32(&runs); got != 1 {
+		t.Errorf("the work ran %d times, want 1: a tick during a manual pass must do nothing", got)
+	}
+}
+
+// TestRunner_RunOnceRunsAgainAfterCompletion guards the other direction: the
+// guard must not be a one-shot latch, or the periodic loop would enrich once and
+// never again.
+func TestRunner_RunOnceRunsAgainAfterCompletion(t *testing.T) {
+	t.Parallel()
+
+	runner := New(context.Background(), Config{Workers: 1}, nil)
+	t.Cleanup(runner.Close)
+
+	var runs int32
+	work := func() (any, error) {
+		atomic.AddInt32(&runs, 1)
+		return "ok", nil
+	}
+
+	for i := 0; i < 3; i++ {
+		value, err := runner.RunOnce("enrich:all", work)
+		if err != nil {
+			t.Fatalf("pass %d: %v", i, err)
+		}
+		if value != "ok" {
+			t.Fatalf("pass %d returned %v, want the work's value", i, value)
+		}
+	}
+	if got := atomic.LoadInt32(&runs); got != 3 {
+		t.Errorf("sequential passes ran %d times, want 3", got)
+	}
+}

@@ -381,10 +381,28 @@ func runServe(args []string) error {
 			"default", map[bool]string{true: "all", false: "none"}[policy.DefaultAll()])
 	}
 
+	// Long work runs on a runner rather than inside the request that asked for
+	// it. It descends from the signal context, so a shutdown cancels the jobs
+	// while a client going away does not - which is the difference the review's
+	// W-2 turns on: the UI's fifteen-second timeout used to end the scan. The
+	// background loops use it too, so a manual pass and a periodic one cannot
+	// overlap.
+	runner := jobs.New(ctx, jobs.Config{}, app.logger)
+	defer runner.Close()
+
+	// One worker, not two. This used to build a second metadata.Worker for the
+	// background loop while the API kept the one env.open made, so an enrichment
+	// pass driven from the API and a periodic one could overlap: both walked the
+	// same incomplete entities and both called the provider, which is a wasted
+	// lookup per entity against a rate-limited API (A-B7 of the 2026-10-09
+	// review). app.worker is the one the API submits to, so it is the one the
+	// loop drives.
 	if *enrichInterval > 0 {
-		worker := metadata.NewWorker(app.repo, app.provider, *enrichInterval, app.logger)
-		worker.SetMetrics(metrics)
-		go worker.Start(ctx)
+		// The loop defers to the same key the API uses, so a tick that lands
+		// while a manual enrich is running does nothing rather than repeating
+		// every provider lookup.
+		app.worker.SetDedupe(runner)
+		go app.worker.Start(ctx)
 	}
 
 	// Periodic scanning is what makes files appear without anyone asking; the
@@ -392,13 +410,6 @@ func runServe(args []string) error {
 	scheduler := library.NewScanScheduler(app.repo, app.scanner, *scanInterval, app.logger)
 	scheduler.SetMetrics(metrics)
 	go scheduler.Start(ctx)
-
-	// Long work runs on a runner rather than inside the request that asked for
-	// it. It descends from the signal context, so a shutdown cancels the jobs
-	// while a client going away does not - which is the difference the review's
-	// W-2 turns on: the UI's fifteen-second timeout used to end the scan.
-	runner := jobs.New(ctx, jobs.Config{}, app.logger)
-	defer runner.Close()
 
 	deps := api.Deps{
 		Repository:  app.repo,
