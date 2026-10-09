@@ -21,6 +21,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,13 +41,13 @@ const ocrPageSegmentation = "6"
 const ocrMergeWindow = 40 * time.Millisecond
 
 // OCRSupportsCodec reports whether this OCR path can read a given image
-// subtitle codec. Only HDMV PGS is implemented: it is the format the parser
-// decodes and the one this project can build a fixture for. VobSub
-// (dvd_subtitle) is also a bitmap format, but it lives in a different
-// container with a different palette, so it stays burn-only rather than being
-// advertised and then failing when the extractor rejects it.
+// subtitle codec. Two are implemented: HDMV PGS, the format the PGS parser
+// decodes, and VobSub (dvd_subtitle), whose picture stream and container
+// palette the VobSub parser decodes. DVB subtitles are still burn-only: their
+// palette and composition live in the stream itself, and no decoder for them
+// has been written, so advertising one would fail inside the extractor.
 func OCRSupportsCodec(codec string) bool {
-	return strings.EqualFold(codec, "hdmv_pgs_subtitle")
+	return strings.EqualFold(codec, "hdmv_pgs_subtitle") || strings.EqualFold(codec, "dvd_subtitle")
 }
 
 // OCRReady reports whether the OCR engine is present. A caller uses it to
@@ -106,17 +107,42 @@ func (s *Service) ocrExtract(ctx context.Context, mediaPath string, trackIndex i
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
-	supPath, cleanup, err := s.extractPGSStream(ctx, mediaPath, trackIndex)
+	codec, ordinal, err := s.imageSubtitleCodec(ctx, mediaPath, trackIndex)
 	if err != nil {
 		return err
 	}
+
+	// Two formats, two extractions and two decoders. Each extraction knows
+	// where its format keeps the palette: PGS carries it in the stream, so the
+	// stream alone is enough, while VobSub keeps it in the container, so the
+	// extraction has to keep a container that has one and hand the palette on.
+	var (
+		path    string
+		palette string
+		decode  func(io.Reader) ([]ImageCue, error) = ParsePGS
+		cleanup func()
+	)
+	if strings.EqualFold(codec, "dvd_subtitle") {
+		extracted, err := s.extractVobSubStream(ctx, mediaPath, ordinal)
+		if err != nil {
+			return err
+		}
+		path, palette, cleanup = extracted.path, extracted.palette, extracted.cleanup
+		decode = func(r io.Reader) ([]ImageCue, error) { return ParseVobSub(r, palette) }
+	} else {
+		supPath, remove, err := s.extractPGSStream(ctx, mediaPath, trackIndex)
+		if err != nil {
+			return err
+		}
+		path, cleanup = supPath, remove
+	}
 	defer cleanup()
 
-	file, err := os.Open(supPath)
+	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening the extracted image subtitle stream: %w", err)
 	}
-	cues, parseErr := ParsePGS(file)
+	cues, parseErr := decode(file)
 	closeErr := file.Close()
 	if parseErr != nil {
 		return fmt.Errorf("decoding image subtitle track %d of %s: %w", trackIndex, mediaPath, parseErr)
@@ -164,6 +190,44 @@ func (s *Service) ocrExtract(ctx context.Context, mediaPath string, trackIndex i
 	s.logger.InfoContext(ctx, "recognised image subtitle track",
 		"track", trackIndex, "cues", len(recognised), "source", filepath.Base(mediaPath))
 	return nil
+}
+
+// imageSubtitleCodec reports the codec of the subtitle track the caller asked
+// about, so the extraction knows which container handling it needs.
+//
+// The caller names the track by its global stream index, which is what ffprobe
+// reports as `index` and what an ffmpeg `-map 0:N` takes. ffprobe's own `s:N`
+// selector counts only subtitle streams, so that ordinal is returned too: a
+// file with video and audio numbers its subtitle streams from zero and the two
+// numbers differ immediately.
+func (s *Service) imageSubtitleCodec(ctx context.Context, mediaPath string, trackIndex int) (string, int, error) {
+	cmd := exec.CommandContext(ctx, s.ffprobeBin,
+		"-v", "error",
+		"-select_streams", "s",
+		"-show_entries", "stream=index,codec_name",
+		"-of", "csv=p=0",
+		mediaPath,
+	)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", 0, fmt.Errorf("identifying subtitle track %d of %s: %w", trackIndex, mediaPath, err)
+	}
+	ordinal := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Split(strings.TrimSpace(line), ",")
+		if len(fields) < 2 {
+			continue
+		}
+		index, convErr := strconv.Atoi(fields[0])
+		if convErr != nil {
+			continue
+		}
+		if index == trackIndex {
+			return fields[1], ordinal, nil
+		}
+		ordinal++
+	}
+	return "", 0, fmt.Errorf("%w: %s has no subtitle track %d", ErrNoCues, mediaPath, trackIndex)
 }
 
 // extractPGSStream copies the chosen subtitle stream out of the media file into

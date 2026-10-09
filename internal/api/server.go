@@ -1266,10 +1266,10 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !track.Text {
-			// An image track needs OCR to become text, and the reader only
-			// understands PGS. Anything else - no engine installed, or VobSub,
-			// which it cannot read - keeps the explicit 415 naming the format
-			// rather than failing inside the extractor.
+			// An image track needs OCR to become text, and the reader has a
+			// decoder for PGS and for VobSub. Anything else - no engine
+			// installed, or a codec with no decoder - keeps the explicit 415
+			// naming the format rather than failing inside the extractor.
 			if !s.subtitles.OCRReady() {
 				writeError(w, http.StatusUnsupportedMediaType, "subtitle_format_unsupported",
 					"subtitle track "+indexPart+" is image-based ("+track.Codec+
@@ -1279,7 +1279,7 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 			if !subtitles.OCRSupportsCodec(track.Codec) {
 				writeError(w, http.StatusUnsupportedMediaType, "subtitle_format_unsupported",
 					"subtitle track "+indexPart+" is image-based ("+track.Codec+
-						") and the OCR reader only understands PGS ("+track.Codec+" is burn-only)")
+						") and the OCR reader has no decoder for it ("+track.Codec+" is burn-only)")
 				return
 			}
 			imageBased = true

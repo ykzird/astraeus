@@ -331,19 +331,24 @@ Image-based subtitles (PGS, VobSub) carry pictures rather than text, and a
 browser has no way to render a timed bitmap. Two delivery paths exist, and the
 server offers the better one it can actually perform.
 
-**OCR, for PGS, when an engine is installed.** `internal/subtitles` decodes the
-HDMV PGS stream (PCS/ODS/PDS segments, run-length-encoded objects, the YCbCr
-palette) into bitmaps, renders each cue as dark glyphs on a white page, and hands
-it to `tesseract`, whose output becomes the WebVTT body. The resulting track is
-delivered, cached and served exactly like a text track, so it can be toggled,
-restyled and searched and costs a fetch rather than a re-encode. The OCR engine
-is an **optional runtime dependency**: when it is absent the server keeps the
-previous behaviour - no URL is advertised for an image track and the endpoint
-answers `415 subtitle_format_unsupported` - rather than failing. The reader
-covers PGS only; VobSub and DVB subtitles live in different containers with
-different palettes and stay burn-only, and the refusal names the format rather
-than failing inside the extractor. `subtitle_ocr_enabled` in
-`/api/system/capabilities` reports the host's answer.
+**OCR, for PGS and VobSub, when an engine is installed.** `internal/subtitles`
+decodes an image stream into bitmaps, renders each cue as dark glyphs on a white
+page, and hands it to `tesseract`, whose output becomes the WebVTT body. The
+resulting track is delivered, cached and served exactly like a text track, so it
+can be toggled, restyled and searched and costs a fetch rather than a re-encode.
+The OCR engine is an **optional runtime dependency**: when it is absent the
+server keeps the previous behaviour - no URL is advertised for an image track and
+the endpoint answers `415 subtitle_format_unsupported` - rather than failing.
+Two decoders exist. The PGS one reads the HDMV segments (PCS/ODS/PDS,
+run-length-encoded objects, the YCbCr palette) from a raw `.sup`. The VobSub one
+reads a `dvd_subtitle` track's control sequence, two interleaved run-length
+fields and its container's palette: because that palette lives outside the
+picture stream - in Matroska's codec private, or a `.idx` sidecar - the
+extraction keeps a container that carries one, and a bare MPEG-PS source with no
+palette is refused rather than rendered blank. DVB subtitles have no decoder and
+stay burn-only; the refusal names the format rather than failing inside the
+extractor. `subtitle_ocr_enabled` in `/api/system/capabilities` reports the
+host's answer.
 
 **Burn-in, as the fallback.** A client asks for it with `burn_subtitle_index` on
 the playback request; the decision then reports `burned_subtitle_index`, forces a

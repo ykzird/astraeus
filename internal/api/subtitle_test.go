@@ -285,16 +285,30 @@ func vobsubInfo() *streaming.MediaInfo {
 	}
 }
 
-// TestSubtitleEndpoint_KeepsVobSubBurnOnly pins the boundary of the OCR work:
-// the reader decodes PGS, so a VobSub track must keep the old 415 and stay
-// without a URL even when an OCR engine is installed. Advertising it and then
-// failing inside the extractor would be worse than not offering it.
-func TestSubtitleEndpoint_KeepsVobSubBurnOnly(t *testing.T) {
+// dvbInfo is a media file whose only subtitle track is a DVB image track, a
+// format the reader has no decoder for.
+func dvbInfo() *streaming.MediaInfo {
+	return &streaming.MediaInfo{
+		Container:  "mpegts",
+		VideoCodec: "h264",
+		AudioCodec: "aac",
+		Subtitles: []streaming.SubtitleTrack{
+			{Index: 2, Codec: "dvb_subtitle", Language: "en", Text: false},
+		},
+	}
+}
+
+// TestSubtitleEndpoint_KeepsUndecodableImageTracksBurnOnly pins the boundary of
+// the OCR work: the reader decodes PGS and VobSub, so a DVB track must keep the
+// old 415 and stay without a URL even when an OCR engine is installed.
+// Advertising it and then failing inside the extractor would be worse than not
+// offering it.
+func TestSubtitleEndpoint_KeepsUndecodableImageTracksBurnOnly(t *testing.T) {
 	t.Parallel()
 
 	converter := &fakeConverter{ocrReady: true}
 	env := newTestEnv(t,
-		withProber(stubProber{info: vobsubInfo()}),
+		withProber(stubProber{info: dvbInfo()}),
 		withStreams(&fakeStreams{}),
 		withSubtitles(converter))
 	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "bytes")
@@ -305,7 +319,7 @@ func TestSubtitleEndpoint_KeepsVobSubBurnOnly(t *testing.T) {
 		t.Fatalf("got %d subtitle tracks, want 1", len(response.Subtitles))
 	}
 	if response.Subtitles[0].URL != "" {
-		t.Errorf("VobSub track url = %q, want it withheld as burn-only", response.Subtitles[0].URL)
+		t.Errorf("DVB track url = %q, want it withheld as burn-only", response.Subtitles[0].URL)
 	}
 
 	objects, err := env.repo.GetObjectsByEntity(context.Background(), entity.ID)
@@ -321,6 +335,83 @@ func TestSubtitleEndpoint_KeepsVobSubBurnOnly(t *testing.T) {
 	}
 	if converter.lastImageTrack != 0 {
 		t.Error("OCR must not be attempted for a codec the reader cannot decode")
+	}
+}
+
+// TestSubtitleEndpoint_OCRsVobSubTracks covers the second image-subtitle reader:
+// a VobSub track is offered as an ordinary text track and served through the
+// same OCR entry point as PGS, rather than kept burn-only.
+func TestSubtitleEndpoint_OCRsVobSubTracks(t *testing.T) {
+	t.Parallel()
+
+	converter := &fakeConverter{ocrReady: true}
+	env := newTestEnv(t,
+		withProber(stubProber{info: vobsubInfo()}),
+		withStreams(&fakeStreams{}),
+		withSubtitles(converter))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "bytes")
+
+	recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback", "")
+	response := decodeBody[playbackResponse](t, recorder)
+	if len(response.Subtitles) != 1 {
+		t.Fatalf("got %d subtitle tracks, want 1", len(response.Subtitles))
+	}
+	if response.Subtitles[0].Text {
+		t.Error("a VobSub track must stay text: false even when OCR can read it")
+	}
+	want := "/api/objects/" + response.ObjectID + "/subtitles/2.vtt"
+	if response.Subtitles[0].URL != want {
+		t.Errorf("VobSub track url = %q, want %q", response.Subtitles[0].URL, want)
+	}
+
+	objects, err := env.repo.GetObjectsByEntity(context.Background(), entity.ID)
+	if err != nil {
+		t.Fatalf("getting objects: %v", err)
+	}
+	recorder = env.do(t, http.MethodGet, "/api/objects/"+objects[0].ID+"/subtitles/2.vtt", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	if converter.lastImageTrack != 2 {
+		t.Errorf("OCR ran for track %d, want 2", converter.lastImageTrack)
+	}
+	if converter.lastTrack != 0 {
+		t.Error("the text extractor must not be used for an image track")
+	}
+}
+
+// TestSubtitleEndpoint_KeepsVobSubBurnOnlyWithoutAnEngine is the other half of
+// the optional-dependency rule the PGS path already pins: a VobSub track the
+// server could read is still a burn-in when no OCR engine is installed.
+func TestSubtitleEndpoint_KeepsVobSubBurnOnlyWithoutAnEngine(t *testing.T) {
+	t.Parallel()
+
+	converter := &fakeConverter{}
+	env := newTestEnv(t,
+		withProber(stubProber{info: vobsubInfo()}),
+		withStreams(&fakeStreams{}),
+		withSubtitles(converter))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "bytes")
+
+	recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback", "")
+	response := decodeBody[playbackResponse](t, recorder)
+	if len(response.Subtitles) != 1 {
+		t.Fatalf("got %d subtitle tracks, want 1", len(response.Subtitles))
+	}
+	if response.Subtitles[0].URL != "" {
+		t.Errorf("VobSub track url = %q without an OCR engine, want it withheld", response.Subtitles[0].URL)
+	}
+
+	objects, err := env.repo.GetObjectsByEntity(context.Background(), entity.ID)
+	if err != nil {
+		t.Fatalf("getting objects: %v", err)
+	}
+	recorder = env.do(t, http.MethodGet, "/api/objects/"+objects[0].ID+"/subtitles/2.vtt", "")
+	if recorder.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	if converter.lastImageTrack != 0 {
+		t.Error("conversion must not be attempted without an OCR engine")
 	}
 }
 

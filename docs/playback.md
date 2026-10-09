@@ -268,14 +268,23 @@ carry pictures rather than text, so no browser can render one as a subtitle
 track. There are two ways to show one, and the server chooses the better one it
 can actually do.
 
-**OCR reads PGS into text.** When `tesseract` is installed (that is, when
-`subtitle_ocr_enabled` is true), an image track is advertised with a URL like a
-text track and served as WebVTT: the subtitle stream is demuxed with ffmpeg, the
-PGS bitmaps are decoded by `internal/subtitles`, each cue's picture is turned
+**OCR reads PGS and VobSub into text.** When `tesseract` is installed (that is,
+when `subtitle_ocr_enabled` is true), an image track is advertised with a URL like
+a text track and served as WebVTT: the subtitle stream is demuxed with ffmpeg,
+its bitmaps are decoded by `internal/subtitles`, each cue's picture is turned
 into dark glyphs on a white page, and tesseract returns the words. The result is
 an ordinary `<track>` — the viewer can toggle it, restyle it and search it, and
 switching it on costs nothing but a fetch. That is the whole point: a burn can do
 none of those things.
+
+The two readers differ in where a track keeps its palette. PGS carries its own
+inside the picture stream, so its extraction is a raw `.sup`. A VobSub track does
+not: the palette lives in the container, as the `size:`/`palette:` text of a
+`.idx` sidecar, or the same text in Matroska's codec private. A Matroska source
+is therefore kept as Matroska — its subtitle stream is copied into a standalone
+Matroska file and the palette travels with it — and any other source is demuxed
+into raw SPU packets with the codec private read out beside them, because an
+image-only copy would drop the palette and leave nothing to render.
 
 The runtime dependency is treated as optional, not assumed. Without tesseract the
 server does not fail: it logs that image subtitles will be burned in, withholds
@@ -300,10 +309,16 @@ subtitle stream in the same graph does not deliver subtitle frames.
 
 What OCR covers, honestly:
 
-- **PGS only.** The reader is an HDMV PGS decoder. VobSub (`dvd_subtitle`) and
-  DVB subtitles are different containers with different palettes; they keep the
-  `415` refusal and are offered as a burn, rather than being advertised and then
-  failing inside the extractor. The message names the format.
+- **PGS and VobSub, not DVB.** Two decoders exist: HDMV PGS, and VobSub
+  (`dvd_subtitle`), whose control sequence, run-length fields and container
+  palette are decoded by `internal/subtitles`. DVB subtitles are still
+  burn-only: their palette and composition live in the stream and no decoder for
+  them has been written, so they keep the `415` refusal and are offered as a
+  burn rather than being advertised and then failing inside the extractor. The
+  message names the format.
+- **VobSub needs a container that carries the palette.** A bare MPEG-PS stream
+  has none, and the extraction says so rather than rendering every pixel
+  transparent; a disc rip's `.idx` sidecar is the ordinary source of one.
 - **It is OCR, so it can be wrong.** Recognition of a small or unusual font can
   misread a word, and a picture that is not text can be read as some. The
   fixtures are sized so the recogniser reads them exactly; a real disc's subtitles

@@ -1,12 +1,13 @@
 # Handoff
 
-**As of the round-17 work of 2026-10-09 — a VobSub fixture, and the end of a
-blocker. 145 tracked files; `v0.17.0` and `v0.18.0` are released, so the in-tree
-version is `dev` and the next tag would be `v0.18.1`.** (`git log` names the
-commits. Round 17 disproved the note that had been blocking the VobSub reader
-for two rounds: ffmpeg cannot *mux* VobSub, but it can *encode* it, so the
-project's PGS fixture re-encodes into a real sample that ffmpeg decodes and
-tesseract reads (§7). Round 16 added
+**As of the round-18 work of 2026-10-09 — the VobSub reader. 149 tracked files;
+`v0.17.0` and `v0.18.0` are released, so the in-tree version is `dev` and the
+next tag would be `v0.18.1`.** (`git log` names the commits. Round 17 disproved
+the note that had been blocking the VobSub reader for two rounds: ffmpeg cannot
+*mux* VobSub, but it can *encode* it, so the project's PGS fixture re-encodes
+into a real sample that ffmpeg decodes and tesseract reads. Round 18 wrote the
+decoder and the routing, so a `dvd_subtitle` track is now offered as text
+instead of burn-only (§6). Round 16 added
 `--access-policy`, which turns the gate from "may this request in" into "what may
 it see" (§6). Round 15 added `deploy/tls/` and ran it: Caddy terminating
 TLS, a client certificate as the viewer's identity, and the trust boundary the
@@ -180,12 +181,15 @@ mise exec -- go test -v -run 'PerViewer|LocalOne|WidensProgress|UngatedServer|Fi
 mise exec -- go test -tags=integration -run BurnIn -v ./internal/streaming/
 mise exec -- go test -run 'BurnsAnImageSubtitle|DoesNotBurnATextSubtitle|BurnIndexThatDoesNotExist' ./internal/streaming/ ./internal/api/
 
-# OCR for PGS. The parser is unit-tested against a generated fixture, pixel for
-# pixel; the OCR path is integration-tagged and asserts the *words*, through real
-# ffmpeg and a real tesseract - it skips when tesseract is absent, and a separate
-# always-run unit test pins the refusal that an install without it keeps. The API
-# routing (image track -> ConvertImage, VobSub stays burn-only) is unit-tested.
-mise exec -- go test -count=1 -run 'ParsePGS|OCR|ConvertImage' ./internal/subtitles/
+# OCR for PGS *and* VobSub. Both parsers are unit-tested against committed
+# fixtures; the VobSub fixture is decoded from a Matroska container, so that test
+# needs no ffmpeg at all. The OCR path is integration-tagged and asserts the
+# *words*, through real ffmpeg and a real tesseract - it skips when tesseract is
+# absent, and separate always-run unit tests pin the refusal that an install
+# without it keeps and the routing (image track -> ConvertImage, DVB -> 415).
+# The VobSub fixture is regenerated with scripts/make-vobsub-fixture.sh; its
+# decoder was checked against ffmpeg's own decode, pixel for pixel.
+mise exec -- go test -count=1 -run 'ParsePGS|ParseVobSub|OCR|ConvertImage' ./internal/subtitles/
 mise exec -- go test -tags=integration -run OCR -v ./internal/subtitles/
 mise exec -- go test -run 'SubtitleEndpoint|AdvertisesImageTrack' ./internal/api/
 # And the whole path against a running server: an image track is advertised with
@@ -902,6 +906,45 @@ fixture never reached. The glyph size is chosen for the recogniser rather than t
 eye (capitals about 28 pixels tall); at twice that the blocky font read "ASTRAEUS"
 as "ASTRAELS".
 
+**The second bitmap-subtitle reader, for VobSub, landed in round 18**, which
+finishes what round 17 unblocked. `internal/subtitles` gained `vobsub.go`: a
+decoder that walks a packet's control sequence (palette selection, display
+rectangle, the two bitmap offsets), expands the run-length data as the two
+interleaved fields the format uses — the first field's runs carry the even lines
+and the second's the odd ones — and applies the container's palette into an
+`*image.RGBA`, which is the same shape the PGS decoder produces and therefore
+feeds the same OCR path. `matroska.go` is a small EBML reader, enough to reach a
+track's codec private and its blocks, so the committed fixture can be proved
+without ffmpeg.
+
+Three things carried the work, and the first is the one worth remembering.
+**The decoder was checked against ffmpeg's own decode, not against reasoning.**
+A tiny C program linked against `libavcodec` decoded the same packet, and the
+Go decoder's output was compared against ffmpeg's rendered frame pixel for
+pixel (3440 ink pixels, 332x28); the RLE nibble order and the rectangle's
+packed coordinates were both got wrong first and corrected from that comparison.
+**The palette is in the container, not the picture stream**, so the extraction
+keeps a container that has one: a Matroska source is copied into a standalone
+Matroska file and its codec private travels with it, while any other source is
+demuxed into raw SPU packets with the codec private read out beside them. A bare
+MPEG-PS sample carries no palette and is refused rather than rendered blank.
+**A single never-cleared cue needs a duration.** A VobSub track clears the screen
+with a separate erase packet, and a one-cue sample has none, so the open cue
+ended at its own start — and an empty cue is dropped as though it had never been
+drawn. It now gets a placeholder duration, which a real rip's erase packet never
+exercises.
+
+Verified at the artefact level. The unit test decodes the committed fixture and
+asserts the geometry and the ink count, and a second pins the field interleave by
+decoding each field on its own and checking the interleaved result row by row.
+An integration test re-encodes the PGS fixture with ffmpeg's `dvdsub` encoder and
+runs the whole pipeline — the extraction, the decoder, the render and a real
+tesseract — asserting the exact caption `"ASTRAEUS MEDIA"`, which the fixture's
+glyph size at its native 640x360 makes reliable. The API routing is pinned both
+ways: a VobSub track is advertised and served with an engine, and keeps its
+`415` refusal and its burn without one; DVB, which still has no decoder, keeps
+the refusal even with an engine.
+
 **Front-end unit tests** landed as of 0.14.0, which closes the largest remaining
 untested surface. The player's timeline arithmetic — the source↔media time
 conversion (`source = media + sessionStart` and its inverse), the produced window,
@@ -1139,18 +1182,12 @@ the TLS example — are done, and observed rather than reasoned about. §6 recor
 what running them found, including the defects that only a real run could
 surface. What is left:
 
-1. **A second image-subtitle reader, for VobSub.** OCR covers PGS only; a VobSub
-   (or DVB) track keeps its refusal and its burn. Round 17 removed the part that
-   was actually blocking it — the belief that no sample could be made here.
-   ffmpeg has no `vobsub` *muxer* but it does have a `dvdsub` *encoder*, so
-   `scripts/make-vobsub-fixture.sh` re-encodes this project's own PGS fixture
-   into real VobSub, and ffmpeg's decoder renders it and tesseract reads the
-   caption back out. What is left is the decoder — packets → SPU → control
-   sequence → RLE bitmap → RGBA — and the routing that offers the track as text
-   instead of as a burn. One trap is already known: the palette is in the
-   *container*, not the picture stream. Matroska's codec private carries the same
-   `.idx` text (`size:`, `palette:`), and a bare MPEG-PS sample carries none, so
-   an extraction has to keep the container that holds one.
+1. **DVB image subtitles.** The VobSub reader landed in round 18 (§6); DVB
+   (`dvb_subtitle`) still keeps its refusal and its burn, because no decoder for
+   it has been written. It is a different format again — its palette and
+   composition are carried in the stream as segments rather than in a container
+   — and no sample of one exists here, so a fixture would have to come first the
+   way round 17 built the VobSub one.
 2. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
@@ -1289,15 +1326,19 @@ surface. What is left:
   guarantee. A bitmap that is not text can be read as some — a solid rectangle
   came back as a mark — which means a PGS track of a shape may yield a spurious
   cue rather than none. The words OCR produces should be treated as approximate.
-- **OCR covers PGS only**, and the extraction step is PGS-specific: it copies the
+- **OCR covers PGS and VobSub; DVB has no decoder.** The PGS extraction copies the
   stream with `-f sup`, which the `sup` muxer accepts only for
-  `hdmv_pgs_subtitle`. VobSub (`dvd_subtitle`) and DVB subtitles therefore keep
-  the `415` refusal and the burn, even with an engine installed. Round 17 removed
-  the fixture half of that obstacle — a VobSub sample can be synthesised now (§7)
-  — so what is missing is the decoder rather than something to test it against.
-  `--ocr-language` is passed through
+  `hdmv_pgs_subtitle`; the VobSub extraction keeps a container that carries the
+  palette, so a bare MPEG-PS track with no palette is refused rather than
+  rendered blank. DVB (`dvb_subtitle`) therefore still keeps the `415` refusal
+  and the burn even with an engine installed. `--ocr-language` is passed through
   to tesseract but only `eng` is installed here, and no non-English caption has
   been recognised.
+- **The VobSub reader is verified against a synthetic sample.** Its input is the
+  codec private a container carries, and a real disc rip's palette arrives in an
+  `.idx` sidecar, which the same parser reads -- but nothing here has tried a real
+  one. The reader decodes the two-field run-length form ffmpeg's encoder emits
+  and the eight-bit form the format allows; the eight-bit branch has no sample.
 - **The OCR path has not been exercised with a hardware encoder or a ladder**,
   for the same reason the burn path has not: the burn and the OCR path both apply
   to the single-rendition case, and only software encoders exist on this host.

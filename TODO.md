@@ -68,16 +68,21 @@ Status as of the current build. Evidence for each claim is the test suite
       tesseract; the browser harness sees the caption on screen (10/10). The
       server must not be *worse* without the dependency: a unit test pins the
       refusal and the integration test skips when tesseract is absent
-- [ ] **OCR for VobSub (and DVB) image subtitles**: the second bitmap reader. The
-      pipeline, the routing and the optional-runtime-dependency rules already
-      exist for PGS; what is missing is a decoder for the other format — packets
-      → SPU → control sequence → RLE bitmap → RGBA. A synthetic sample is now
-      available: `scripts/make-vobsub-fixture.sh` re-encodes the PGS fixture with
-      ffmpeg's `dvdsub` encoder into `internal/subtitles/testdata/`, and ffmpeg's
-      decoder plus tesseract read the caption back out of it. The palette lives
-      in the container rather than the picture stream, so the extraction has to
-      keep Matroska's codec private (the `.idx` text), which a bare MPEG-PS
-      sample does not carry
+- [x] **OCR for VobSub image subtitles**: the second bitmap reader, so a
+      `dvd_subtitle` track is offered as text instead of burn-only. The decoder
+      walks packets → SPU → control sequence → the two interleaved RLE fields →
+      RGBA, and it was checked against ffmpeg's own decode of the same packet
+      pixel for pixel. The palette lives in the container rather than the picture
+      stream, so the extraction keeps a container that carries one: a Matroska
+      source is copied into a standalone Matroska file, and any other source is
+      demuxed into raw SPU packets with the codec private read out beside them.
+      A bare MPEG-PS sample with no palette is refused rather than rendered
+      blank. The route is unit-tested against `internal/subtitles/testdata/`
+      (which `scripts/make-vobsub-fixture.sh` regenerates), the integration test
+      reads the caption back through real ffmpeg and a real tesseract, and the
+      API routing is pinned both ways: VobSub is advertised and served with an
+      engine, and keeps the `415` refusal and the burn without one. DVB still has
+      no decoder.
 - [x] `max_bitrate_kbps` acted on rather than echoed: the audio's share is
       reserved and the video held to the remainder as a VBV ceiling, uniformly
       across encoder families. Verified end to end — the same 9 Mbps source came
@@ -291,12 +296,16 @@ Status as of the current build. Evidence for each claim is the test suite
     encoders are: the 10-bit probe runs on whatever host starts the server, but
     no NVIDIA, Intel or AMD GPU is reachable here. On this machine the probe
     verified five software encoders at 10-bit.
-- OCR covers **PGS** and only PGS. VobSub (`dvd_subtitle`) and DVB subtitles are
-  bitmaps in different containers with different palettes; they keep the `415`
-  refusal and are offered as a burn rather than advertised and then failing inside
-  the extractor. A second decoder is the work that would change that, and the
-  fixture it was waiting on now exists — `scripts/make-vobsub-fixture.sh`
-  synthesises one with ffmpeg's `dvdsub` encoder (see the Phase 2 item).
+- OCR covers **PGS and VobSub**. DVB subtitles still have no decoder: they keep
+  the `415` refusal and are offered as a burn rather than advertised and then
+  failing inside the extractor.
+- The VobSub reader is verified against a **synthetic** sample, and its input is
+  a container's codec private. A real disc rip's palette arrives in an `.idx`
+  sidecar, which the same parser reads, but nothing has tried one; a bare
+  MPEG-PS track with no palette anywhere is refused rather than guessed at.
+  The reader decodes the two-field run-length form the encoder emits and the
+  eight-bit form the format allows, but the eight-bit branch has never been seen
+  in a sample here.
 - OCR is verified against **handwritten fixtures**, not real disc subtitles. The
   fixture font is sized so the recogniser reads it exactly; a real Blu-ray track
   brings anti-aliased edges, a black outline and a palette, none of which has been
@@ -312,11 +321,10 @@ Status as of the current build. Evidence for each claim is the test suite
   correctly. Cue timing from a hand-written `.sup` is shifted when ffmpeg remuxes
   it into Matroska, which is why the tests assert words rather than exact times.
 - The burn-in path is verified for **PGS** and only for software encoders. VobSub
-  shares the track classification and the same overlay path, but no real VobSub
-  sample exists on this host — a synthetic one can now be generated
-  (`scripts/make-vobsub-fixture.sh`), and ffmpeg's own decoder reads its caption
-  back, but nothing decodes it inside the server yet; a hardware encoder's upload
-  filter has never been combined with the burn graph.
+  shares the track classification and the same overlay path; a synthetic sample
+  can be generated (`scripts/make-vobsub-fixture.sh`), and ffmpeg's own decoder
+  reads its caption back, but a hardware encoder's upload filter has never been
+  combined with the burn graph.
 - Browser clients are capped at 1080p, 8-bit and stereo by default, and do not
   declare HDR support, so a PQ film is tone mapped for them by design. There is
   no surround passthrough and no per-client override beyond sending a capability

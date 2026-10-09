@@ -142,3 +142,75 @@ func requireOCRTools(t *testing.T) {
 		}
 	}
 }
+
+// muxVobSubFixture builds the VobSub half of the OCR integration test: a real
+// PGS fixture is drawn, then re-encoded as dvd_subtitle with ffmpeg's dvdsub
+// encoder. ffmpeg has no vobsub muxer, but it does have the encoder, which is
+// what round 17 discovered; Matroska is the container that keeps the palette the
+// encoder writes into its codec private.
+func muxVobSubFixture(t *testing.T, dir string, subtitle []byte) (string, int) {
+	t.Helper()
+
+	sup := filepath.Join(dir, "caption.sup")
+	if err := os.WriteFile(sup, subtitle, 0o644); err != nil {
+		t.Fatalf("writing the PGS fixture: %v", err)
+	}
+
+	source := filepath.Join(dir, "vobsub.mkv")
+	runOCRFFmpeg(t, "-i", sup, "-c:s", "dvdsub", source)
+
+	probe := exec.Command("ffprobe", "-v", "error", "-select_streams", "s",
+		"-show_entries", "stream=index,codec_name", "-of", "csv=p=0", source)
+	output, err := probe.Output()
+	if err != nil {
+		t.Fatalf("probing the fixture: %v", err)
+	}
+	fields := strings.Split(strings.TrimSpace(string(output)), ",")
+	if len(fields) < 2 || fields[1] != "dvd_subtitle" {
+		t.Fatalf("the fixture has no VobSub track: %q", string(output))
+	}
+	index, err := strconv.Atoi(fields[0])
+	if err != nil {
+		t.Fatalf("parsing the subtitle stream index from %q: %v", fields[0], err)
+	}
+	return source, index
+}
+
+// TestService_OCRsAVobSubSubtitleIntoWebVTT is the end-to-end check for the
+// second bitmap reader: a VobSub track decoded by this package, composited and
+// read by a real tesseract, must yield the words the fixture drew.
+//
+// The assertion is the exact caption because the fixture's glyph size is chosen
+// for the recogniser: the fixture is drawn at the source's own 640x360, so the
+// re-encode does not resample it and the glyphs stay the size the PGS test
+// already reads reliably.
+func TestService_OCRsAVobSubSubtitleIntoWebVTT(t *testing.T) {
+	requireOCRTools(t)
+
+	dir := t.TempDir()
+	const caption = "ASTRAEUS MEDIA"
+	source, index := muxVobSubFixture(t, dir, pgs.Text(640, 360, []pgs.TextCue{{
+		StartMS: 500, EndMS: 5500, X: 100, Y: 250, Text: caption,
+	}}))
+
+	service := newOCRService(t, dir)
+	path, err := service.ConvertImage(context.Background(), source, index)
+	if err != nil {
+		t.Fatalf("ConvertImage: %v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the recognised track: %v", err)
+	}
+	text := string(body)
+
+	if !strings.HasPrefix(text, "WEBVTT") {
+		t.Errorf("the recognised track is not WebVTT:\n%s", text)
+	}
+	if !strings.Contains(text, caption) {
+		t.Errorf("the recognised subtitles do not contain %q; the OCR output was:\n%s", caption, text)
+	}
+	if !strings.Contains(text, "-->") {
+		t.Errorf("the recognised track has no cue timing:\n%s", text)
+	}
+}

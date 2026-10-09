@@ -7,6 +7,7 @@ import (
 	"image/color"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,6 +186,12 @@ func TestConvertImage_ReportsNoCuesWhenNothingIsRecognised(t *testing.T) {
 	if err := os.WriteFile(fakeFFmpeg, []byte(script), 0o755); err != nil {
 		t.Fatalf("writing the stub ffmpeg: %v", err)
 	}
+	// The extraction identifies the track's codec first, so the probe is a stub
+	// too: this test is about what happens once a PGS stream is in hand.
+	fakeFFprobe := filepath.Join(dir, "ffprobe")
+	if err := os.WriteFile(fakeFFprobe, []byte("#!/bin/sh\necho hdmv_pgs_subtitle\n"), 0o755); err != nil {
+		t.Fatalf("writing the stub ffprobe: %v", err)
+	}
 	fakeTesseract := filepath.Join(dir, "tesseract")
 	if err := os.WriteFile(fakeTesseract, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("writing the stub recogniser: %v", err)
@@ -192,6 +199,7 @@ func TestConvertImage_ReportsNoCuesWhenNothingIsRecognised(t *testing.T) {
 
 	service, err := New(Config{
 		FFmpegBin:    fakeFFmpeg,
+		FFprobeBin:   fakeFFprobe,
 		TesseractBin: fakeTesseract,
 		CacheDir:     filepath.Join(dir, "cache"),
 		Timeout:      30 * time.Second,
@@ -215,19 +223,21 @@ func TestConvertImage_ReportsNoCuesWhenNothingIsRecognised(t *testing.T) {
 	}
 }
 
-// TestOCRSupportsCodec pins the honesty of the format claim: the reader is a
-// PGS decoder, so a VobSub track must not be advertised as readable and then
-// fail inside the extractor.
+// TestOCRSupportsCodec pins the honesty of the format claim: the reader has a
+// PGS decoder and a VobSub decoder, so those two may be advertised, and a
+// format with no decoder must not be.
 func TestOCRSupportsCodec(t *testing.T) {
 	t.Parallel()
 
-	if !OCRSupportsCodec("hdmv_pgs_subtitle") {
-		t.Error("PGS must be OCR-readable")
+	for _, codec := range []string{"hdmv_pgs_subtitle", "dvd_subtitle"} {
+		if !OCRSupportsCodec(codec) {
+			t.Errorf("%q must be OCR-readable", codec)
+		}
+		if !OCRSupportsCodec(strings.ToUpper(codec)) {
+			t.Errorf("codec matching must not be case-sensitive (%q)", codec)
+		}
 	}
-	if !OCRSupportsCodec("HDMV_PGS_SUBTITLE") {
-		t.Error("codec matching must not be case-sensitive")
-	}
-	for _, codec := range []string{"dvd_subtitle", "dvb_subtitle", "subrip", "ass", ""} {
+	for _, codec := range []string{"dvb_subtitle", "subrip", "ass", ""} {
 		if OCRSupportsCodec(codec) {
 			t.Errorf("%q must not be reported as OCR-readable", codec)
 		}

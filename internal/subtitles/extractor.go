@@ -29,6 +29,10 @@ var ErrNoCues = errors.New("subtitle track contained no cues")
 type Config struct {
 	// FFmpegBin is the ffmpeg executable.
 	FFmpegBin string
+	// FFprobeBin is the ffprobe executable, which the image-subtitle path uses
+	// to identify a track's codec and to read the codec private data that
+	// carries a VobSub palette. It defaults to "ffprobe".
+	FFprobeBin string
 	// TesseractBin is the OCR executable used for image-based subtitle tracks.
 	// It is optional: when it is missing the service still converts text
 	// tracks, and an image track keeps its refusal instead of failing.
@@ -46,6 +50,7 @@ type Config struct {
 // Service extracts and caches WebVTT subtitles.
 type Service struct {
 	ffmpegBin    string
+	ffprobeBin   string
 	tesseractBin string
 	ocrLanguage  string
 	cacheDir     string
@@ -57,6 +62,9 @@ type Service struct {
 func New(cfg Config) (*Service, error) {
 	if cfg.FFmpegBin == "" {
 		cfg.FFmpegBin = "ffmpeg"
+	}
+	if cfg.FFprobeBin == "" {
+		cfg.FFprobeBin = "ffprobe"
 	}
 	if cfg.TesseractBin == "" {
 		cfg.TesseractBin = "tesseract"
@@ -76,6 +84,7 @@ func New(cfg Config) (*Service, error) {
 
 	return &Service{
 		ffmpegBin:    cfg.FFmpegBin,
+		ffprobeBin:   cfg.FFprobeBin,
 		tesseractBin: cfg.TesseractBin,
 		ocrLanguage:  cfg.OCRLanguage,
 		cacheDir:     cfg.CacheDir,
