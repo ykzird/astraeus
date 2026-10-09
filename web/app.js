@@ -35,6 +35,7 @@
     ENGINE_HLS_JS: ENGINE_HLS_JS, engineLabel: engineLabelFor,
     subtitleSelectable: subtitleSelectable, orphanedSessionId: orphanedSessionId,
     shouldRenegotiateAfterFailure: shouldRenegotiateAfterFailure,
+    fetchFailure: fetchFailure,
   } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */
@@ -231,26 +232,34 @@
       });
     } catch (error) {
       clearTimeout(timer);
-      if (error && error.name === "AbortError") {
-        throw new ApiError(
-          "The request to the Astraeus API timed out after " +
-            Math.round(REQUEST_TIMEOUT_MS / 1000) +
-            " seconds.",
-          { path: path, code: "timeout" }
-        );
+      const failure = fetchFailure("send", error, REQUEST_TIMEOUT_MS);
+      if (failure.kind === "timeout") {
+        throw new ApiError(failure.message, { path: path, code: "timeout" });
       }
       throw new ApiError(
         "Could not reach the Astraeus API (" + API_BASE + path + "). Is the server running?",
         { path: path, code: "network" }
       );
     }
-    clearTimeout(timer);
 
+    /* The timer stays armed while the body is read. Clearing it here cleared it
+       once the headers had arrived, so a server that sent a Content-Length and
+       then stalled mid-body hung the request forever - and the module header's
+       claim that every fetch has a timeout was false for exactly that case
+       (W-9 of the 2026-10-09 review). */
     let text = "";
     try {
       text = await response.text();
     } catch (error) {
+      const failure = fetchFailure("body", error, REQUEST_TIMEOUT_MS);
+      if (failure.kind === "timeout") {
+        throw new ApiError(failure.message, { path: path, code: "timeout" });
+      }
+      /* A body that failed to arrive for another reason is treated as empty, so
+         the status still decides what the caller is told. */
       text = "";
+    } finally {
+      clearTimeout(timer);
     }
 
     if (!response.ok) {
@@ -1974,6 +1983,7 @@
   }
 
   /* ── 9. Actions ──────────────────────────────────────────────────────── */
+
 
   /** How often a job's state is polled while it runs. */
   const JOB_POLL_MS = 1000;
@@ -4251,14 +4261,27 @@
     loadContinueWatching();
   }
 
-  async function refreshEntities(libraryId) {
+  /**
+   * Load a library's entities into the shared state.
+   *
+   * `token` is the route token the caller was given. The list is not written
+   * unless it is still the current one: a slow library's answer arriving after
+   * the viewer moved on used to be written and only then discarded, which meant
+   * it had already overwritten the list on screen (W-7).
+   *
+   * Callers that do not care about staleness - the ones that are the only
+   * writer in their flow - pass the current token and get the old behaviour.
+   */
+  async function refreshEntities(libraryId, token) {
     const raw = await api.libraryEntities(libraryId);
     if (!Array.isArray(raw)) {
       throw new ApiError("The API did not return a list of entities.", { code: "unexpected_shape" });
     }
+    if (!entityListIsCurrent(token, state.loadToken)) return false;
     state.entities = raw;
     state.entitiesLibraryId = libraryId;
     for (const entity of raw) rememberEntity(entity);
+    return true;
   }
 
   async function loadEntity(entityId, token) {
@@ -4400,7 +4423,11 @@
       });
       if (!library) {
         state.libraryId = null;
-        state.entities = [];
+        /* Both fields, not just the list: a leftover id made the next view
+           render this library as an empty one (W-8). */
+        const cleared = clearedEntityList();
+        state.entities = cleared.entities;
+        state.entitiesLibraryId = cleared.entitiesLibraryId;
         state.loading = false;
         render();
         applyFocusTarget();
@@ -4418,8 +4445,8 @@
       setAmbient(library);
       render();
       try {
-        await refreshEntities(library.id);
-        if (token !== state.loadToken) return;
+        const current = await refreshEntities(library.id, token);
+        if (!current) return;
         state.entitiesFailed = false;
         clearError();
       } catch (error) {

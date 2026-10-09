@@ -182,6 +182,72 @@
     return isFinite(position) && position >= 0;
   }
 
+  /**
+   * Whether a loaded entity list still belongs to the view that asked for it.
+   *
+   * A route change bumps `loadToken`, so a list that arrives after the viewer
+   * has moved on is stale. The check used to happen in the caller, *after* the
+   * helper had already written the list and its library id into shared state -
+   * so the late answer of a slow library overwrote the current library's list,
+   * and the caller's check then discarded nothing that mattered (W-7 of the
+   * 2026-10-09 review). Checked here, the write never happens.
+   */
+  function entityListIsCurrent(token, currentToken) {
+    /* No token means the caller is the only writer in its flow - a scan
+       refreshing the list it just scanned, say - so there is nothing to be
+       stale against and the write proceeds. Only a caller that was given a token
+       can be overtaken, and only it is checked. */
+    if (token === undefined || token === null) return true;
+    return token === currentToken;
+  }
+
+  /**
+   * What the shared entity state should be when there is no list at all.
+   *
+   * Both fields move together. Clearing the list but leaving the library id
+   * pointing at the library that is gone made the next view render "0 entities"
+   * for a library nobody had asked about - it read as an empty library rather
+   * than as a missing one (W-8 of the 2026-10-09 review).
+   */
+  function clearedEntityList() {
+    return { entities: [], entitiesLibraryId: null };
+  }
+
+  /** The message a request that ran out of time produces. */
+  function timeoutMessage(timeoutMs) {
+    return (
+      "The request to the Astraeus API timed out after " +
+      Math.round(Number(timeoutMs) / 1000) +
+      " seconds."
+    );
+  }
+
+  /**
+   * What a failed part of a fetch means, so every stage of one reports it the
+   * same way.
+   *
+   * `stage` is "send" while the request is being made and "body" while the
+   * response body is being read. An abort means the timeout fired, wherever it
+   * fired. A body that failed for another reason is not a timeout and must not
+   * be reported as one: the caller still has a status code, which is a better
+   * answer than "network error".
+   *
+   * This exists because the timeout used to be cleared once the headers arrived,
+   * so a stalled body was covered by nothing and the UI could spin forever while
+   * the module header claimed every fetch had a timeout (W-9 of the 2026-10-09
+   * review).
+   */
+  function fetchFailure(stage, error, timeoutMs) {
+    const aborted = !!error && error.name === "AbortError";
+    if (aborted) {
+      return { kind: "timeout", message: timeoutMessage(timeoutMs) };
+    }
+    if (stage === "body") {
+      return { kind: "body", message: "" };
+    }
+    return { kind: "network", message: "" };
+  }
+
   /* ── progress reporting ───────────────────────────────────────────────── */
 
   /** A position shorter than this is not worth remembering. */
@@ -379,5 +445,9 @@
     subtitleSelectable: subtitleSelectable,
     orphanedSessionId: orphanedSessionId,
     shouldRenegotiateAfterFailure: shouldRenegotiateAfterFailure,
+    fetchFailure: fetchFailure,
+    entityListIsCurrent: entityListIsCurrent,
+    clearedEntityList: clearedEntityList,
+    timeoutMessage: timeoutMessage,
   };
 });

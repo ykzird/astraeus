@@ -516,3 +516,67 @@ test("a failure with no usable position is not renegotiated", () => {
     false
   );
 });
+
+// ── what a failed fetch means ───────────────────────────────────────────────
+//
+// W-9: the API timeout was cleared as soon as the headers arrived, so a response
+// body that stalled was covered by nothing and the UI could spin forever - while
+// the module header claimed every fetch had a timeout. The classifier lives here
+// so both stages of a fetch report a timeout the same way, and so the case that
+// used to be reported as a network error can be tested.
+
+test("an abort means the timeout, wherever it fired", () => {
+  const aborted = { name: "AbortError" };
+  assert.equal(core.fetchFailure("send", aborted, 20000).kind, "timeout");
+  // The stage that was previously uncovered.
+  assert.equal(core.fetchFailure("body", aborted, 20000).kind, "timeout");
+});
+
+test("a body failure that is not a timeout is not reported as one", () => {
+  // The status code the caller already has is a better answer than "network
+  // error", so a body that failed for another reason is its own kind.
+  const ended = { name: "TypeError", message: "network error" };
+  assert.equal(core.fetchFailure("body", ended, 20000).kind, "body");
+  assert.equal(core.fetchFailure("body", null, 20000).kind, "body");
+});
+
+test("a send failure that is not a timeout is a network failure", () => {
+  assert.equal(core.fetchFailure("send", { name: "TypeError" }, 20000).kind, "network");
+  assert.equal(core.fetchFailure("send", null, 20000).kind, "network");
+});
+
+test("the timeout message says how long it waited", () => {
+  assert.match(core.timeoutMessage(20000), /20 seconds/);
+  assert.match(core.timeoutMessage(1500), /2 seconds/);
+});
+
+// ── a stale entity list must not be written ─────────────────────────────────
+//
+// W-7: the load token was checked by the caller *after* the helper had written
+// the list into shared state, so a slow library's answer arriving after the
+// viewer moved on had already overwritten the list on screen. W-8: clearing the
+// list without clearing its library id made a library nobody had asked about
+// render as "0 entities".
+
+test("a list from a superseded route is not current", () => {
+  assert.equal(core.entityListIsCurrent(3, 4), false);
+  assert.equal(core.entityListIsCurrent(4, 4), true);
+});
+
+test("a caller with no token writes unconditionally", () => {
+  // A scan refreshing the list it just scanned is the only writer in its flow,
+  // so there is nothing for it to be stale against. Without this, every such
+  // caller would silently stop loading entities - which is the bug the first
+  // version of this introduced.
+  assert.equal(core.entityListIsCurrent(undefined, 7), true);
+  assert.equal(core.entityListIsCurrent(null, 7), true);
+});
+
+test("clearing the entity state clears both fields", () => {
+  const cleared = core.clearedEntityList();
+  assert.deepEqual(cleared.entities, []);
+  assert.equal(cleared.entitiesLibraryId, null);
+  // The invariant: no list, no library - a library id pointing at nothing is
+  // what made the next view claim an empty library.
+  assert.ok(!cleared.entitiesLibraryId);
+});
