@@ -13,7 +13,25 @@ import (
 
 var (
 	// episodeRe matches S01E02, s1e2, S01.E02, S01 E02 and similar forms.
-	episodeRe = regexp.MustCompile(`(?i)\bs(\d{1,2})[\s._-]*e(\d{1,3})\b`)
+	//
+	// `\b` is wrong at the left edge. A word boundary is a change between a word
+	// character and a non-word one, and `_` is a word character - so
+	// "Show_S01E01_Pilot" has no boundary before the S and was rejected outright,
+	// which is the shape a great many releases use (L-17 of the 2026-10-09 review).
+	// The lookarounds say what was meant: not part of a longer word.
+	episodeRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])s(\d{1,2})[\s._-]*e(\d{1,3})(?:v\d+)?(?:[^a-z0-9]|$)`)
+	// episodeMultiRe matches the two-episode form, S01E01E02, and captures the last
+	// number because that is the one a season's numbering continues from.
+	episodeMultiRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])s(\d{1,2})[\s._-]*e(\d{1,3})[\s._-]*e(\d{1,3})`)
+	// episodeXRe matches the 1x02 form, which predates the SxxExx convention and is
+	// still what some libraries use. It requires a digit before the x, so a title
+	// like "Malcolm X" is not an episode.
+	episodeXRe = regexp.MustCompile(`(?:^|[^a-z0-9])(\d{1,2})x(\d{2,3})(?:[^a-z0-9]|$)`)
+	// episodeSeasonRe matches S2024E01 - a four-digit year used as the season, which
+	// is how long-running shows and daily programmes number themselves. It is tried
+	// after the two-digit form so a normal S01E02 does not read as S2024E01's
+	// shorter cousin.
+	episodeSeasonRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])s(\d{4})[\s._-]*e(\d{1,3})(?:[^a-z0-9]|$)`)
 	// seasonDirRe matches a directory named "Season 1", "season.01", "S1", ...
 	seasonDirRe = regexp.MustCompile(`(?i)^(?:season|series|s)[\s._-]*(\d{1,2})$`)
 	// junkRe collapses separators commonly used in release names.
@@ -123,23 +141,64 @@ type EpisodeInfo struct {
 func ParseEpisodeName(fileName string) (EpisodeInfo, bool) {
 	base := strings.TrimSuffix(fileName, filepath.Ext(fileName))
 
-	m := episodeRe.FindStringSubmatchIndex(base)
-	if m == nil {
-		return EpisodeInfo{}, false
-	}
-
-	season, errS := strconv.Atoi(base[m[2]:m[3]])
-	episode, errE := strconv.Atoi(base[m[4]:m[5]])
-	if errS != nil || errE != nil {
+	season, episode, end, ok := matchEpisode(base)
+	if !ok {
 		return EpisodeInfo{}, false
 	}
 
 	// Only the text after the SxxExx marker is a plausible episode title. The
 	// text before it is the series name, which the caller already has, so an
 	// absent title is returned as empty rather than guessed at.
-	title := cleanTitle(strings.Trim(base[m[1]:], " ._-"))
+	title := cleanTitle(strings.Trim(base[end:], " ._-"))
 
 	return EpisodeInfo{Season: season, Episode: episode, Title: title}, true
+}
+
+// matchEpisode finds a season and episode number in a name, and reports where the
+// marker ended.
+//
+// The forms are tried most specific first, because they overlap: S2024E01 contains
+// S24E01 to a two-digit pattern, and S01E01E02 contains S01E01 to the single form.
+// Taking the two-digit form first would read a year-based season as season 24.
+func matchEpisode(base string) (season, episode, end int, ok bool) {
+	// A four-digit season first.
+	if m := episodeSeasonRe.FindStringSubmatchIndex(base); m != nil {
+		s, errS := strconv.Atoi(base[m[2]:m[3]])
+		e, errE := strconv.Atoi(base[m[4]:m[5]])
+		if errS == nil && errE == nil {
+			return s, e, m[1], true
+		}
+	}
+
+	// A two-episode marker: the season's numbering continues from the *last*
+	// number, which is what a viewer looking for the next episode wants.
+	if m := episodeMultiRe.FindStringSubmatchIndex(base); m != nil {
+		s, errS := strconv.Atoi(base[m[2]:m[3]])
+		e, errE := strconv.Atoi(base[m[6]:m[7]])
+		if errS == nil && errE == nil {
+			return s, e, m[1], true
+		}
+	}
+
+	// The usual form, with an optional "v2" revision suffix the pattern swallows.
+	if m := episodeRe.FindStringSubmatchIndex(base); m != nil {
+		s, errS := strconv.Atoi(base[m[2]:m[3]])
+		e, errE := strconv.Atoi(base[m[4]:m[5]])
+		if errS == nil && errE == nil {
+			return s, e, m[1], true
+		}
+	}
+
+	// And the older 1x02 form.
+	if m := episodeXRe.FindStringSubmatchIndex(base); m != nil {
+		s, errS := strconv.Atoi(base[m[2]:m[3]])
+		e, errE := strconv.Atoi(base[m[4]:m[5]])
+		if errS == nil && errE == nil {
+			return s, e, m[1], true
+		}
+	}
+
+	return 0, 0, 0, false
 }
 
 // ParseEpisodePath derives the full placement of an episode file from its path

@@ -639,11 +639,16 @@ func TestScanner_PrunesDespiteAnUnplaceableFile(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 
-	// A show with two episodes in its season directory, which is the layout the
-	// scanner places, plus one name it cannot classify beside them.
+	// A show whose season directory holds one episode the scanner can place and one
+	// it cannot classify at all.
+	//
+	// The unplaceable fixture used to be "Show S01E02E03.mkv" - a two-episode
+	// marker - which the scanner learned to read while fixing L-17. A fixture that
+	// becomes placeable stops testing what this test is about, so the unnameable
+	// file is now one with no marker in it at all.
 	scene := filepath.Join(root, "Show", "Season 01")
 	writeFile(t, filepath.Join(scene, "Show S01E01.mkv"), "episode one")
-	writeFile(t, filepath.Join(scene, "Show S01E02E03.mkv"), "a double episode")
+	writeFile(t, filepath.Join(scene, "Show - an extra featurette.mkv"), "not an episode")
 
 	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
 	scanner := library.NewScanner(repo, newTestLogger())
@@ -680,7 +685,7 @@ func TestScanner_PrunesDespiteAnUnplaceableFile(t *testing.T) {
 		t.Fatalf("listing entities: %v", err)
 	}
 	for _, entity := range entities {
-		if strings.Contains(entity.Name, "S01E01") && !strings.Contains(entity.Name, "E02E03") {
+		if strings.Contains(entity.Name, "S01E01") {
 			t.Errorf("the deleted episode's entity is still present: %+v", entity)
 		}
 	}

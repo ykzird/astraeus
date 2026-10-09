@@ -337,3 +337,107 @@ func TestSeasonDirName(t *testing.T) {
 		t.Errorf("SeasonDirName(3) = %q, want %q", got, "Season 3")
 	}
 }
+
+// TestParseEpisodeName_FormsTheReviewFoundUnsupported covers the episode half of
+// L-17.
+//
+// The pattern used `\b` at its left edge, and `_` is a word character - so
+// "Show_S01E01_Pilot" has no boundary before the S and was rejected outright, which
+// is the shape a great many releases use. Four other forms were not recognised at
+// all.
+func TestParseEpisodeName_FormsTheReviewFoundUnsupported(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		fileName    string
+		wantOK      bool
+		wantSeason  int
+		wantEpisode int
+		wantTitle   string
+	}{
+		{
+			// The form the word boundary rejected.
+			name:     "underscore separated",
+			fileName: "Show_S01E01_Pilot.mkv",
+			wantOK:   true, wantSeason: 1, wantEpisode: 1, wantTitle: "Pilot",
+		},
+		{
+			// A two-episode file takes the last number: the season's numbering
+			// continues from it, and that is the episode a viewer is looking for
+			// next.
+			name:     "two episodes in one file",
+			fileName: "Show.S01E01E02.mkv",
+			wantOK:   true, wantSeason: 1, wantEpisode: 2,
+		},
+		{
+			// The form that predates SxxExx.
+			name:     "the 1x02 form",
+			fileName: "Show 1x02 - Descent.mkv",
+			wantOK:   true, wantSeason: 1, wantEpisode: 2, wantTitle: "Descent",
+		},
+		{
+			// A year used as the season, which is how long-running shows number
+			// themselves. The two-digit pattern must not read this as season 24.
+			name:     "a four-digit season",
+			fileName: "Show.S2024E01.mkv",
+			wantOK:   true, wantSeason: 2024, wantEpisode: 1,
+		},
+		{
+			// The revision suffix is not part of the episode number.
+			name:     "a revision suffix",
+			fileName: "Show.S01E01v2.mkv",
+			wantOK:   true, wantSeason: 1, wantEpisode: 1,
+		},
+		{
+			// A season number of more than two digits is not a season, so this is
+			// not an episode at all rather than a season 1 episode.
+			name:     "a title that only looks like a marker",
+			fileName: "Malcolm X.mkv",
+			wantOK:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			info, ok := ParseEpisodeName(tt.fileName)
+			if ok != tt.wantOK {
+				t.Fatalf("ParseEpisodeName(%q) ok = %v, want %v (info %+v)",
+					tt.fileName, ok, tt.wantOK, info)
+			}
+			if !ok {
+				return
+			}
+			if info.Season != tt.wantSeason {
+				t.Errorf("season = %d, want %d", info.Season, tt.wantSeason)
+			}
+			if info.Episode != tt.wantEpisode {
+				t.Errorf("episode = %d, want %d", info.Episode, tt.wantEpisode)
+			}
+			if tt.wantTitle != "" && info.Title != tt.wantTitle {
+				t.Errorf("title = %q, want %q", info.Title, tt.wantTitle)
+			}
+		})
+	}
+}
+
+// TestParseEpisodeName_StillRejectsWhatItShould guards the widened patterns
+// against being widened too far.
+func TestParseEpisodeName_StillRejectsWhatItShould(t *testing.T) {
+	t.Parallel()
+
+	for _, fileName := range []string{
+		"Show.mkv",
+		"S01.mkv", // a season with no episode
+		"Season 1.mkv",
+		"S01E.mkv",
+		"Ex01.mkv", // no digits
+		"Malcolm X (1992).mkv",
+	} {
+		if info, ok := ParseEpisodeName(fileName); ok {
+			t.Errorf("ParseEpisodeName(%q) matched as %+v, want no match", fileName, info)
+		}
+	}
+}
