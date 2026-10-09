@@ -240,6 +240,13 @@ func readMatroskaTree(r io.Reader, size int64) ([]*matroskaElement, error) {
 	)
 
 	for size < 0 || consumed < size {
+		// What the parent still admits to. An element larger than this cannot
+		// fit in its container however well-formed its own declaration is.
+		remaining := int64(-1)
+		if size >= 0 {
+			remaining = size - consumed
+		}
+
 		id, idLen, err := readMatroskaID(r)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -275,15 +282,52 @@ func readMatroskaTree(r io.Reader, size int64) ([]*matroskaElement, error) {
 			}
 			element.children = children
 		default:
-			element.body = make([]byte, elementSize)
-			if _, err := io.ReadFull(r, element.body); err != nil {
-				return nil, fmt.Errorf("%w: a %d-byte Matroska element ended early: %v", ErrInvalidVobSub, elementSize, err)
+			element.body, err = readMatroskaBody(r, elementSize, remaining)
+			if err != nil {
+				return nil, err
 			}
 		}
 		elements = append(elements, element)
 		consumed += elementSize
 	}
 	return elements, nil
+}
+
+// maxMatroskaElement bounds one element's body. A subpicture track's samples are
+// small - the committed fixture's largest is a few kilobytes - so anything in the
+// megabytes is a malformed or hostile stream rather than a subtitle.
+const maxMatroskaElement = 64 << 20 // 64 MiB
+
+// readMatroskaBody reads one element's payload after bounding its size.
+//
+// An element's size is a 56-bit field, so a twelve-byte input can declare an
+// element larger than any file and make the reader ask for that much memory
+// outright: make([]byte, elementSize) panics with "makeslice: len out of range",
+// and sizes just under the limit produce a fatal out-of-memory instead of a
+// panic - which net/http cannot recover, so the process dies (L-16 of the
+// 2026-10-09 review; found again by FuzzDemuxMatroskaVobSub in 47 ms).
+//
+// Three bounds, and all three matter: the declared size, the size the parent
+// admits to (a child cannot be larger than its parent's remaining bytes), and an
+// absolute cap so a well-formed declaration cannot be used to allocate anyway.
+func readMatroskaBody(r io.Reader, elementSize int64, parentSize int64) ([]byte, error) {
+	if elementSize < 0 {
+		return nil, fmt.Errorf("%w: a Matroska element declares a negative size", ErrInvalidVobSub)
+	}
+	if elementSize > maxMatroskaElement {
+		return nil, fmt.Errorf("%w: a Matroska element declares %d bytes, over the %d-byte limit",
+			ErrInvalidVobSub, elementSize, maxMatroskaElement)
+	}
+	if parentSize >= 0 && elementSize > parentSize {
+		return nil, fmt.Errorf("%w: a %d-byte Matroska element does not fit in its %d-byte parent",
+			ErrInvalidVobSub, elementSize, parentSize)
+	}
+
+	body := make([]byte, elementSize)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, fmt.Errorf("%w: a %d-byte Matroska element ended early: %v", ErrInvalidVobSub, elementSize, err)
+	}
+	return body, nil
 }
 
 // readMatroskaID reads a variable-length element id, whose leading bit marks
