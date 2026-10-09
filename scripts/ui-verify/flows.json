@@ -77,7 +77,7 @@
           "id": "incomplete-filter",
           "kind": "auto",
           "expect": "the list narrows and the badge agrees with the visible count",
-          "assert": "the entity count matches the badge",
+          "assert": "count the entities whose status is Incomplete from /api/entities and assert the badge and the visible list agree - do not assume either status",
           "selector": "#filter-toggle"
         },
         {
@@ -106,13 +106,15 @@
           "kind": "auto",
           "expect": "a direct-playable H.264 clip negotiates direct_play and starts",
           "assert": "capture POST playback and assert the mode and reasons",
-          "api": "POST /api/entities/{id}/playback"
+          "api": "POST /api/entities/{id}/playback",
+          "responseShape": "mode is top-level; reasons, target codecs and the chosen audio stream are inside decision; media_info is beside them"
         },
         {
           "id": "transcode-makes-quality-menu",
           "kind": "auto",
           "expect": "an HEVC entity transcodes and a quality control appears; a direct-play entity has none",
-          "assert": "assert presence for the transcode and absence for direct play"
+          "assert": "assert presence for the transcode and absence for direct play",
+          "manifest": "the client manifest needs supports_hls:true or the server answers not_deliverable instead of transcoding"
         },
         {
           "id": "quality-choice",
@@ -232,27 +234,31 @@
           "assert": "read the transport's source clock, not the element's",
           "api": "GET /api/progress",
           "existingHarness": "resume-verify.mjs",
-          "fixture": "longClip"
+          "fixture": "longClip",
+          "responseShape": "GET /api/progress answers an object whose entries list holds the positions"
         },
         {
           "id": "start-over",
           "kind": "auto",
           "expect": "start-over clears the position and the row leaves Continue watching",
           "assert": "the row is gone from /api/progress",
-          "api": "GET /api/progress"
+          "api": "GET /api/progress",
+          "responseShape": "GET /api/progress answers an object whose entries list holds the positions"
         },
         {
           "id": "watched-through",
           "kind": "auto",
           "expect": "running into the closing percent clears the row rather than offering it again",
-          "assert": "absence from /api/progress"
+          "assert": "absence from /api/progress",
+          "responseShape": "GET /api/progress answers an object whose entries list holds the positions"
         },
         {
           "id": "per-viewer",
           "kind": "auto",
           "expect": "two identities keep separate positions",
           "assert": "each identity reads back its own place",
-          "note": "needs --auth-mode proxy behind the deploy/tls example"
+          "note": "needs --auth-mode proxy behind the deploy/tls example",
+          "responseShape": "GET /api/progress answers an object whose entries list holds the positions"
         }
       ],
       "fixture": "longClip"

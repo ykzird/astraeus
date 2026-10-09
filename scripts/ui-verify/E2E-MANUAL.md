@@ -127,12 +127,16 @@ Register whatever you add with `./astraeus-server scan`, then reload the UI.
       **[auto]** assert the breadcrumb text matches the library that was clicked
       and that the canvas is no longer empty.
 
-- [ ] **Do this:** click the **incomplete** filter.
-      **Expect:** the list narrows and the badge shows a count. The demo library
-      has no TMDB key by default, so entities are `Incomplete` and the filter
-      should keep them; if you configured a key, enrich first and expect the
-      opposite.
-      **[auto]** assert the visible entity count changes and matches the badge.
+- [ ] **Do this:** click the **incomplete** filter, and note the statuses first.
+      **Expect:** the badge's count equals the number of entities whose status is
+      `Incomplete`, and the visible list matches. A freshly scanned library is
+      `Incomplete`; if `metadata enrich` has run (the demo script enriches when a
+      TMDB key is configured, and `demo.db` is local state that may already have
+      been enriched) every entity is `Complete` and the filter correctly shows
+      none. **Check the badge against the statuses rather than assuming either**
+      — that is the assertion, not a particular count.
+      **[auto]** read each entity's `status` from `/api/entities`, count the
+      `Incomplete` ones, and assert the badge and the visible list agree.
 
 - [ ] **Do this:** toggle the filter off, then click an entity.
       **Expect:** the canvas shows the entity's detail — title, poster area,
@@ -155,13 +159,27 @@ thing.
       **Blade Runner 2049**.
       **Expect:** a `POST /api/entities/{id}/playback`, a `200`, and playback
       starts. On a direct-playable H.264 file the mode should be `direct_play`.
-      **Prove it:** the response's `mode` and `reasons` say why.
+      **Prove it:** the response's `mode` and its `decision.reasons` say why.
+      Note where they live: `mode` is top-level but `reasons`, the chosen audio
+      stream and the target codecs are inside `decision`, and `media_info` is a
+      third thing beside them. Asserting on the wrong level is an easy way to
+      "pass" a check that read `null`.
       **[auto]** capture the playback request and response and assert `mode`,
       exactly as `burn-verify.mjs` already captures its own.
 
 - [ ] **Do this:** press Play on **Arrival** (the HEVC one).
       **Expect:** the quality menu appears, because no browser here decodes HEVC
       and the server is transcoding. The mode should be `transcode`.
+      **Prove it:** by hand, against a client that can play HLS — the manifest
+      needs `"supports_hls": true` or the server answers `not_deliverable`
+      rather than transcoding, which is correct and worth seeing once:
+
+      ```sh
+      curl -s -X POST localhost:8910/api/entities/<id>/playback \
+        -H 'Content-Type: application/json' \
+        -d '{"video_codecs":["h264"],"audio_codecs":["aac"],"supports_hls":true}' \
+        | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["mode"]); print(d["decision"]["reasons"])'
+      ```
       **[auto]** assert the mode badge/decision says transcode and that a
       quality control exists. On a direct-play entity, assert the quality control
       is *absent* — a missing control must not pass by accident.
@@ -262,7 +280,8 @@ being sought.
 - [ ] **Do this:** play the long clip for ~30 seconds, pause, and reload.
       **Expect:** the entity appears under **Continue watching**, and playing it
       resumes near where you left off rather than at zero.
-      **Prove it:** `curl -s localhost:8910/api/progress` lists it.
+      **Prove it:** `curl -s localhost:8910/api/progress` lists it under
+      `entries`.
       **[auto]** read the transport's **source** clock, not the element's — a
       player that ignores the stored position and starts at zero looks identical
       otherwise. `resume-verify.mjs` already does this.
@@ -270,12 +289,12 @@ being sought.
 - [ ] **Do this:** click the transport's start-over control.
       **Expect:** the stored position is cleared, the entity leaves Continue
       watching, and the next Play starts at zero.
-      **[auto]** assert the row is gone from `/api/progress`.
+      **[auto]** assert `entries` no longer names the entity.
 
 - [ ] **Do this:** let the clip run into its last few percent, then reload.
       **Expect:** it does **not** appear in Continue watching — watched-through
       clears the row.
-      **[auto]** assert absence. **[needs real media]**
+      **[auto]** assert its absence from `entries`.
 
 - [ ] **Do this (gated installs only):** with `--auth-mode proxy` behind the TLS
       example in `deploy/tls/`, report a position as one client certificate and
