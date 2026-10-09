@@ -432,13 +432,8 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info, err := os.Stat(req.Path)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_path", "path is not readable: "+err.Error())
-		return
-	}
-	if !info.IsDir() {
-		writeError(w, http.StatusBadRequest, "invalid_path", "path is not a directory")
+	if err := library.RootExists(req.Path); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_path", err.Error())
 		return
 	}
 
@@ -447,6 +442,19 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if !errors.Is(err, library.ErrNotFound) {
 		s.writeRepoError(w, r, err, "checking for an existing library")
+		return
+	}
+
+	// Overlapping roots are refused rather than allowed to take turns owning the
+	// same files (L-15 of the 2026-10-09 review). The check compares resolved
+	// paths, so /media and /mnt/media-link are caught too.
+	registered, err := s.repo.ListLibraries(r.Context())
+	if err != nil {
+		s.writeRepoError(w, r, err, "listing libraries")
+		return
+	}
+	if overlap, found := library.FindOverlap(registered, req.Path); found {
+		writeError(w, http.StatusConflict, "path_overlaps", overlap.Error())
 		return
 	}
 

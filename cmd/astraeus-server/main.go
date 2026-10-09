@@ -703,6 +703,18 @@ func resolveLibrary(ctx context.Context, app *env, libraryID, path, kind, name s
 			return nil, err
 		}
 
+		// The same refusal the API makes, because a CLI that registers an
+		// overlapping root creates the same problem: two libraries taking turns
+		// owning one file, with the entity it belongs to following the scan order
+		// (L-15 of the 2026-10-09 review).
+		registered, err := app.repo.ListLibraries(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if overlap, found := library.FindOverlap(registered, abs); found {
+			return nil, fmt.Errorf("registering %s: %w", abs, overlap)
+		}
+
 		parsedKind, err := library.ParseLibraryKind(kind)
 		if err != nil {
 			return nil, fmt.Errorf("%w (required with --path)", err)
