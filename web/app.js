@@ -30,6 +30,11 @@
   /* Aliased because the local wrapper below keeps the name call sites use. */
   const { resumeOffsetFor: resumeOffsetFromProgress } = window.AstraeusCore;
   const { awaitJob: awaitJobOutcome, JOB_WAIT_MS: awaitJobWaitMs } = window.AstraeusCore;
+  const {
+    ENGINE_NATIVE: ENGINE_NATIVE, ENGINE_NATIVE_HLS: ENGINE_NATIVE_HLS,
+    ENGINE_HLS_JS: ENGINE_HLS_JS, engineLabel: engineLabelFor,
+    subtitleSelectable: subtitleSelectable,
+  } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */
 
@@ -548,7 +553,9 @@
       currentTime: 0,
       seeking: false,
       started: false,
-      /* "native" for a direct file or native HLS, "hls.js" for MSE. */
+      /* One of ENGINE_NATIVE, ENGINE_NATIVE_HLS or ENGINE_HLS_JS; core.js owns
+         the names and the wording, so a comparison cannot drift from what the
+         player sets. */
       engine: null,
       /* True whenever delivery is segmented, i.e. generated while playing. */
       segmented: false,
@@ -1614,19 +1621,31 @@
     for (const sub of list) {
       const key = subtitleKey(sub);
       /* An image track with no URL has no way to reach a <track>, so the only
-         way it can be shown is burned into the picture. Offer it anyway and say
-         so in the label: the choice is real, it just costs a server-side
-         re-encode rather than an instant toggle. An image track the server has
-         read into text carries a URL and is offered like any other. */
-      const label = subtitleNeedsBurn(sub)
-        ? subtitleLabel(sub) + " (burned in)"
-        : subtitleLabel(sub);
+         way it can be shown is burned into the picture. Offer it and say so in
+         the label: the choice is real, it just costs a server-side re-encode
+         rather than an instant toggle. An image track the server has read into
+         text carries a URL and is offered like any other.
+
+         A track that can be neither delivered nor burned is listed as disabled
+         and says why. Offering it as a working control meant choosing it
+         repainted the radio and then did nothing, which reads as a broken
+         player (W-6 of the 2026-10-09 review). */
+      const selectable = subtitleSelectable(sub);
+      let label = subtitleLabel(sub);
+      if (!selectable) {
+        label += " (unavailable)";
+      } else if (subtitleNeedsBurn(sub)) {
+        label += " (burned in)";
+      }
       options.push(
         subtitleOptionNode({
           key: key,
           label: label,
-          checked: pb.subtitleSelection === key,
-          disabled: !live,
+          /* A track that cannot be chosen is not shown as chosen, even if the
+             stored preference names it - a checked radio that does nothing is
+             the bug. */
+          checked: selectable && pb.subtitleSelection === key,
+          disabled: !live || !selectable,
         })
       );
     }
@@ -1772,7 +1791,7 @@
       if (pb.mode === "direct_play") {
         return "Direct play: the server is sending the original file over HTTP range requests, so seeking is exact.";
       }
-      const engine = pb.engine === "native" ? "the browser's native HLS support" : "the bundled hls.js player over MSE";
+      const engine = engineLabelFor(pb.engine);
       return (
         "Segmented delivery via " +
         engine +
@@ -3639,7 +3658,7 @@
     const pb = state.playback;
     pb.status = "ready";
     pb.url = url;
-    pb.engine = "native";
+    pb.engine = ENGINE_NATIVE;
     pb.segmented = false;
     pb.controlsVisible = true;
     dom.playerLayer.hidden = false;
@@ -3729,7 +3748,7 @@
     instance.on(HlsCtor.Events.LEVEL_UPDATED, syncTransport);
     instance.on(HlsCtor.Events.LEVEL_LOADED, syncTransport);
 
-    pb.engine = "hls.js";
+    pb.engine = ENGINE_HLS_JS;
     pb.status = "ready";
     instance.attachMedia(playerVideo);
     instance.loadSource(url);
@@ -4050,7 +4069,7 @@
          a native HLS playlist still grows as ffmpeg produces it. */
       startVideo(pb.url, entity, resumePlaying !== false);
       pb.segmented = true;
-      pb.engine = "native-hls";
+      pb.engine = ENGINE_NATIVE_HLS;
       return;
     }
     startSegmented(pb.url, entity, resumePlaying !== false);

@@ -580,9 +580,31 @@ func runServe(args []string) error {
 	}
 
 	server := &http.Server{
-		Addr:              *addr,
-		Handler:           handler,
+		Addr:    *addr,
+		Handler: handler,
+		// Bounded reads, unbounded writes. A request that cannot finish sending
+		// its headers or its body is not a client this server needs to keep, and
+		// holding the connection is a way to spend its sockets one slow byte at a
+		// time (A-9 of the 2026-10-09 review).
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// A client that keeps a connection open and sends nothing is also not
+		// worth a socket. Well above a browser's own keep-alive, so an idle tab
+		// reconnects rather than being cut off.
+		IdleTimeout: 120 * time.Second,
+		// MaxHeaderBytes is left at Go's default of 1 MiB, which is a large
+		// allowance for headers this server does not read beyond a token, an
+		// identity and a content type. It is lowered here to a size that still
+		// fits a long URL and every header a browser sends.
+		MaxHeaderBytes: 64 << 10,
+
+		// WriteTimeout is deliberately unset. HLS is served by holding a response
+		// open and writing segments as they are produced, and a write deadline
+		// would cut a stream off mid-film. The handlers that can write slowly
+		// bound themselves: session segments come from a directory the producer
+		// is filling, and the job endpoints answer immediately rather than
+		// waiting. An operator who wants a deadline can set one per handler with
+		// http.ResponseController.
 	}
 
 	errCh := make(chan error, 1)

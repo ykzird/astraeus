@@ -474,3 +474,57 @@ func TestRateLimitAddress(t *testing.T) {
 			"host can rotate through its allocation and never be limited")
 	}
 }
+
+// TestServerTimeoutsAreBoundedButWritesAreNot is the regression test for A-9.
+//
+// Only ReadHeaderTimeout was set, so a keep-alive connection was still served
+// after twenty seconds idle and a slow body could hold a handler indefinitely.
+// The asymmetry in the fix is the part worth pinning: reads are bounded because a
+// client that will not finish sending is not one to keep, and the write deadline
+// is deliberately absent because HLS holds a response open and writes segments as
+// they are produced. A write deadline would cut a stream off mid-film, and the
+// tempting "set every timeout" edit is exactly the one that breaks playback.
+func TestServerTimeoutsAreBoundedButWritesAreNot(t *testing.T) {
+	t.Parallel()
+
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("reading main.go: %v", err)
+	}
+	text := string(source)
+
+	// The literal, so a check cannot be satisfied by an unrelated mention.
+	start := strings.Index(text, "server := &http.Server{")
+	if start < 0 {
+		t.Fatal("the http.Server literal was not found in main.go")
+	}
+	end := strings.Index(text[start:], "\n\t}")
+	if end < 0 {
+		t.Fatal("the http.Server literal is not terminated")
+	}
+	literal := text[start : start+end]
+
+	// Comments explain the reasoning; they are not settings.
+	var settings []string
+	for _, line := range strings.Split(literal, "\n") {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		settings = append(settings, line)
+	}
+	configured := strings.Join(settings, "\n")
+
+	for _, want := range []string{"ReadHeaderTimeout", "ReadTimeout", "IdleTimeout", "MaxHeaderBytes"} {
+		if !strings.Contains(configured, want) {
+			t.Errorf("the server does not set %s, so a client can hold a connection "+
+				"open without finishing its request", want)
+		}
+	}
+
+	// The deliberate omission.
+	if strings.Contains(configured, "WriteTimeout") {
+		t.Error("the server sets WriteTimeout, which cuts an HLS response off mid-stream: " +
+			"segments are written as they are produced, so the response is open for the " +
+			"length of the film")
+	}
+}

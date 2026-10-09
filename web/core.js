@@ -101,6 +101,28 @@
     return !!track && track.text === false && !subtitleDeliverable(track);
   }
 
+  /**
+   * Whether a track in the menu can actually be chosen.
+   *
+   * A text track needs a URL: the player toggles a <track> the element already
+   * owns, and a track with no URL has nothing to toggle. An image track needs a
+   * server that will composite it, which needs a burn index - a track with
+   * neither is listed but cannot be selected.
+   *
+   * The rule exists because the menu offered such tracks as enabled radios and
+   * choosing one did nothing: `selectSubtitle` returned without a word after the
+   * radio had already been repainted as checked, so the control looked broken
+   * (W-6 of the 2026-10-09 review). A menu entry that cannot be honoured is
+   * rendered disabled and says why.
+   */
+  function subtitleSelectable(track) {
+    if (!track) return false;
+    if (subtitleDeliverable(track)) return true;
+    if (!subtitleNeedsBurn(track)) return false;
+    const index = typeof track.index === "number" ? track.index : NaN;
+    return isFinite(index) && index > 0;
+  }
+
   /* ── progress reporting ───────────────────────────────────────────────── */
 
   /** A position shorter than this is not worth remembering. */
@@ -248,7 +270,40 @@
     }
   }
 
+  /* The playback engines the server can report. Named here because they are
+     compared against, and comparing against a string that is never produced is a
+     silent bug: the player read `pb.engine === "native"` while native HLS sets
+     `"native-hls"`, so a Safari user was told they were watching "the bundled
+     hls.js player" (W-5 of the 2026-10-09 review). */
+  const ENGINE_NATIVE = "native";
+  const ENGINE_NATIVE_HLS = "native-hls";
+  const ENGINE_HLS_JS = "hls.js";
+
+  /**
+   * What to call the engine the server reported.
+   *
+   * Unknown values are passed through rather than labelled as hls.js: saying
+   * "the bundled hls.js player" about something else is worse than saying what
+   * the server said.
+   */
+  function engineLabel(engine) {
+    switch (engine) {
+      case ENGINE_NATIVE:
+        return "the browser's native playback";
+      case ENGINE_NATIVE_HLS:
+        return "the browser's native HLS support";
+      case ENGINE_HLS_JS:
+        return "the bundled hls.js player over MSE";
+      default:
+        return typeof engine === "string" && engine ? engine : "an unknown engine";
+    }
+  }
+
   return {
+    ENGINE_NATIVE: ENGINE_NATIVE,
+    ENGINE_NATIVE_HLS: ENGINE_NATIVE_HLS,
+    ENGINE_HLS_JS: ENGINE_HLS_JS,
+    engineLabel: engineLabel,
     JOB_WAIT_MS: JOB_WAIT_MS,
     awaitJob: awaitJob,
     FINISHED_FRACTION: FINISHED_FRACTION,
@@ -262,5 +317,6 @@
     sourceTime: sourceTime,
     subtitleDeliverable: subtitleDeliverable,
     subtitleNeedsBurn: subtitleNeedsBurn,
+    subtitleSelectable: subtitleSelectable,
   };
 });

@@ -418,7 +418,7 @@ run inside/ffmpeg-version.txt "$DOCKER" exec "$CONTAINER_ID" ffmpeg -version
 run inside/ffmpeg-encoders.txt "$DOCKER" exec "$CONTAINER_ID" ffmpeg -hide_banner -encoders
 run inside/ffmpeg-hwaccels.txt "$DOCKER" exec "$CONTAINER_ID" ffmpeg -hide_banner -hwaccels
 run inside/ffmpeg-devices.txt "$DOCKER" exec "$CONTAINER_ID" sh -c \
-    'ls -l /dev/dri 2>&1; echo "--- /dev/nvidia* ---"; ls -l /dev/nvidia* 2>&1; echo "--- /dev/dri by-id ---"; ls -l /dev/dri/by-path 2>&1'
+    'echo "== /dev/dri =="; ls -l /dev/dri 2>&1; echo "== /dev/dri/by-path =="; ls -l /dev/dri/by-path 2>&1; echo "== /dev/nvidia* =="; ls -l /dev/nvidia* 2>&1; echo "== render nodes =="; ls /dev/dri/renderD* 2>&1; echo "== nvidia nodes =="; ls /dev/nvidia[0-9]* 2>&1'
 run inside/tesseract-version.txt "$DOCKER" exec "$CONTAINER_ID" tesseract --version
 run inside/identity-and-data.txt "$DOCKER" exec "$CONTAINER_ID" sh -c \
     'id; echo "--- /data ---"; ls -la /data; echo "--- /data/streams ---"; ls -la /data/streams 2>/dev/null | head -50; echo "--- /data/subtitles ---"; ls -la /data/subtitles 2>/dev/null | head -50; echo "--- ffmpeg processes ---"; ps -eo pid,ppid,etime,pcpu,pmem,args 2>/dev/null | grep -E "ffmpeg|astraeus" | grep -v grep'

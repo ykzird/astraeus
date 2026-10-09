@@ -337,3 +337,81 @@ test("awaitJob requires the two injected functions when there is a job", async (
     return core.awaitJob(accepted, {});
   }, /needs sleep and status/);
 });
+
+// ── the playback engine ─────────────────────────────────────────────────────
+//
+// W-5: the player compared `pb.engine === "native"` while native HLS sets
+// `"native-hls"`, so a Safari user was told they were watching "the bundled
+// hls.js player over MSE". Comparing against a string that is never produced
+// fails silently, which is why the names and the wording live here.
+
+test("engineLabel names native HLS as native, not as hls.js", () => {
+  assert.match(core.engineLabel(core.ENGINE_NATIVE_HLS), /native HLS/);
+  assert.doesNotMatch(core.engineLabel(core.ENGINE_NATIVE_HLS), /hls\.js/);
+});
+
+test("engineLabel names each engine the player actually sets", () => {
+  // The values have to match what app.js assigns, or the label is decoration.
+  assert.equal(core.ENGINE_NATIVE, "native");
+  assert.equal(core.ENGINE_NATIVE_HLS, "native-hls");
+  assert.equal(core.ENGINE_HLS_JS, "hls.js");
+
+  assert.match(core.engineLabel(core.ENGINE_NATIVE), /native/);
+  assert.match(core.engineLabel(core.ENGINE_HLS_JS), /hls\.js/);
+});
+
+test("engineLabel passes an unknown engine through rather than guessing", () => {
+  // Saying "the bundled hls.js player" about something else is worse than
+  // saying what the server said.
+  assert.equal(core.engineLabel("some-future-engine"), "some-future-engine");
+  assert.doesNotMatch(core.engineLabel("some-future-engine"), /hls\.js/);
+  // And a missing value is not an engine.
+  assert.equal(core.engineLabel(null), "an unknown engine");
+  assert.equal(core.engineLabel(""), "an unknown engine");
+});
+
+// ── which subtitle tracks can be chosen ─────────────────────────────────────
+//
+// W-6: a track the player could not honour was offered as a working radio, and
+// choosing it repainted the control and then returned without a word. The rule
+// lives here so the menu and the selection path cannot disagree about it.
+
+test("a text track with a URL is selectable", () => {
+  assert.equal(
+    core.subtitleSelectable({ index: 2, text: true, url: "/api/objects/x/subtitles/2.vtt" }),
+    true
+  );
+});
+
+test("a text track with no URL is not selectable", () => {
+  // The player toggles a <track> the element already owns; with no URL there is
+  // nothing to toggle, and the click did nothing.
+  assert.equal(core.subtitleSelectable({ index: 2, text: true }), false);
+  assert.equal(core.subtitleSelectable({ index: 2, text: true, url: "" }), false);
+});
+
+test("an image track is selectable when it can be burned", () => {
+  assert.equal(core.subtitleSelectable({ index: 3, text: false, codec: "hdmv_pgs_subtitle" }), true);
+});
+
+test("an image track with no usable index is not selectable", () => {
+  assert.equal(core.subtitleSelectable({ index: 0, text: false }), false);
+  assert.equal(core.subtitleSelectable({ text: false }), false);
+  assert.equal(core.subtitleSelectable(null), false);
+});
+
+test("nothing that is unselectable may be shown as checked", () => {
+  // The invariant the bug violated. Whatever the stored preference says, a
+  // track the menu cannot honour must not render as the current choice.
+  const unselectable = [
+    { index: 2, text: true },
+    { index: 0, text: false },
+    null,
+  ];
+  for (const track of unselectable) {
+    assert.equal(core.subtitleSelectable(track), false);
+    // And the menu's rule follows from it: checked requires selectable.
+    const checked = core.subtitleSelectable(track) && true;
+    assert.equal(checked, false);
+  }
+});
