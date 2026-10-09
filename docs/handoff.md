@@ -1,10 +1,12 @@
 # Handoff
 
-**As of the round-14 work of 2026-10-09 — measuring what the server costs, and
-the harness to repeat it. 135 tracked files; `v0.17.0` and `v0.18.0` are
-released, so the in-tree version is `dev` and the next tag would be
-`v0.18.1`.** (`git log` names the commits. Round 14 added
-`scripts/load-verify/` and measured the API and the 1080p and 4K transcode paths
+**As of the round-15 work of 2026-10-09 — TLS and the reverse proxy, verified
+against a real one. 137 tracked files; `v0.17.0` and `v0.18.0` are released, so
+the in-tree version is `dev` and the next tag would be `v0.18.1`.** (`git log`
+names the commits. Round 15 added `deploy/tls/` and ran it: Caddy terminating
+TLS, a client certificate as the viewer's identity, and the trust boundary the
+access gate depends on (§6). Round 14 added `scripts/load-verify/` and measured
+the API and the 1080p and 4K transcode paths
 on this host (§6), which turned up one real defect — transcode percentiles were
 interpolations rather than measurements, now fixed with per-metric bucket
 bounds. Round 12 ran the release workflow
@@ -742,6 +744,34 @@ transcode actually runs for; the test that pins it failed first at exactly
 real and explainable rather than arithmetic: the server measures from ffmpeg
 starting, the client measures the whole round trip.
 
+**TLS and the reverse proxy** are documented and verified as of round 15, in
+`deploy/tls/`: a Caddy configuration beside the unit that terminates TLS, sends
+the `Strict-Transport-Security` the server deliberately does not, and
+establishes the identity the gate believes — one client certificate per tester,
+whose subject becomes the viewer. The server has to be told both halves, so the
+runbook's unit change is `--auth-mode proxy --auth-header X-Astraeus-User
+--trusted-proxy 127.0.0.1/32,::1/128`.
+
+It was run rather than read. Against Caddy 2 with `client_auth`: a connection
+with no client certificate fails the handshake before any HTTP request; a valid
+one returns `200` with HSTS and no `Server` header; two testers appear as
+`user="CN=tester1"` and `user="CN=tester2"` on their request log lines; a
+position reported by one is invisible to the other; a client-forged
+`X-Astraeus-User` is overwritten by the proxy and appears nowhere in the log;
+direct play returns a working `206` range response and a transcode returns a
+playlist and a segment. Requests from the LAN address and from the Tailscale
+address, each carrying a well-formed identity header, are refused
+`403 untrusted_source` — the header is worthless without the address.
+`--rate-limit 1 --rate-limit-burst 2` then answered `200, 200, 429` with
+`Retry-After: 1` for one identity and `200` for a second, so the limiter really
+is keyed on the person and not on the connection.
+
+**One trap is worth carrying forward.** `--trusted-proxy 127.0.0.1/32` does not
+cover `::1`, and a proxy that resolves `localhost` may connect over IPv6. The
+symptom is a `403` for every request through a proxy that is plainly running,
+which reads like a fault in the proxy. The runbook lists both loopback families
+and says why.
+
 **A quality choice that caps a ladder** landed as of 0.16.0, which fixes a
 negotiation model that was thinner than its field name. Until now
 `max_height` did two jobs: it clipped the target height *and* it switched the
@@ -1064,25 +1094,21 @@ cover.
 
 Priority order, with the reasoning. Take it top-down.
 
-The two claims that used to head this list — the release run and the systemd unit
-— are done, and observed rather than reasoned about. §6 records what running them
-found, including the two defects that only a real run could surface. What is
-left:
+The claims that used to head this list — the release run, the systemd unit and
+the TLS example — are done, and observed rather than reasoned about. §6 records
+what running them found, including the defects that only a real run could
+surface. What is left:
 
-1. **A TLS example.** Release automation landed in round 10 (see §6), so a tag
-   now builds and publishes the archives and the image; what is still missing is
-   the reverse-proxy configuration beside the unit, and the runbook for the
-   access-gate interaction a proxy creates.
-2. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
+1. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
    VobSub (or DVB) track keeps its refusal and its burn because it lives in a
    different container with a different palette, and no such sample exists here.
    This is the natural continuation of round 8 and is smaller than it was: the
    pipeline, the routing and the fixture font all exist, so the work is one more
    decoder plus a fixture. See the OCR bullet in §8 for what is unverified.
-3. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
+2. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
    the gate remains instance-wide: it admits a request, it does not decide what
    the request may see, so every admitted viewer sees the whole library.
-4. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
+3. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
@@ -1152,13 +1178,17 @@ left:
   implemented, and scans, metadata lookups and individual segments are not
   spanned — so the specification's "from API call to media segment delivery" is
   covered up to the session starting, not to each segment.
-- **Rate limiting is verified by unit tests and one manual run, not by a real
-  proxy or a load test.** The identity-keyed path is exercised through the gate's
-  context in a test, not by Tailscale or Cloudflare Access forwarding headers on a
-  real network; `token` mode puts every API client in one bucket; and the limiter
-  is per process, so several replicas behind one proxy limit as a sum. The idle
-  sweep that bounds bucket memory is unit-tested with a two-key threshold, but has
-  not been observed under a flood of distinct addresses.
+- **Rate limiting is verified by unit tests, one manual run and now one real
+  proxy, but not by a load test.** The identity-keyed path was exercised for real
+  in round 15 through Caddy with client certificates: a burst of two at one per
+  second answers `200, 200, 429` with `Retry-After: 1` for one identity, and a
+  second identity gets its own bucket. What that still does not cover: Tailscale
+  and Cloudflare Access set their *own* header names, which the gate believes by
+  default but which no run has actually seen arrive; `token` mode puts every API
+  client in one bucket; and the limiter is per process, so several replicas
+  behind one proxy limit as a sum. The idle sweep that bounds bucket memory is
+  unit-tested with a two-key threshold, but has not been observed under a flood
+  of distinct addresses.
 - **One transport assertion is timing-sensitive on a 4K transcode.** A harness
   run against the 17 GB film reported 31/32 once, with the failing check outside
   the captured tail, and two immediate re-runs passed 32/32 on the same code.

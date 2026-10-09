@@ -93,7 +93,8 @@ harness passes with no console errors under the policy.
 
 `Strict-Transport-Security` is deliberately absent: this server speaks plain
 HTTP, where browsers ignore it. A reverse proxy that terminates TLS is where it
-belongs — see [`deploy/README.md`](../deploy/README.md).
+belongs — [`deploy/tls/README.md`](../deploy/tls/README.md) is the runbook for
+that, and for the identity the gate needs a proxy to assert.
 
 ## Access gate
 

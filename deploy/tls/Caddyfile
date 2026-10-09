@@ -1,0 +1,65 @@
+# Caddy in front of Astraeus Media: TLS termination, HSTS, and the identity that
+# the access gate believes.
+#
+#   docker run -d --name astraeus-caddy --network host \
+#     -v /etc/astraeus/tls:/etc/caddy/tls:ro \
+#     -v /etc/astraeus/Caddyfile:/etc/caddy/Caddyfile:ro \
+#     -v astraeus-caddy-data:/data \
+#     -e ASTRAEUS_HOST=media.example.com \
+#     caddy:2
+#
+# The whole runbook — certificates, the server's flags, and how to check it — is
+# in README.md beside this file. Read the section on the trust boundary before
+# changing the address in reverse_proxy below.
+{
+	# Only used when Caddy obtains the certificate itself; harmless otherwise.
+	email {$ACME_EMAIL:admin@example.com}
+
+	# Uncomment when the host cannot bind port 80 — a container without the
+	# capability, or something else already on it. Caddy otherwise answers plain
+	# HTTP on :80 to redirect to HTTPS; without that, a client that types the
+	# bare hostname gets a connection error instead of a redirect.
+	# auto_https disable_redirects
+}
+
+{$ASTRAEUS_HOST:media.example.com} {
+	# Certificates. This form uses files you already have, which is what the
+	# runbook generates. Two alternatives, both a one-line change:
+	#
+	#   tls {
+	#       client_auth { ... }
+	#   }
+	#       A public domain: Caddy obtains and renews the certificate over ACME,
+	#       which needs ports 80 and 443 reachable from the internet.
+	#
+	#   tls internal {
+	#       client_auth { ... }
+	#   }
+	#       A LAN name with no public DNS: Caddy issues from its own CA, and every
+	#       client has to trust that CA.
+	tls /etc/caddy/tls/server.crt /etc/caddy/tls/server.key {
+		# A client certificate is the whole authentication story: this Caddy
+		# refuses the connection unless the client presents one signed by your
+		# CA, and the subject of that certificate becomes the viewer's identity.
+		client_auth {
+			mode require_and_verify
+			trust_pool file /etc/caddy/tls/clients-ca.pem
+		}
+	}
+
+	header {
+		# The server speaks plain HTTP, where a browser ignores this header, so
+		# the proxy that terminates TLS is the only place it means anything.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# Do not advertise the software or its version.
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:8642 {
+		# The one place an identity is established. Setting the field replaces
+		# whatever the client sent, and the server believes this header only from
+		# the address in --trusted-proxy. Both halves are required: without the
+		# first, a client forges an identity; without the second, any client does.
+		header_up X-Astraeus-User {http.request.tls.client.subject}
+	}
+}

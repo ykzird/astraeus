@@ -73,6 +73,9 @@ docker run -d --name astraeus \
 Publishing on `127.0.0.1` and putting a reverse proxy in front is the intended
 shape; `-p 8642:8642` publishes it to every interface, which without
 `--auth-mode` hands anyone who can reach the port the whole library.
+[`tls/README.md`](tls/README.md) is the runbook for the proxy side: terminating
+TLS, sending `Strict-Transport-Security`, and giving each viewer an identity the
+gate can believe.
 
 **Which gate mode you choose changes what "per viewer" means.** Playback progress
 is keyed on the identity the gate attaches, so `--auth-mode proxy` (Tailscale or
@@ -314,7 +317,6 @@ identity that wrote them was never recorded.
 
 ## Not covered yet
 
-- **TLS.** Put Caddy, nginx or Tailscale in front; the server speaks plain HTTP.
 - **Multiple users or per-user libraries.** The gate is instance-wide: it decides
   whether a request is admitted, not what it may see, so every admitted user sees
   the whole library. Playback progress is per viewer, but access is not.

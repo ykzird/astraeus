@@ -155,6 +155,13 @@ Status as of the current build. Evidence for each claim is the test suite
       re-negotiates at the current position
 - [x] Controls that fade while playing and return on interaction, never hiding while
       paused, while focused, or while the pointer rests on them
+- [ ] An opt-in 4K path: a client whose system reports 4K support is asked
+      whether to switch, and a declined or dismissed prompt plays the 1080p
+      stream instead. The negotiation already expresses this — it is a default
+      and a consent step in the player, not a new delivery mode — and the
+      round-14 measurement is the argument for it: a 4K transcode costs roughly
+      2.6 CPU cores per realtime viewer against 0.5 for 1080p, so it should
+      never be what a viewer silently lands on
 - [ ] Subtitle appearance controls (size, colour, background)
 - [x] Poster/backdrop artwork: the UI renders `poster_url`/`backdrop_url`, which
       are this server's own proxy, and never the metadata provider's absolute URL
@@ -194,7 +201,14 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] A release archive that carries documentation a user needs and nothing else:
       the five reference pages, not `docs/handoff.md` or the removed reviews, with
       every relative link inside the archive resolving (checked in CI)
-- [ ] A TLS reverse-proxy example (Caddy or nginx) beside the systemd unit
+- [x] TLS and the reverse proxy as a runbook (`deploy/tls/`): a Caddy
+      configuration beside the unit, a client certificate per tester as the
+      viewer identity, the `--trusted-proxy` interaction the gate requires, and
+      the `Strict-Transport-Security` the server deliberately does not send.
+      Verified against a real Caddy rather than reasoned about: mutual TLS
+      enforced, per-viewer progress isolated through the proxy, a client-forged
+      identity header overwritten, LAN and Tailscale sources refused `403`, and
+      the rate limiter keyed on the identity the proxy asserted
 - [ ] Package the VAAPI userspace drivers into the image, so GPU transcoding
       works in a container without extra packages
 
@@ -329,7 +343,8 @@ Status as of the current build. Evidence for each claim is the test suite
   reports to, and a policy that reports nowhere is theatre. A deployment that
   wants violation reporting has to add both ends.
 - `Strict-Transport-Security` is not sent by the server. It speaks HTTP, so the
-  header would mean nothing there; a TLS-terminating proxy should set it.
+  header would mean nothing there; `deploy/tls/` is the proxy configuration that
+  sends it, and the runbook that says why.
 - Cross-origin isolation (`COOP`/`COEP`) is not configured. Nothing here needs
   it, and enabling it would break resources that are not `CORP`-tagged.
 - Tracing is traces only, over OTLP/HTTP, and opt-in. There is no OTLP over

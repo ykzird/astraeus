@@ -10,7 +10,8 @@ running, or are about to.
 | [Playback and delivery](playback.md) | Direct play, remux, transcode; the capability manifest; HDR and hardware encoders; audio tracks; image subtitles and OCR; the adaptive ladder |
 | [Configuration and operations](configuration.md) | Scanning libraries, every flag, the security headers, the access gate, rate limiting and tracing |
 | [HTTP API](api.md) | Every endpoint, the playback request and response, resume state and metrics |
-| [Deployment](../deploy/README.md) | The container and the systemd unit, backups and upgrades, and putting TLS in front |
+| [Deployment](../deploy/README.md) | The container and the systemd unit, backups and upgrades, and what the unit hardens |
+| [TLS in front of it](../deploy/tls/README.md) | Terminating TLS, the identity the access gate believes, client certificates, and the trust boundary that makes any of it worth something |
 
 ## Working on it
 
