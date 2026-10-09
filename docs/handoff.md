@@ -1,8 +1,12 @@
 # Handoff
 
-**As of the round-16 work of 2026-10-09 — per-viewer library access. 141 tracked
-files; `v0.17.0` and `v0.18.0` are released, so the in-tree version is `dev` and
-the next tag would be `v0.18.1`.** (`git log` names the commits. Round 16 added
+**As of the round-17 work of 2026-10-09 — a VobSub fixture, and the end of a
+blocker. 145 tracked files; `v0.17.0` and `v0.18.0` are released, so the in-tree
+version is `dev` and the next tag would be `v0.18.1`.** (`git log` names the
+commits. Round 17 disproved the note that had been blocking the VobSub reader
+for two rounds: ffmpeg cannot *mux* VobSub, but it can *encode* it, so the
+project's PGS fixture re-encodes into a real sample that ffmpeg decodes and
+tesseract reads (§7). Round 16 added
 `--access-policy`, which turns the gate from "may this request in" into "what may
 it see" (§6). Round 15 added `deploy/tls/` and ran it: Caddy terminating
 TLS, a client certificate as the viewer's identity, and the trust boundary the
@@ -1135,12 +1139,18 @@ the TLS example — are done, and observed rather than reasoned about. §6 recor
 what running them found, including the defects that only a real run could
 surface. What is left:
 
-1. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
-   VobSub (or DVB) track keeps its refusal and its burn because it lives in a
-   different container with a different palette, and no such sample exists here.
-   This is the natural continuation of round 8 and is smaller than it was: the
-   pipeline, the routing and the fixture font all exist, so the work is one more
-   decoder plus a fixture. See the OCR bullet in §8 for what is unverified.
+1. **A second image-subtitle reader, for VobSub.** OCR covers PGS only; a VobSub
+   (or DVB) track keeps its refusal and its burn. Round 17 removed the part that
+   was actually blocking it — the belief that no sample could be made here.
+   ffmpeg has no `vobsub` *muxer* but it does have a `dvdsub` *encoder*, so
+   `scripts/make-vobsub-fixture.sh` re-encodes this project's own PGS fixture
+   into real VobSub, and ffmpeg's decoder renders it and tesseract reads the
+   caption back out. What is left is the decoder — packets → SPU → control
+   sequence → RLE bitmap → RGBA — and the routing that offers the track as text
+   instead of as a burn. One trap is already known: the palette is in the
+   *container*, not the picture stream. Matroska's codec private carries the same
+   `.idx` text (`size:`, `palette:`), and a bare MPEG-PS sample carries none, so
+   an extraction has to keep the container that holds one.
 2. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
@@ -1244,11 +1254,13 @@ surface. What is left:
   capture the whole output, because `tail` is what lost the name of the check.
 - **Image subtitles are verified for PGS, for software encoders, at one
   rendition.** The fixture is hand-written by `internal/testfixtures/pgs` because
-  no real PGS or VobSub sample exists on this host, so what was exercised is
+  no real Blu-ray or DVD sample exists on this host, so what was exercised is
   ffmpeg's PGS decoder on a synthetic rectangle — not a real Blu-ray subtitle with
   its palette, cropping and partial object updates. VobSub shares the track
   classification and the same overlay path but has never been decoded here at
-  all. `scale2ref`/`overlay` has only been run with libx264: a hardware encoder's
+  all; round 17 showed a VobSub sample can at least be synthesised (§7), which is
+  a fixture and not yet a decoder. `scale2ref`/`overlay` has only been run with
+  libx264: a hardware encoder's
   upload filter has never been combined with the burn graph, and a ladder is
   refused for a burn rather than composited per rung. A real PGS sample would be
   the cheapest way to strengthen all of this.

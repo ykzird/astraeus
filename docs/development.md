@@ -74,6 +74,7 @@ web/                    the Spatial Web UI, including vendored hls.js
 scripts/ui-verify/      browser harnesses for playback and subtitles
 scripts/load-verify/    load, latency and CPU measurement harnesses
 scripts/pgsgen/         writes a PGS (.sup) fixture for those harnesses
+scripts/make-vobsub-fixture.sh  re-encodes a PGS fixture into a VobSub one
 scripts/make-demo-media.sh  generates a throwaway demo library
 deploy/                 the systemd unit and the deployment runbook
 Dockerfile              the container image (multi-stage, ffmpeg included)

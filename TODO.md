@@ -68,6 +68,16 @@ Status as of the current build. Evidence for each claim is the test suite
       tesseract; the browser harness sees the caption on screen (10/10). The
       server must not be *worse* without the dependency: a unit test pins the
       refusal and the integration test skips when tesseract is absent
+- [ ] **OCR for VobSub (and DVB) image subtitles**: the second bitmap reader. The
+      pipeline, the routing and the optional-runtime-dependency rules already
+      exist for PGS; what is missing is a decoder for the other format — packets
+      → SPU → control sequence → RLE bitmap → RGBA. A synthetic sample is now
+      available: `scripts/make-vobsub-fixture.sh` re-encodes the PGS fixture with
+      ffmpeg's `dvdsub` encoder into `internal/subtitles/testdata/`, and ffmpeg's
+      decoder plus tesseract read the caption back out of it. The palette lives
+      in the container rather than the picture stream, so the extraction has to
+      keep Matroska's codec private (the `.idx` text), which a bare MPEG-PS
+      sample does not carry
 - [x] `max_bitrate_kbps` acted on rather than echoed: the audio's share is
       reserved and the video held to the remainder as a VBV ceiling, uniformly
       across encoder families. Verified end to end — the same 9 Mbps source came
@@ -299,9 +309,11 @@ Status as of the current build. Evidence for each claim is the test suite
   correctly. Cue timing from a hand-written `.sup` is shifted when ffmpeg remuxes
   it into Matroska, which is why the tests assert words rather than exact times.
 - The burn-in path is verified for **PGS** and only for software encoders. VobSub
-  shares the track classification and the same overlay path, but no VobSub sample
-  exists on this host, so it is reasoned about rather than observed; a hardware
-  encoder's upload filter has never been combined with the burn graph.
+  shares the track classification and the same overlay path, but no real VobSub
+  sample exists on this host — a synthetic one can now be generated
+  (`scripts/make-vobsub-fixture.sh`), and ffmpeg's own decoder reads its caption
+  back, but nothing decodes it inside the server yet; a hardware encoder's upload
+  filter has never been combined with the burn graph.
 - Browser clients are capped at 1080p, 8-bit and stereo by default, and do not
   declare HDR support, so a PQ film is tone mapped for them by design. There is
   no surround passthrough and no per-client override beyond sending a capability
