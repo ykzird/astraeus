@@ -38,6 +38,7 @@
     fetchFailure: fetchFailure, rollbackSubtitleSelection: rollbackSubtitleSelection,
     unloadTeardownIsPending: unloadTeardownIsPending, bfcacheRestore: bfcacheRestore,
     prunedSummary: prunedSummary, shouldCheckHealth: shouldCheckHealth,
+    entityListIsCurrent: entityListIsCurrent, clearedEntityList: clearedEntityList,
   } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */

@@ -197,9 +197,19 @@ jobs:
       # Pinned to a commit, not a tag: a tag can be moved under the job.
       # This is the only gate on the Go standard library itself, which is where
       # the 18 reachable vulnerabilities the 2026-10-09 review found lived.
+      #
+      # `cache: false` because this action caches the module tree itself by
+      # default, and the `actions/setup-go` step above already restores it - so
+      # the tree was extracted twice into the same directory. `tar` overwrites
+      # what is already there and prints "Cannot open: File exists" for every
+      # file, which this action surfaces as an error annotation: 9,057 of them in
+      # the v0.19.0 release run. The step still passed, but a job whose log is
+      # nine thousand errors cannot show you the one that matters. The Go cache
+      # above is the one that should do this work.
       - uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
         with:
           go-package: ./...
+          cache: false
 
   image:
     name: Build the container image
