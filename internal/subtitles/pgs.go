@@ -323,6 +323,13 @@ func (d *pgsDecoder) compose() *image.RGBA {
 		if object == nil || object.width <= 0 || object.height <= 0 {
 			continue
 		}
+		// A position is clamped rather than trusted: the field is a 16-bit
+		// unsigned number, so an object can claim to sit 65535 pixels away from
+		// anything, which is how the 17 GB bounding box was reachable. Clamping
+		// keeps the picture - a real subpicture's elements are inside the frame -
+		// and an element entirely outside it simply contributes nothing.
+		element.x = clampPGSCoord(element.x)
+		element.y = clampPGSCoord(element.y)
 		if len(items) == 0 {
 			minX, minY = element.x, element.y
 			maxX, maxY = element.x+object.width, element.y+object.height
@@ -338,7 +345,15 @@ func (d *pgsDecoder) compose() *image.RGBA {
 		return nil
 	}
 
-	img := image.NewRGBA(image.Rect(0, 0, maxX-minX, maxY-minY))
+	width, height := maxX-minX, maxY-minY
+	if width <= 0 || height <= 0 {
+		return nil
+	}
+	if err := checkPGSPlane(width, height); err != nil {
+		return nil
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	for _, item := range items {
 		for row := 0; row < item.object.height; row++ {
 			for column := 0; column < item.object.width; column++ {
@@ -353,6 +368,62 @@ func (d *pgsDecoder) compose() *image.RGBA {
 	return img
 }
 
+// PGS resources are bounded, because the input is not trusted.
+//
+// A library file is usually a download, and the PGS bitmap inside it is just
+// bytes: the format's width and height are 16-bit fields, so a 125-byte stream
+// can declare two 1x1 objects at (0,0) and (65535,65535). Composing those needs
+// a bounding box 65536 pixels square, which is image.NewRGBA asking for 17 GB -
+// and that is a runtime fatal error rather than a panic, so net/http cannot
+// recover it and the process dies on the first OCR request (L-3 of the 2026-10-09
+// review).
+//
+// The limits are generous rather than tight. A composition canvas larger than
+// 8K cannot be a real subpicture: the largest commercial format is 4K, whose
+// frame is 8.3 megapixels, so the pixel cap is set above that and a single
+// object bigger than a whole 8K frame is treated as malformed.
+const (
+	// maxPGSCanvasDimension bounds a declared video or object dimension.
+	maxPGSCanvasDimension = 8192
+	// maxPGSPixels bounds one object's plane and one composed image, at about
+	// 67 megapixels - eight times a 4K frame, so no real subpicture is refused.
+	maxPGSPixels = 64 << 20
+)
+
+// checkPGSPlane refuses a bitmap whose geometry could not come from a real
+// subpicture, before anything is allocated for it.
+//
+// The check is on the dimensions and on their product: a 65535x65535 object has
+// a plausible-looking width and an implausible area, and it is the area that
+// decides how much memory the plane needs.
+func checkPGSPlane(width, height int) error {
+	if width <= 0 || height <= 0 {
+		return fmt.Errorf("%w: a %dx%d bitmap is empty", ErrInvalidPGS, width, height)
+	}
+	if width > maxPGSCanvasDimension || height > maxPGSCanvasDimension {
+		return fmt.Errorf("%w: a %dx%d bitmap exceeds the %d-pixel limit",
+			ErrInvalidPGS, width, height, maxPGSCanvasDimension)
+	}
+	if width*height > maxPGSPixels {
+		return fmt.Errorf("%w: a %dx%d bitmap is %d pixels, over the %d-pixel limit",
+			ErrInvalidPGS, width, height, width*height, maxPGSPixels)
+	}
+	return nil
+}
+
+// clampPGSCoord bounds one element position. Real positions are inside a video
+// frame, so a value beyond the largest canvas dimension is a malformed or
+// hostile stream rather than a place on screen.
+func clampPGSCoord(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > maxPGSCanvasDimension {
+		return maxPGSCanvasDimension
+	}
+	return value
+}
+
 // decodePGSObject decodes one object's data: its size, then a run-length
 // encoded plane of palette indexes.
 func decodePGSObject(data []byte) (*pgsObject, error) {
@@ -363,6 +434,9 @@ func decodePGSObject(data []byte) (*pgsObject, error) {
 	height := int(binary.BigEndian.Uint16(data[2:4]))
 	if width <= 0 || height <= 0 {
 		return nil, nil
+	}
+	if err := checkPGSPlane(width, height); err != nil {
+		return nil, err
 	}
 	indexes, err := decodePGSRLE(data[4:], width, height)
 	if err != nil {
