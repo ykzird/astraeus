@@ -448,8 +448,10 @@ func TestExemptPaths(t *testing.T) {
 		{
 			name: "token mode",
 			cfg: Config{
-				Mode:        ModeToken,
-				Token:       "t",
+				Mode: ModeToken,
+				// Long enough for the minimum; the value is irrelevant to this
+				// test, which is about which paths bypass the gate.
+				Token:       "0123456789abcdef0123456789abcdef",
 				ExemptPaths: []string{"/api/health"},
 				Logger:      testLogger(),
 			},
@@ -595,5 +597,40 @@ func TestIdentityFromContext_EmptyWhenAbsent(t *testing.T) {
 
 	if got := IdentityFromContext(request(http.MethodGet, "/", "127.0.0.1:1").Context()); got != "" {
 		t.Errorf("identity = %q, want empty", got)
+	}
+}
+
+// TestNew_RefusesAShortToken is the regression test for the token half of A-6.
+//
+// Any non-blank token was accepted. The comparison is exact and constant-time, so
+// the token's length is the whole of the attacker's problem, and a three-character
+// token is a three-character search - the sort of thing a server set up to
+// "survive a reboot" quietly has.
+func TestNew_RefusesAShortToken(t *testing.T) {
+	t.Parallel()
+
+	for _, token := range []string{
+		"t",
+		"hunter2",
+		"0123456789abcde", // one short of the minimum
+	} {
+		if _, err := New(Config{Mode: ModeToken, Token: token, Logger: testLogger()}); err == nil {
+			t.Errorf("New accepted a %d-character token %q", len(token), token)
+		}
+	}
+
+	// The minimum itself, and the documented generator's output, are accepted.
+	for _, token := range []string{
+		"0123456789abcdef", // exactly the minimum
+		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", // openssl rand -hex 32
+	} {
+		if _, err := New(Config{Mode: ModeToken, Token: token, Logger: testLogger()}); err != nil {
+			t.Errorf("New refused a %d-character token: %v", len(token), err)
+		}
+	}
+
+	// A blank token is still the other refusal, with its own message.
+	if _, err := New(Config{Mode: ModeToken, Token: "   ", Logger: testLogger()}); err == nil {
+		t.Error("New accepted a blank token")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -411,5 +412,65 @@ func TestBackupDocumentationNamesRealPaths(t *testing.T) {
 	// And it must say sqlite3 is required, because it is not a project dependency.
 	if !strings.Contains(section, "sqlite3") {
 		t.Error("the backup section does not mention sqlite3, which its recipe needs")
+	}
+}
+
+// TestRateLimitAddress covers the IPv6 half of A-6.
+//
+// The limiter keyed on the peer address, so an IPv6 host - which is routinely
+// given a whole /64 and can use any address in it - got a fresh bucket for every
+// address it tried. One machine with one allocation could make the limit
+// meaningless, and it is exactly the client most likely to be running a loop.
+//
+// The /64 is the unit that is allocated, so it is the unit that is limited. IPv4
+// is deliberately left alone: it is not handed out in blocks that size to one
+// client, and grouping it would charge one client for another's requests.
+func TestRateLimitAddress(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		addr string
+		want string
+	}{
+		{"IPv4 is unchanged", "203.0.113.7", "203.0.113.7"},
+		{"loopback v4 is unchanged", "127.0.0.1", "127.0.0.1"},
+		{"IPv6 keeps its full address", "2001:db8::1", "2001:db8::/64"},
+		{
+			// The whole point: two addresses from one allocation share a bucket.
+			name: "a second address in the same /64 shares the bucket",
+			addr: "2001:db8::dead:beef",
+			want: "2001:db8::/64",
+		},
+		{
+			// And a different allocation does not.
+			name: "a different /64 is a different bucket",
+			addr: "2001:db8:1::1",
+			want: "2001:db8:1::/64",
+		},
+		{"IPv6 loopback follows the same rule", "::1", "::/64"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			addr, err := netip.ParseAddr(tt.addr)
+			if err != nil {
+				t.Fatalf("parsing %q: %v", tt.addr, err)
+			}
+			if got := rateLimitAddress(addr); got != tt.want {
+				t.Errorf("rateLimitAddress(%s) = %q, want %q", tt.addr, got, tt.want)
+			}
+		})
+	}
+
+	// Two addresses in one allocation must produce one key, or the test above
+	// passes for the wrong reason.
+	first, _ := netip.ParseAddr("2001:db8::1")
+	second, _ := netip.ParseAddr("2001:db8::2")
+	if rateLimitAddress(first) != rateLimitAddress(second) {
+		t.Error("two addresses from one /64 produced different rate-limit keys, so a " +
+			"host can rotate through its allocation and never be limited")
 	}
 }

@@ -189,6 +189,10 @@ mode without a token, refuses to start.
 so liveness probes keep working. `/metrics` is **not** exempt: point Prometheus
 at it with a token or let it through the proxy.
 
+The token must be at least 16 characters, and the server refuses to start with a
+shorter one. The comparison is exact and constant-time, so the token's length is
+the whole of an attacker's problem: generate it with `openssl rand -hex 32`.
+
 Identity is recorded on every request log line the API serves, so the gate is
 auditable for everything it admits - a request it refuses is counted by
 `astraeus_auth_denied_total{reason}` instead, because the gate answers before
@@ -269,7 +273,16 @@ not restricted further, and there is no per-library administration.
 
 `--rate-limit` (requests per second per client, default `0` = off) bounds how
 often the API may be called, and `--rate-limit-burst` sets how many requests a
-client may make at once (default: the rate rounded up, which is the smallest
+client may make at once. A client is keyed by the gate identity when there is one
+and by the peer address otherwise; an **IPv6 client is keyed by its /64**, because
+a host is routinely given a whole /64 and limiting each address in it separately
+would hand one machine 2^64 buckets. IPv4 is keyed by the address, since it is not
+allocated in blocks that size to one client.
+
+Note that the limiter sits inside the gate, so a request that is **refused** for a
+bad token is not counted - a client guessing tokens can try faster than the limit.
+Where that matters, put the limit at the reverse proxy instead, which sees the
+traffic before the server does (default: the rate rounded up, which is the smallest
 bucket a normal page load still fits in).
 
 ```sh

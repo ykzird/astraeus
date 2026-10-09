@@ -2,10 +2,17 @@ package library_test
 
 import (
 	"context"
-	"github.com/ykzird/astraeus/internal/library"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/ykzird/astraeus/internal/library"
+	"github.com/ykzird/astraeus/internal/observability"
 )
 
 func TestScanScheduler_ScanAll(t *testing.T) {
@@ -173,4 +180,83 @@ func TestScanScheduler_DisabledIntervalReturnsImmediately(t *testing.T) {
 	if scheduler.Interval() != 0 {
 		t.Errorf("interval = %v, want 0", scheduler.Interval())
 	}
+}
+
+// TestScanAll_MetricsCarryNoLibraryName is the regression test for A-5.
+//
+// The scan metrics were labelled `{"library": lib.Name}`. /metrics is not behind
+// the access policy - it is gated, but a token holder and a Prometheus scraper see
+// whatever it exposes - so a library's name was readable by everything that could
+// scrape, including a library a viewer is not allowed to see. The name is the one
+// field of a library that is a viewer's words; the id names it just as precisely
+// for whoever is reading the metric and discloses nothing.
+//
+// The test asserts on the rendered Prometheus output rather than on the call site,
+// because that is what a scraper reads.
+func TestScanAll_MetricsCarryNoLibraryName(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "Heat (1995).mkv"), "bytes")
+
+	metrics := observability.New()
+	const secretName = "Family Videos"
+	mustLibraryAtNamed(t, repo, root, library.MoviesLibrary, secretName)
+
+	scheduler := library.NewScanScheduler(repo, library.NewScanner(repo, newTestLogger()), 0, newTestLogger())
+	scheduler.SetMetrics(metrics)
+
+	if _, err := scheduler.ScanAll(ctx); err != nil {
+		t.Fatalf("ScanAll: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := recorder.Body.String()
+
+	if strings.Contains(body, secretName) {
+		t.Errorf("the metrics output contains the library's name %q, which is readable by "+
+			"anyone who can scrape /metrics:\n%s", secretName, firstLinesContaining(body, secretName))
+	}
+
+	// The scan metrics are still there, labelled by something.
+	if !strings.Contains(body, "astraeus_scan_seconds") {
+		t.Error("the scan histogram is missing from the metrics output")
+	}
+	if !strings.Contains(body, `library="`) {
+		t.Error("the scan histogram carries no library label at all, so its series cannot " +
+			"be told apart")
+	}
+}
+
+// firstLinesContaining returns the lines of body that mention needle, so a failure
+// shows what leaked rather than the whole scrape.
+func firstLinesContaining(body, needle string) string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, needle) {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// mustLibraryAtNamed registers a library with a chosen name, so a test can assert
+// that the name does not appear somewhere it should not.
+func mustLibraryAtNamed(t *testing.T, repo library.Repository, root string, kind library.LibraryKind, name string) *library.Library {
+	t.Helper()
+
+	lib := &library.Library{
+		ID:        uuid.NewString(),
+		Name:      name,
+		Path:      root,
+		Kind:      kind,
+		CreatedAt: time.Now(),
+	}
+	if err := repo.CreateLibrary(context.Background(), lib); err != nil {
+		t.Fatalf("creating library %q: %v", name, err)
+	}
+	return lib
 }

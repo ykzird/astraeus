@@ -43,6 +43,14 @@ const (
 	ModeToken Mode = "token"
 )
 
+// minimumTokenLength is the shortest bearer token the gate will accept.
+//
+// The token is compared exactly and in constant time, so an attacker has to guess
+// the whole string; the length is what makes guessing hopeless rather than slow.
+// Sixteen characters is 64 bits if the token is random hex, and the documented
+// generator produces 32 bytes.
+const minimumTokenLength = 16
+
 // ParseMode validates a user-supplied mode.
 func ParseMode(value string) (Mode, error) {
 	switch Mode(strings.ToLower(strings.TrimSpace(value))) {
@@ -182,6 +190,18 @@ func New(cfg Config) (*Gate, error) {
 	case ModeToken:
 		if strings.TrimSpace(cfg.Token) == "" {
 			return nil, errors.New("access: token mode requires a token")
+		}
+		// A minimum length, because any non-blank token was accepted and the
+		// comparison is exact rather than derived: a three-character token is a
+		// three-character search. The comparison itself is constant-time, so
+		// length is the whole of the attacker's problem, and this makes brute
+		// force infeasible rather than merely slow (A-6 of the 2026-10-09
+		// review). Sixteen hex characters is 64 bits; the documented way to
+		// generate one is 32 bytes.
+		if len(cfg.Token) < minimumTokenLength {
+			return nil, fmt.Errorf(
+				"access: the token is %d characters and must be at least %d; generate one with `openssl rand -hex 32`",
+				len(cfg.Token), minimumTokenLength)
 		}
 		return gate, nil
 

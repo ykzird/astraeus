@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -879,7 +880,32 @@ func apiClientKey(r *http.Request) string {
 		return "identity:" + identity
 	}
 	if addr, ok := access.ClientAddress(r); ok {
-		return "address:" + addr.String()
+		return "address:" + rateLimitAddress(addr)
 	}
 	return ""
+}
+
+// rateLimitAddress groups an address the way a rate limit wants it grouped.
+//
+// An IPv6 host is routinely given a whole /64, and a single machine can use any
+// address in it. Keying per address therefore handed one host 2^64 buckets and
+// made the limit meaningless for exactly the clients most likely to run a loop
+// (A-6 of the 2026-10-09 review). The /64 is the unit that is actually allocated,
+// so it is the unit that is limited.
+//
+// IPv4 is left alone. It is not allocated in blocks that size to one client, and
+// widening it - 127.0.0.0/24 would put a whole LAN in one bucket - would start
+// charging one client for another's requests.
+func rateLimitAddress(addr netip.Addr) string {
+	if !addr.Is6() {
+		return addr.String()
+	}
+	prefix, err := addr.Prefix(64)
+	if err != nil {
+		// Not reachable for a valid IPv6 address, but a key is not the place to
+		// panic; falling back to the address narrows the bucket rather than
+		// widening it.
+		return addr.String()
+	}
+	return prefix.String()
 }

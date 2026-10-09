@@ -111,18 +111,26 @@ func (s *ScanScheduler) ScanAll(ctx context.Context) ([]ScanOutcome, error) {
 		outcome := ScanOutcome{LibraryID: lib.ID, LibraryName: lib.Name}
 		scanStart := time.Now()
 		result, err := s.scanner.ScanLibrary(ctx, &lib)
+		// Labelled by id, not by name. The name is what a viewer chose and can be
+		// anything - including the title of something a viewer is not allowed to
+		// see - and /metrics is not behind the access policy, so a name here was
+		// readable by anyone who could reach the port (A-5 of the 2026-10-09
+		// review). An id names the library just as precisely for the person reading
+		// the metric, and discloses nothing to anyone else.
 		s.metrics.ObserveHistogram(
 			"astraeus_scan_seconds",
 			"Time taken to walk one library directory and reconcile it with the database.",
 			time.Since(scanStart).Seconds(),
-			map[string]string{"library": lib.Name},
+			map[string]string{"library": lib.ID},
 		)
 		if err != nil {
 			outcome.Error = err.Error()
 		} else {
 			outcome.Result = result
 			s.metrics.AddCounter("astraeus_scan_files_total", "Media files seen by the scanner.", float64(result.FilesSeen), nil)
-			s.metrics.IncCounter("astraeus_scan_runs_total", "Completed scan passes per library.", map[string]string{"library": lib.Name})
+			s.metrics.IncCounter("astraeus_scan_runs_total",
+				"Completed scan passes per library, labelled by library id.",
+				map[string]string{"library": lib.ID})
 		}
 		outcomes = append(outcomes, outcome)
 	}
