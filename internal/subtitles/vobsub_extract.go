@@ -56,6 +56,12 @@ func (s *Service) probeSubtitleStream(ctx context.Context, mediaPath string, ord
 		"-v", "error",
 		"-select_streams", "s:"+strconv.Itoa(ordinal),
 		"-show_entries", "stream=extradata",
+		// `-show_data` is what prints extradata at all. Without it the entry is
+		// requested, reported as present and left empty, so a container whose
+		// palette lives there - an MPEG program stream, anything HandBrake wrote -
+		// was refused with "carries no palette in its container". The palette was
+		// there; ffprobe was told not to print it (L-12 of the 2026-10-09 review).
+		"-show_data",
 		"-of", "default=noprint_wrappers=1:nokey=1",
 		mediaPath)
 	output, err = stream.Output()
