@@ -58,10 +58,35 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 	if err != nil {
 		return result, fmt.Errorf("resolving library path %q: %w", lib.Path, err)
 	}
+
+	// The root is resolved to a real path before anything walks it.
+	//
+	// os.Stat follows a symbolic link but filepath.WalkDir does not: it lstats
+	// the root, sees something that is not a directory, and stops. So a library
+	// registered as a symlink - the ordinary shape in a Docker or NAS setup,
+	// where /media is a link to the real volume - reported zero files and said
+	// nothing about why (L-5 of the 2026-10-09 review).
+	resolved, resolveErr := filepath.EvalSymlinks(root)
+	if resolveErr != nil {
+		// An unresolvable root is a real error, not a link to be ignored: the
+		// path exists for Stat but cannot be followed.
+		return result, fmt.Errorf("resolving library path %q: %w", lib.Path, resolveErr)
+	}
+	root = resolved
+
 	if info, statErr := os.Stat(root); statErr != nil {
 		return result, fmt.Errorf("library path %q: %w", lib.Path, statErr)
 	} else if !info.IsDir() {
 		return result, fmt.Errorf("library path %q is not a directory", lib.Path)
+	}
+
+	// If the root is still a link, EvalSymlinks left it alone and the walk is
+	// about to see a non-directory and stop. Saying so beats reporting an empty
+	// library with no explanation.
+	if info, lstatErr := os.Lstat(root); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		result.Warnings = append(result.Warnings,
+			fmt.Sprintf("%s is a symbolic link that could not be resolved, so it was not walked", lib.Path))
+		s.logger.WarnContext(ctx, "library root is an unresolved symbolic link", "path", lib.Path)
 	}
 
 	// tally accumulates the distinct entities this pass touches.
