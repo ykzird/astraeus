@@ -34,6 +34,7 @@
     ENGINE_NATIVE: ENGINE_NATIVE, ENGINE_NATIVE_HLS: ENGINE_NATIVE_HLS,
     ENGINE_HLS_JS: ENGINE_HLS_JS, engineLabel: engineLabelFor,
     subtitleSelectable: subtitleSelectable, orphanedSessionId: orphanedSessionId,
+    shouldRenegotiateAfterFailure: shouldRenegotiateAfterFailure,
   } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */
@@ -2554,6 +2555,27 @@
       } catch (error) {
         /* fall through to the failure path */
       }
+    }
+
+    /* Both recoveries have been tried. Before reporting a failure, ask the server
+       for a new session at where the viewer is: a session it has reaped answers
+       404, and `startLoad()` above cannot bring it back, but a new session can.
+       This happens once - a second failure is real (S-10 of the 2026-10-09
+       review). */
+    const position = currentSourceTime(pb);
+    if (shouldRenegotiateAfterFailure({
+      sessionCurrent: state.playback === pb,
+      alreadyRenegotiated: recovery.renegotiated === true,
+      position: position,
+    })) {
+      recovery.renegotiated = true;
+      toast("The stream expired; resuming…", "info");
+      resumeSession({
+        startSeconds: position,
+        preferredHeight: pb.preferredHeight,
+        audioTrackIndex: pb.audioTrackIndex,
+      });
+      return;
     }
 
     failSegmentedPlayback(

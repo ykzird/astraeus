@@ -26,9 +26,21 @@ const (
 	// defaultSegmentSeconds is the HLS target segment duration. Six seconds is
 	// the usual compromise between startup latency and request overhead.
 	defaultSegmentSeconds = 6
-	// defaultSessionTTL is how long an unwatched session is kept before its
-	// ffmpeg process is stopped.
-	defaultSessionTTL = 2 * time.Minute
+	// defaultSessionTTL is how long an idle session is kept before its ffmpeg
+	// process is stopped.
+	//
+	// Idle means no client has asked for anything, which is not the same as
+	// unwatched. hls.js stops polling once a playlist carries #EXT-X-ENDLIST -
+	// which a fast remux writes well before the viewer has finished watching - so
+	// a short TTL ends the session under someone who paused. At two minutes the
+	// review measured exactly that: the session was reaped and the UI offered
+	// "Recovery was not possible" (S-10 of the 2026-10-09 review).
+	//
+	// Half an hour covers a pause, a phone call, and a viewer who walked away
+	// without closing the tab. It is configurable with --session-ttl, because the
+	// right value is a function of how the install is used rather than of
+	// anything the server knows.
+	defaultSessionTTL = 30 * time.Minute
 	// playlistWait bounds how long Start waits for ffmpeg to publish a
 	// playlist before giving up.
 	playlistWait = 30 * time.Second
@@ -721,6 +733,16 @@ func (m *Manager) Reap(now time.Time) int {
 		m.Stop(id)
 	}
 	return len(stale)
+}
+
+// SessionTTL reports how long an idle session is kept.
+//
+// It exists so the value can be asserted rather than read out of a struct: the
+// default is what decides whether a viewer who pauses loses their stream, so it
+// is worth a test that fails when someone shortens it without thinking about that
+// (S-10 of the 2026-10-09 review).
+func (m *Manager) SessionTTL() time.Duration {
+	return m.cfg.SessionTTL
 }
 
 // ReapLoop reaps idle sessions until the context is cancelled.

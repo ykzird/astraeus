@@ -52,6 +52,7 @@ rather than here:
 | `--web-dir` | `web` | Static UI directory |
 | `--ffmpeg`, `--ffprobe` | `ffmpeg`, `ffprobe` | Binaries to run. Without them the server starts and lists the library; the media routes answer `503 streaming_unavailable` |
 | `--stream-root` | temp | HLS session directories |
+| `--session-ttl` | `30m` | How long an idle streaming session is kept before its encoder stops. An idle session is one no client has asked for, which includes a viewer who paused — hls.js stops polling once a playlist is complete |
 | `--segment-seconds` | 6 | HLS target segment duration |
 | `--max-sessions` | 8 | Concurrent segmented streams |
 | `--image-cache`, `--subtitle-cache` | temp | Artwork and WebVTT caches |

@@ -252,6 +252,11 @@ func runServe(args []string) error {
 	deviceDir := fs.String("device-dir", "/dev/dri",
 		"directory containing hardware transcoding devices (Intel QuickSync / VAAPI)")
 	segmentSeconds := fs.Int("segment-seconds", 6, "target HLS segment duration in seconds")
+	sessionTTL := fs.Duration("session-ttl", 30*time.Minute,
+		"how long an idle streaming session is kept before its encoder is stopped. "+
+			"An idle session is one no client has asked for, which includes a viewer who "+
+			"paused: hls.js stops polling once a playlist is complete, so a short TTL ends "+
+			"playback under a viewer who is still watching")
 	webDir := fs.String("web-dir", "web", "directory of static UI assets served at /; empty serves the API only")
 	imageCache := fs.String("image-cache", filepath.Join(os.TempDir(), "astraeus-images"),
 		"directory caching artwork proxied from the metadata provider")
@@ -523,6 +528,7 @@ func runServe(args []string) error {
 			FFmpegBin:      *ffmpegBin,
 			RootDir:        *streamRoot,
 			SegmentSeconds: *segmentSeconds,
+			SessionTTL:     *sessionTTL,
 			MaxSessions:    *maxSessions,
 			Server:         deps.Server,
 			Metrics:        metrics,

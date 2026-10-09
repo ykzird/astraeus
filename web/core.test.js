@@ -464,3 +464,55 @@ test("an id already released is not released again", () => {
     "sess-new"
   );
 });
+
+// ── recovering from a reaped session ────────────────────────────────────────
+//
+// S-10: a fast remux finishes producing, hls.js stops polling, the server reaps
+// the idle session, and the player reports "Recovery was not possible" under a
+// viewer who is still watching. The TTL is longer and configurable now, but a
+// session can still expire, and the one thing that recovers it is a new session
+// at the current position rather than a retry against a playlist that is gone.
+
+test("a failure with a position to resume from is renegotiated", () => {
+  assert.equal(
+    core.shouldRenegotiateAfterFailure({ sessionCurrent: true, position: 754.5 }),
+    true
+  );
+  // A position of zero is still a position: restarting from the beginning is a
+  // better answer than a dead player.
+  assert.equal(core.shouldRenegotiateAfterFailure({ sessionCurrent: true, position: 0 }), true);
+});
+
+test("renegotiation happens once, not in a loop", () => {
+  // A server that keeps refusing is a real failure, and retrying forever against
+  // it is a client bug rather than a recovery.
+  assert.equal(
+    core.shouldRenegotiateAfterFailure({
+      sessionCurrent: true,
+      position: 100,
+      alreadyRenegotiated: true,
+    }),
+    false
+  );
+});
+
+test("a failure belonging to a replaced session is not renegotiated", () => {
+  // The viewer navigated away while the stream was breaking. Starting a new
+  // session would play something they are no longer looking at.
+  assert.equal(
+    core.shouldRenegotiateAfterFailure({ sessionCurrent: false, position: 100 }),
+    false
+  );
+});
+
+test("a failure with no usable position is not renegotiated", () => {
+  assert.equal(core.shouldRenegotiateAfterFailure({ sessionCurrent: true }), false);
+  assert.equal(
+    core.shouldRenegotiateAfterFailure({ sessionCurrent: true, position: NaN }),
+    false
+  );
+  assert.equal(
+    core.shouldRenegotiateAfterFailure({ sessionCurrent: true, position: -1 }),
+    false
+  );
+});

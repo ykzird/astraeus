@@ -847,3 +847,86 @@ func TestManager_FailedSessionIsGoneNotNotFound(t *testing.T) {
 		t.Errorf("the 410 does not say why the stream failed: %q", recorder.Body.String())
 	}
 }
+
+// TestSessionTTL_CoversAPause is the regression test for S-10.
+//
+// The idle rule measures whether a client has asked for anything, which is not
+// whether anyone is watching. hls.js stops polling once a playlist carries
+// #EXT-X-ENDLIST, and a fast remux writes that well before the viewer has
+// finished - so at the old two-minute default, pausing the film for three minutes
+// had the session reaped underneath and the UI offered "Recovery was not
+// possible".
+//
+// The default is asserted rather than left implicit: it is the value that decides
+// whether the scenario happens, and a two-minute default is the bug.
+func TestSessionTTL_CoversAPause(t *testing.T) {
+	t.Parallel()
+
+	if defaultSessionTTL < 10*time.Minute {
+		t.Errorf("the default session TTL is %v; a viewer who pauses for longer than that "+
+			"loses the stream, because a completed playlist stops the client polling",
+			defaultSessionTTL)
+	}
+
+	// And the TTL is the operator's to set, because how long a pause is
+	// reasonable depends on the install.
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		RootDir:    t.TempDir(),
+		SessionTTL: 45 * time.Minute,
+		Logger:     newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	if got := manager.SessionTTL(); got != 45*time.Minute {
+		t.Errorf("session TTL = %v, want the configured 45m", got)
+	}
+}
+
+// TestReap_KeepsASessionWithinItsTTL is the other half: raising the default only
+// helps if the reaper honours it.
+func TestReap_KeepsASessionWithinItsTTL(t *testing.T) {
+	t.Parallel()
+
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		RootDir:    t.TempDir(),
+		SessionTTL: 30 * time.Minute,
+		Logger:     newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	// A completed session - done closed with no error - touched three minutes
+	// ago. That is the pause the finding describes.
+	done := make(chan struct{})
+	close(done)
+	session := &Session{
+		ID:         "paused",
+		Dir:        t.TempDir(),
+		done:       done,
+		cancel:     func() {},
+		startedAt:  time.Now().Add(-time.Hour),
+		lastAccess: time.Now().Add(-3 * time.Minute),
+	}
+	manager.mu.Lock()
+	manager.sessions["paused"] = session
+	manager.mu.Unlock()
+
+	if reaped := manager.Reap(time.Now()); reaped != 0 {
+		t.Errorf("a session idle for three minutes with a thirty-minute TTL was reaped; " +
+			"a fast remux has already finished producing, so the client has stopped " +
+			"asking and the viewer is still watching")
+	}
+
+	// And one idle past the TTL is still reaped, so the bound is real.
+	session.mu.Lock()
+	session.lastAccess = time.Now().Add(-31 * time.Minute)
+	session.mu.Unlock()
+	if reaped := manager.Reap(time.Now()); reaped != 1 {
+		t.Errorf("reaped %d sessions, want 1: the TTL bound must still hold", reaped)
+	}
+}

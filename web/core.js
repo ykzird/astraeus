@@ -159,6 +159,29 @@
     return started;
   }
 
+  /**
+   * Whether a broken segmented stream should be asked for again at where the
+   * viewer is, rather than reported as failed.
+   *
+   * The recovery hls.js offers is `startLoad()`, which re-requests a playlist
+   * that may no longer exist: a session the server has reaped answers 404, and
+   * nothing in the player can bring it back. Re-negotiating starts a new session
+   * at the current position, which is the one thing that can.
+   *
+   * This is the last resort *before* the failure path, not instead of it. It
+   * happens once - a second failure is reported, because renegotiating in a loop
+   * against a server that keeps refusing is a client bug, not a recovery - and
+   * only when there is a position to resume from and a session that is still the
+   * one on screen.
+   */
+  function shouldRenegotiateAfterFailure(options) {
+    const opts = options || {};
+    if (opts.sessionCurrent !== true) return false;
+    if (opts.alreadyRenegotiated === true) return false;
+    const position = Number(opts.position);
+    return isFinite(position) && position >= 0;
+  }
+
   /* ── progress reporting ───────────────────────────────────────────────── */
 
   /** A position shorter than this is not worth remembering. */
@@ -355,5 +378,6 @@
     subtitleNeedsBurn: subtitleNeedsBurn,
     subtitleSelectable: subtitleSelectable,
     orphanedSessionId: orphanedSessionId,
+    shouldRenegotiateAfterFailure: shouldRenegotiateAfterFailure,
   };
 });
