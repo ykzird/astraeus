@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -23,6 +24,11 @@ type TMDB struct {
 	baseURL    string
 	httpClient *http.Client
 }
+
+// maxResponseBytes bounds a provider response. TMDB's largest payload for one
+// title is a few tens of kilobytes; a megabyte is generous room for a provider
+// that sends more than it needs to.
+const maxResponseBytes = 1 << 20
 
 // NewTMDB creates a TMDB provider. An empty apiKey is a programming error at
 // this level; callers should select a Mock instead.
@@ -153,7 +159,19 @@ func (p *TMDB) search(ctx context.Context, kind string, entity *library.MediaEnt
 	}
 
 	var payload tmdbSearchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	// Bounded, because the body is somebody else's and "somebody else's" is not a
+	// size guarantee. A provider that answers with something enormous - a
+	// misconfiguration, a proxy's error page, a hostile response - would otherwise
+	// be decoded into memory without limit (L-18 of the 2026-10-09 review).
+	limited := io.LimitReader(resp.Body, maxResponseBytes+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("tmdb: reading the %s search response: %w", kind, err)
+	}
+	if int64(len(body)) > maxResponseBytes {
+		return nil, fmt.Errorf("tmdb: the %s search response exceeded %d bytes", kind, maxResponseBytes)
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("tmdb: decoding %s search response: %w", kind, err)
 	}
 	if len(payload.Results) == 0 {

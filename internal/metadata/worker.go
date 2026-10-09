@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -30,6 +31,10 @@ var _ Store = (library.Repository)(nil)
 
 // EnrichResult reports the outcome of one enrichment pass.
 type EnrichResult struct {
+	// Skipped counts entities that went away between the list this pass read and
+	// the write it made. They are not failures and not successes: the entity they
+	// describe no longer exists.
+	Skipped   int `json:"skipped"`
 	Processed int `json:"processed"`
 	Enriched  int `json:"enriched"`
 	Failed    int `json:"failed"`
@@ -133,7 +138,8 @@ func (w *Worker) runPass(ctx context.Context) {
 	}
 	if result.Processed > 0 {
 		w.logger.InfoContext(ctx, "metadata enrichment pass complete",
-			"processed", result.Processed, "enriched", result.Enriched, "failed", result.Failed)
+			"processed", result.Processed, "enriched", result.Enriched, "failed", result.Failed,
+			"skipped", result.Skipped)
 	}
 }
 
@@ -191,6 +197,22 @@ func (w *Worker) EnrichOnce(ctx context.Context) (EnrichResult, error) {
 		entity.Status = library.StatusComplete
 		entity.UpdatedAt = w.now()
 		if err := w.store.UpdateEntity(ctx, &entity); err != nil {
+			// A pruned entity is not a failure of the pass. A scan running
+			// concurrently can remove an entity between the list this pass read and
+			// the write it is making, and aborting the whole pass because one of a
+			// thousand entities went away means the other nine hundred and
+			// ninety-nine are not enriched - and the next pass starts from the
+			// beginning of a list that has changed again (L-18 of the 2026-10-09
+			// review).
+			if errors.Is(err, library.ErrNotFound) {
+				result.Skipped++
+				w.logger.DebugContext(ctx, "entity disappeared during the pass",
+					"entity_id", entity.ID, "name", entity.Name)
+				continue
+			}
+			// Anything else is a real failure of the store, and that stops the pass:
+			// continuing would mean trying every remaining entity against a database
+			// that is not answering.
 			return result, err
 		}
 		result.Enriched++

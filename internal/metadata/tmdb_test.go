@@ -290,3 +290,52 @@ func TestRedactQuery(t *testing.T) {
 		})
 	}
 }
+
+// TestTMDB_RefusesAnOversizedResponse is L-18's third item.
+//
+// The response body went straight into a JSON decoder with no bound, and the body
+// is somebody else's: a misconfiguration, a proxy's error page or a hostile
+// response would be read into memory without limit.
+func TestTMDB_RefusesAnOversizedResponse(t *testing.T) {
+	t.Parallel()
+
+	// A response that is valid JSON of the expected shape, but far larger than the
+	// limit. Being valid is the point: the size is what has to refuse it.
+	var builder strings.Builder
+	builder.WriteString(`{"results":[{"id":1,"title":"`)
+	builder.WriteString(strings.Repeat("x", maxResponseBytes))
+	builder.WriteString(`"}]}`)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(builder.String()))
+	}))
+	t.Cleanup(server.Close)
+
+	provider := NewTMDB("test-key")
+	provider.baseURL = server.URL
+
+	entity := library.MediaEntity{ID: "e1", Type: library.MovieEntity, Name: "Dune"}
+	if _, err := provider.FetchMetadata(context.Background(), &entity); err == nil {
+		t.Errorf("a %d-byte response was accepted, want a refusal: the body is somebody "+
+			"else's and has no size guarantee", builder.Len())
+	} else if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("the refusal does not say the response was too large: %v", err)
+	}
+
+	// And a normal response still works, so the bound is not refusing everything.
+	small := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"id":1,"title":"Dune","release_date":"2021-10-22"}]}`))
+	}))
+	t.Cleanup(small.Close)
+	provider.baseURL = small.URL
+
+	meta, err := provider.FetchMetadata(context.Background(), &entity)
+	if err != nil {
+		t.Fatalf("a normal response was refused: %v", err)
+	}
+	if meta == nil || meta.Title != "Dune" {
+		t.Errorf("meta = %+v, want the parsed title", meta)
+	}
+}
