@@ -62,7 +62,7 @@ internal/library/naming/  pure filename and path rules (no dependencies)
 internal/library/sqlite/  the SQLite adapter for that port
 internal/metadata/      provider interface, TMDB client, mock, enrichment worker
 internal/streaming/     capability negotiation, probing, HLS session manager
-internal/subtitles/     WebVTT extraction and caching, a PGS decoder and OCR
+internal/subtitles/     WebVTT extraction and caching, PGS and VobSub decoders, OCR
 internal/testfixtures/pgs/  a PGS (.sup) writer for image-subtitle fixtures
 internal/images/        artwork proxy and cache
 internal/observability/ KPI registry and Prometheus exposition

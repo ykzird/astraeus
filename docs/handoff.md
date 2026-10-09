@@ -393,7 +393,7 @@ internal/library/naming pure filename/path rules — imports nothing
 internal/library/sqlite the SQLite adapter for that port, schema and migrations
 internal/metadata       provider interface, TMDB, mock, enrichment worker
 internal/streaming      capability negotiation, encoder selection, HLS sessions
-internal/subtitles      WebVTT extraction and caching, a PGS decoder and OCR
+internal/subtitles      WebVTT extraction and caching, PGS and VobSub decoders, OCR
 internal/images         artwork proxy and cache
 internal/access         the access gate
 internal/api            HTTP layer
@@ -891,11 +891,14 @@ dependency, and its absence is not an error**: `OCRReady()` gates it, the track
 keeps its missing URL, the endpoint keeps the `415 subtitle_format_unsupported`
 it always returned, and startup logs "image_subtitles=burned in" with the reason.
 A unit test pins that refusal and the integration test skips when tesseract is
-absent. **Only PGS is read**: VobSub and DVB keep the refusal and the burn,
-because the `sup` muxer the extractor uses takes PGS only and advertising a track
-that then fails inside the extractor would be worse than not offering it. **The
-front end decides from the URL, not from `text`**: `subtitleDeliverable` and
-`subtitleNeedsBurn` are now pure functions in `web/core.js` with Node tests, so
+absent. **Only PGS is read** *as of this release*: VobSub and DVB keep the
+refusal and the burn, because the `sup` muxer the extractor uses takes PGS only
+and advertising a track that then fails inside the extractor would be worse than
+not offering it. (Round 18 added the VobSub reader and round 19 the fixture for
+a DVB one — see below for what changed since, and `TODO.md` for what is still
+missing.) **The front end decides from the URL, not from `text`**:
+`subtitleDeliverable` and `subtitleNeedsBurn` are now pure functions in
+`web/core.js` with Node tests, so
 an image track the server has read is offered as an ordinary `<track>` and one it
 cannot read is still offered as "(burned in)".
 

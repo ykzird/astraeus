@@ -18,8 +18,9 @@ No database server, no front-end build step, three Go dependencies.
 - **Handles real files.** HDR and Dolby Vision reported and tone mapped for
   clients that cannot show them; hardware encoders verified by running them on
   the machine that starts the server; an adaptive bitrate ladder.
-- **Subtitles.** Text tracks served as WebVTT, and PGS image tracks read into
-  text with OCR when `tesseract` is installed — burn-in otherwise.
+- **Subtitles.** Text tracks served as WebVTT, and PGS or VobSub image tracks
+  read into text with OCR when `tesseract` is installed — burn-in otherwise. DVB
+  subtitles are burn-in only.
 - **Remembers where you were**, per viewer, with a continue-watching list.
 - **An access gate, rate limiting and tracing** for when it is not just you.
   [More](docs/configuration.md)

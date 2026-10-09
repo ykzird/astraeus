@@ -436,11 +436,11 @@ Three capabilities were added after the phases above were written:
     `ffmpeg` on demand, cached against the source file's size and modification
     time, and served at `/api/objects/{id}/subtitles/{track}.vtt`. The playback
     response lists every track and only advertises a URL for the ones that can
-    actually be delivered. Text tracks always can; an image-based PGS track can
-    when an OCR engine is installed, in which case it is decoded by the PGS
-    reader in `internal/subtitles` and read by `tesseract` into WebVTT. An image
-    track with no text path - no engine, or a codec the reader does not decode
-    (VobSub, DVB) - is delivered by **burn-in** instead (§9.3): the picture is
+    actually be delivered. Text tracks always can; an image-based PGS or VobSub
+    track can when an OCR engine is installed, in which case it is decoded by the
+    matching reader in `internal/subtitles` and read by `tesseract` into WebVTT.
+    An image track with no text path - no engine, or a codec no reader decodes
+    (DVB) - is delivered by **burn-in** instead (§9.3): the picture is
     re-encoded with the bitmap composited into it. The subtitle is decoded from a
     second opening of the input, scaled to the picture with `scale2ref` so a
     downscaled re-encode places it correctly, and overlaid after the plan's own
