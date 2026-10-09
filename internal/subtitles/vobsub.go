@@ -224,20 +224,30 @@ func decodeVobSub(stream vobsubStream) ([]ImageCue, error) {
 
 	for _, packet := range stream.cues {
 		last = packet.start
-		img, err := decodeSPU(packet.spu, palette)
+		img, stopAfter, err := decodeSPU(packet.spu, palette)
 		if err != nil {
 			return nil, err
 		}
+
+		// The packet's own stop-display command is the authority on when this
+		// subpicture ends. The next packet's start is only the fallback, and it
+		// is a poor one: it stretched a 300 ms cue to the gap before the next
+		// one, and on a sparse track that is seconds (L-11).
+		end := time.Duration(0)
+		if stopAfter > 0 {
+			end = packet.start + stopAfter
+		}
+
 		if img == nil {
 			if open != nil {
-				open.End = packet.start
+				open.End = pickCueEnd(open.Start, end, packet.start)
 				cues = append(cues, *open)
 				open = nil
 			}
 			continue
 		}
 		if open != nil {
-			open.End = packet.start
+			open.End = pickCueEnd(open.Start, end, packet.start)
 			cues = append(cues, *open)
 		}
 		open = &ImageCue{Start: packet.start, Image: img}
@@ -253,27 +263,50 @@ func decodeVobSub(stream vobsubStream) ([]ImageCue, error) {
 	return cues, nil
 }
 
+// pickCueEnd chooses a cue's end time from the packet's own stop-display time
+// and the start of whatever came next.
+//
+// The stop command wins when it is present and plausible: an end at or before
+// the cue's start is not a duration the packet can have meant, and assuming it
+// did would produce a cue that never displays. The next packet's start is the
+// fallback for a stream with no stop blocks at all.
+func pickCueEnd(start, stopAfter, nextStart time.Duration) time.Duration {
+	if stopAfter > start {
+		return stopAfter
+	}
+	if nextStart > start {
+		return nextStart
+	}
+	return start + vobsubDefaultCue
+}
+
 // decodeSPU decodes one SPU packet into the rectangle it draws, or nil when the
 // packet is empty (the control sequence that takes a subtitle off screen).
-func decodeSPU(spu []byte, palette vobsubPalette) (*image.RGBA, error) {
-	colors, box, offsets, err := parseSPUControl(spu)
+//
+// It also reports when the packet's own stop-display command says the picture
+// ends, as a duration from the packet's start. Zero means no block carried one,
+// and the caller falls back to the next packet's start - which is what every
+// cue used to do, and why a cue authored as 300 ms came back as seconds long
+// (L-11 of the 2026-10-09 review).
+func decodeSPU(spu []byte, palette vobsubPalette) (*image.RGBA, time.Duration, error) {
+	colors, box, offsets, stopAfter, err := parseSPUControl(spu)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if box == nil || offsets == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
 	width, height := box.width(), box.height()
 	if width <= 0 || height <= 1 {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	plane, err := decodeVobSubRLE(spu, *offsets, width, height, colors.eightBit)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if !hasInk(plane, colors.alpha) {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
@@ -290,7 +323,7 @@ func decodeSPU(spu []byte, palette vobsubPalette) (*image.RGBA, error) {
 			img.SetRGBA(x, y, tint)
 		}
 	}
-	return img, nil
+	return img, stopAfter, nil
 }
 
 // hasInk reports whether any pixel of the plane is drawn at all. ffmpeg crops a
@@ -314,17 +347,37 @@ type spuOffsets struct {
 	second int
 }
 
+// spuTick is the duration of one SPU timestamp unit.
+//
+// A control block's date is in units of 1024/90000 of a second - the familiar
+// 90 kHz clock divided by 1024 - which the format documents as the conversion
+// (date << 10) / 90, in milliseconds. That division is written out rather than
+// folded into a constant, because folding it in truncates: 1024/90000 does not
+// divide evenly and the rounding showed up as a millisecond of drift over a few
+// seconds, which a test comparing against the documented formula caught.
+const spuTicksPerMS = 90
+
+// spuDateToDuration converts a control block's date into a duration.
+func spuDateToDuration(date int) time.Duration {
+	return time.Duration(date) * 1024 * time.Millisecond / spuTicksPerMS
+}
+
 // parseSPUControl reads a packet's control sequence: the palette selection, the
-// rectangle, and the bitmap's two offsets. A packet whose sequence stops before
-// giving an offset or a rectangle draws nothing.
-func parseSPUControl(spu []byte) (vobsubColors, *vobsubBox, *spuOffsets, error) {
+// rectangle, the bitmap's two offsets, and - when a block carries one - the time
+// its stop-display command names. A packet whose sequence stops before giving an
+// offset or a rectangle draws nothing.
+func parseSPUControl(spu []byte) (vobsubColors, *vobsubBox, *spuOffsets, time.Duration, error) {
 	var (
 		colors  vobsubColors
 		box     *vobsubBox
 		offsets *spuOffsets
+		// stopDisplay is when the subpicture's own stop-display command says it
+		// ends, and hasStop says whether a block actually carried one.
+		stopDisplay time.Duration
+		hasStop     bool
 	)
 	if len(spu) < 10 {
-		return colors, nil, nil, fmt.Errorf("%w: a %d-byte packet is too short", ErrInvalidVobSub, len(spu))
+		return colors, nil, nil, 0, fmt.Errorf("%w: a %d-byte packet is too short", ErrInvalidVobSub, len(spu))
 	}
 
 	// An HD subpicture uses four-byte offsets; a DVD one uses two. Neither
@@ -336,81 +389,111 @@ func parseSPUControl(spu []byte) (vobsubColors, *vobsubBox, *spuOffsets, error) 
 	}
 	controlPos := int(readSPUOffset(spu[controlAt:], offsetSize))
 	if controlPos < 0 || controlPos+2+offsetSize > len(spu) {
-		return colors, nil, nil, fmt.Errorf("%w: control sequence at %d does not fit in a %d-byte packet",
+		return colors, nil, nil, 0, fmt.Errorf("%w: control sequence at %d does not fit in a %d-byte packet",
 			ErrInvalidVobSub, controlPos, len(spu))
 	}
 
-	// The control position points at a block header of two two-byte values: a
-	// date and the offset of the next block. The commands follow the header,
-	// which is where the fixture's own packet puts them (a date at the position,
-	// a next-block pointer after it, and the colour command after that). One
-	// packet can carry more than one block, so the blocks are walked rather
-	// than parsed once.
-	for pos := controlPos + 2 + offsetSize; pos < len(spu); {
-		cmd := spu[pos]
-		pos++
+	// The control position points at the first block's header: a date, then the
+	// offset of the next block. The commands follow the header. A DVD subpicture
+	// normally carries two blocks - the first drawing the picture, the second
+	// carrying the stop-display command - and the second block's date is when
+	// the picture goes away.
+	//
+	// The blocks used to be abandoned at the first 0xff, which is how the first
+	// block's command list ends, so the stop time was never read and every cue
+	// ended at the next packet's start instead (L-11 of the 2026-10-09 review).
+	// That is why a cue authored as 300 ms came back as 1.6 s to 6.5 s: the end
+	// came from the next packet rather than from the packet's own stop command.
+	//
+	// So the walk follows the next-block pointer and records the date of any
+	// block that carries 0x02 (stop display).
+	for pos := controlPos; pos >= 0 && pos+2+offsetSize <= len(spu); {
+		date := int(readSPUOffset(spu[pos:], 2))
+		next := int(readSPUOffset(spu[pos+2:], offsetSize))
 
-		if cmd == 0xff {
+		cmds := pos + 2 + offsetSize
+		for cmds < len(spu) {
+			cmd := spu[cmds]
+			cmds++
+
+			if cmd == 0xff {
+				break
+			}
+
+			need := spuCommandArguments(cmd)
+			if need < 0 {
+				// An unknown command means the rest of this block cannot be
+				// framed, so it is dropped rather than guessed at.
+				break
+			}
+			if cmds+need > len(spu) {
+				return colors, nil, nil, 0, fmt.Errorf("%w: command %#02x at %d is cut short", ErrInvalidVobSub, cmd, cmds-1)
+			}
+
+			switch cmd {
+			case 0x03: // set colour
+				colors.colormap[3] = spu[cmds] >> 4
+				colors.colormap[2] = spu[cmds] & 0x0f
+				colors.colormap[1] = spu[cmds+1] >> 4
+				colors.colormap[0] = spu[cmds+1] & 0x0f
+			case 0x04: // set transparency
+				colors.alpha[3] = spu[cmds] >> 4
+				colors.alpha[2] = spu[cmds] & 0x0f
+				colors.alpha[1] = spu[cmds+1] >> 4
+				colors.alpha[0] = spu[cmds+1] & 0x0f
+			case 0x05, 0x85: // set the display rectangle
+				box = &vobsubBox{
+					x1: int(spu[cmds])<<4 | int(spu[cmds+1])>>4,
+					x2: int(spu[cmds+1]&0x0f)<<8 | int(spu[cmds+2]),
+					y1: int(spu[cmds+3])<<4 | int(spu[cmds+4])>>4,
+					y2: int(spu[cmds+4]&0x0f)<<8 | int(spu[cmds+5]),
+				}
+				colors.eightBit = colors.eightBit || cmd&0x80 != 0
+			case 0x06: // the bitmap's two offsets
+				offsets = &spuOffsets{
+					first:  int(binary.BigEndian.Uint16(spu[cmds:])),
+					second: int(binary.BigEndian.Uint16(spu[cmds+2:])),
+				}
+			case 0x86: // the same, in the HD form
+				offsets = &spuOffsets{
+					first:  int(binary.BigEndian.Uint32(spu[cmds:])),
+					second: int(binary.BigEndian.Uint32(spu[cmds+4:])),
+				}
+			case 0x02: // stop display
+				// The date is this block's, and it is when the picture ends.
+				stopDisplay = spuDateToDuration(date)
+				hasStop = true
+			}
+			cmds += need
+		}
+
+		if next <= 0 || pos+next == pos {
+			// No further block, or a pointer that does not advance, which would
+			// otherwise spin.
 			break
 		}
-
-		need := spuCommandArguments(cmd)
-		if need < 0 {
-			// An unknown command means the rest of the packet cannot be framed,
-			// so it is dropped rather than guessed at.
-			break
-		}
-		if pos+need > len(spu) {
-			return colors, nil, nil, fmt.Errorf("%w: command %#02x at %d is cut short", ErrInvalidVobSub, cmd, pos-1)
-		}
-
-		switch cmd {
-		case 0x03: // set colour
-			colors.colormap[3] = spu[pos] >> 4
-			colors.colormap[2] = spu[pos] & 0x0f
-			colors.colormap[1] = spu[pos+1] >> 4
-			colors.colormap[0] = spu[pos+1] & 0x0f
-		case 0x04: // set transparency
-			colors.alpha[3] = spu[pos] >> 4
-			colors.alpha[2] = spu[pos] & 0x0f
-			colors.alpha[1] = spu[pos+1] >> 4
-			colors.alpha[0] = spu[pos+1] & 0x0f
-		case 0x05, 0x85: // set the display rectangle
-			box = &vobsubBox{
-				x1: int(spu[pos])<<4 | int(spu[pos+1])>>4,
-				x2: int(spu[pos+1]&0x0f)<<8 | int(spu[pos+2]),
-				y1: int(spu[pos+3])<<4 | int(spu[pos+4])>>4,
-				y2: int(spu[pos+4]&0x0f)<<8 | int(spu[pos+5]),
-			}
-			colors.eightBit = colors.eightBit || cmd&0x80 != 0
-		case 0x06: // the bitmap's two offsets
-			offsets = &spuOffsets{
-				first:  int(binary.BigEndian.Uint16(spu[pos:])),
-				second: int(binary.BigEndian.Uint16(spu[pos+2:])),
-			}
-		case 0x86: // the same, in the HD form
-			offsets = &spuOffsets{
-				first:  int(binary.BigEndian.Uint32(spu[pos:])),
-				second: int(binary.BigEndian.Uint32(spu[pos+4:])),
-			}
-		}
-		pos += need
+		pos += next
 	}
 
 	if box == nil || offsets == nil {
-		return colors, nil, nil, nil
+		return colors, nil, nil, stopDisplay, nil
 	}
 	// The offsets point into the packet, past the four-byte header and in order.
 	// A packet that fails this carries no bitmap to draw, which is what an
 	// erase or an unsupported block looks like, so it decodes to nothing rather
 	// than to an error.
 	if width := box.width(); width <= 0 || box.height() <= 1 {
-		return colors, nil, nil, nil
+		return colors, nil, nil, stopDisplay, nil
 	}
 	if offsets.first < 4 || offsets.second < offsets.first || offsets.first >= len(spu) {
-		return colors, nil, nil, nil
+		return colors, nil, nil, stopDisplay, nil
 	}
-	return colors, box, offsets, nil
+	if !hasStop {
+		// No block named a stop time, so the caller has only the next packet's
+		// start to go on.
+		stopDisplay = 0
+	}
+	return colors, box, offsets, stopDisplay, nil
 }
 
 // spuCommandArguments reports how many argument bytes a control command takes,
