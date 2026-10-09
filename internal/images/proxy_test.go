@@ -1,6 +1,7 @@
 package images
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -21,6 +22,12 @@ func testLogger() *slog.Logger {
 }
 
 // stubOrigin serves a small fake image and counts requests.
+// jpegFixture is the smallest thing that is recognisably a JPEG: the magic bytes
+// the proxy checks, then filler. The body has to be a real image format now, and
+// a test that wrote "jpeg-bytes" was asserting that the proxy caches whatever it
+// is handed - which is the behaviour A-8 removed.
+var jpegFixture = append([]byte{0xFF, 0xD8, 0xFF, 0xE0}, []byte("astraeus-test-image")...)
+
 type stubOrigin struct {
 	requests atomic.Int64
 	status   int
@@ -64,7 +71,7 @@ func newTestProxy(t *testing.T, origin *stubOrigin) (*Proxy, *httptest.Server) {
 func TestProxy_FetchesThenServesFromCache(t *testing.T) {
 	t.Parallel()
 
-	origin := &stubOrigin{body: []byte("jpeg-bytes")}
+	origin := &stubOrigin{body: jpegFixture}
 	proxy, _ := newTestProxy(t, origin)
 
 	serve := func() *httptest.ResponseRecorder {
@@ -77,7 +84,7 @@ func TestProxy_FetchesThenServesFromCache(t *testing.T) {
 	if first.Code != http.StatusOK {
 		t.Fatalf("first request status = %d, want 200", first.Code)
 	}
-	if first.Body.String() != "jpeg-bytes" {
+	if !bytes.Equal(first.Body.Bytes(), jpegFixture) {
 		t.Errorf("body = %q, want the upstream bytes", first.Body.String())
 	}
 	if got := first.Header().Get("Content-Type"); got != "image/jpeg" {
@@ -102,7 +109,7 @@ func TestProxy_FetchesThenServesFromCache(t *testing.T) {
 func TestProxy_DistinctSizesAreCachedSeparately(t *testing.T) {
 	t.Parallel()
 
-	origin := &stubOrigin{body: []byte("jpeg-bytes")}
+	origin := &stubOrigin{body: jpegFixture}
 	proxy, _ := newTestProxy(t, origin)
 
 	for _, size := range []string{"w185", "w500"} {
@@ -121,7 +128,7 @@ func TestProxy_DistinctSizesAreCachedSeparately(t *testing.T) {
 func TestProxy_RejectsInvalidRequests(t *testing.T) {
 	t.Parallel()
 
-	origin := &stubOrigin{body: []byte("jpeg-bytes")}
+	origin := &stubOrigin{body: jpegFixture}
 	proxy, _ := newTestProxy(t, origin)
 
 	tests := []struct {
@@ -165,10 +172,22 @@ func TestProxy_UpstreamFailureIsReportedAndNotCached(t *testing.T) {
 	tests := []struct {
 		name   string
 		origin *stubOrigin
+		want   int
 	}{
-		{name: "upstream 404", origin: &stubOrigin{status: http.StatusNotFound}},
-		{name: "upstream 500", origin: &stubOrigin{status: http.StatusInternalServerError}},
-		{name: "empty body", origin: &stubOrigin{body: []byte{}}},
+		// An image that does not exist is the client's 404, not this server's
+		// fault. Reporting it as 502 made every deleted poster look like an outage
+		// and logged a warning per request (A-8).
+		{name: "upstream 404", origin: &stubOrigin{status: http.StatusNotFound}, want: http.StatusNotFound},
+		{name: "upstream 500", origin: &stubOrigin{status: http.StatusInternalServerError}, want: http.StatusBadGateway},
+		{name: "empty body", origin: &stubOrigin{body: []byte{}}, want: http.StatusBadGateway},
+		// An origin that answers 200 with something that is not an image - an HTML
+		// error page, a captive portal - is not a poster and must not be cached as
+		// one.
+		{
+			name:   "an HTML error page",
+			origin: &stubOrigin{body: []byte("<html><body>Not found</body></html>")},
+			want:   http.StatusBadGateway,
+		},
 	}
 
 	for _, tt := range tests {
@@ -179,8 +198,8 @@ func TestProxy_UpstreamFailureIsReportedAndNotCached(t *testing.T) {
 
 			recorder := httptest.NewRecorder()
 			proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/", nil), "w500", "abc.jpg")
-			if recorder.Code != http.StatusBadGateway {
-				t.Errorf("status = %d, want 502", recorder.Code)
+			if recorder.Code != tt.want {
+				t.Errorf("status = %d, want %d", recorder.Code, tt.want)
 			}
 			if proxy.CachedCount() != 0 {
 				t.Errorf("a failed fetch must not be cached, cached count = %d", proxy.CachedCount())
@@ -192,7 +211,7 @@ func TestProxy_UpstreamFailureIsReportedAndNotCached(t *testing.T) {
 func TestProxy_RejectsOversizedImages(t *testing.T) {
 	t.Parallel()
 
-	origin := &stubOrigin{body: []byte(strings.Repeat("x", 2048))}
+	origin := &stubOrigin{body: append(append([]byte{}, jpegFixture...), bytes.Repeat([]byte("x"), 2048)...)}
 	server := httptest.NewServer(origin.handler())
 	t.Cleanup(server.Close)
 
@@ -248,7 +267,7 @@ func TestProxy_RequiresCacheDir(t *testing.T) {
 func TestProxy_ContextCancellation(t *testing.T) {
 	t.Parallel()
 
-	origin := &stubOrigin{body: []byte("jpeg-bytes"), delay: 2 * time.Second}
+	origin := &stubOrigin{body: jpegFixture, delay: 2 * time.Second}
 	proxy, _ := newTestProxy(t, origin)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -312,7 +331,7 @@ func TestValidFileName(t *testing.T) {
 func TestProxy_CacheSurvivesRestart(t *testing.T) {
 	t.Parallel()
 
-	origin := &stubOrigin{body: []byte("jpeg-bytes")}
+	origin := &stubOrigin{body: jpegFixture}
 	server := httptest.NewServer(origin.handler())
 	t.Cleanup(server.Close)
 
@@ -347,7 +366,7 @@ func TestProxy_CacheSurvivesRestart(t *testing.T) {
 func TestProxy_ServesCachedFileEvenWhenUpstreamIsGone(t *testing.T) {
 	t.Parallel()
 
-	origin := &stubOrigin{body: []byte("jpeg-bytes")}
+	origin := &stubOrigin{body: jpegFixture}
 	proxy, server := newTestProxy(t, origin)
 
 	recorder := httptest.NewRecorder()
@@ -394,5 +413,186 @@ func TestErrorsAreDistinguishable(t *testing.T) {
 	// want to branch on.
 	if !errors.Is(ErrInvalidRequest, ErrInvalidRequest) || !errors.Is(ErrUpstream, ErrUpstream) {
 		t.Fatal("sentinel errors must be comparable with errors.Is")
+	}
+}
+
+// TestProxy_RefusesARedirectOffHost is the regression test for A-8.
+//
+// The proxy used the default client, which follows a redirect anywhere. An
+// upstream that answers 302 to an internal address therefore made the server
+// fetch that address - its own API, a metadata service, a cloud instance's
+// credential endpoint - and hand the result back to the caller and cache it. That
+// is a request-forgery primitive reachable by anyone who can influence a poster
+// URL, and refusing it costs a legitimate image origin nothing.
+func TestProxy_RefusesARedirectOffHost(t *testing.T) {
+	t.Parallel()
+
+	// A stand-in for the internal service the redirect points at. It records
+	// whether it was ever reached, which is the assertion that matters: a refusal
+	// after the fetch would still be a request the attacker caused.
+	var internalHits atomic.Int64
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		internalHits.Add(1)
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(jpegFixture)
+	}))
+	t.Cleanup(internal.Close)
+
+	// The configured origin redirects to it.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, internal.URL+"/secret", http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+
+	proxy, err := New(Config{
+		BaseURL:  origin.URL,
+		CacheDir: t.TempDir(),
+		Logger:   testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/", nil), "w500", "abc.jpg")
+
+	if recorder.Code == http.StatusOK {
+		t.Error("the proxy served the redirect target: it followed a redirect off the " +
+			"configured host and returned what it found there")
+	}
+	if got := internalHits.Load(); got != 0 {
+		t.Errorf("the internal service was reached %d times; refusing the redirect has to "+
+			"happen before the request, not after", got)
+	}
+	if proxy.CachedCount() != 0 {
+		t.Errorf("something was cached from a refused redirect, cached count = %d",
+			proxy.CachedCount())
+	}
+	if bytes.Contains(recorder.Body.Bytes(), []byte("astraeus-test-image")) {
+		t.Error("the internal service's bytes reached the client")
+	}
+}
+
+// TestProxy_FollowsASameHostRedirect keeps the other direction honest: a CDN
+// moving a path is normal, and refusing it would break real origins.
+func TestProxy_FollowsASameHostRedirect(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/moved/w500/abc.jpg", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(jpegFixture)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/moved/w500/abc.jpg", http.StatusFound)
+	})
+	origin := httptest.NewServer(mux)
+	t.Cleanup(origin.Close)
+
+	proxy, err := New(Config{
+		BaseURL:  origin.URL,
+		CacheDir: t.TempDir(),
+		Logger:   testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/", nil), "w500", "abc.jpg")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: a redirect within the configured host is how a "+
+			"CDN moves a path (body %s)", recorder.Code, recorder.Body.String())
+	}
+	if !bytes.Equal(recorder.Body.Bytes(), jpegFixture) {
+		t.Error("the redirected image was not served")
+	}
+}
+
+// TestProxy_StopsARedirectLoop covers the chain limit, so an origin that
+// redirects to itself cannot hold a request open until the client timeout.
+func TestProxy_StopsARedirectLoop(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int64
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Redirect(w, r, "/loop", http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+
+	proxy, err := New(Config{
+		BaseURL:  origin.URL,
+		CacheDir: t.TempDir(),
+		Logger:   testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/", nil), "w500", "abc.jpg")
+
+	if recorder.Code == http.StatusOK {
+		t.Error("a redirect loop was served")
+	}
+	if got := hits.Load(); got > maxRedirects+1 {
+		t.Errorf("the origin was asked %d times; the chain should stop at %d",
+			got, maxRedirects)
+	}
+}
+
+// TestProxy_RefusesAResponseThatIsNotAnImage covers the other half of A-8: an
+// origin that answers 200 with an HTML error page was cached and served as
+// image/jpeg.
+func TestProxy_RefusesAResponseThatIsNotAnImage(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		contentType string
+		body        []byte
+	}{
+		{name: "HTML with an image content type", contentType: "image/jpeg",
+			body: []byte("<html><body>upstream is down</body></html>")},
+		{name: "an image type with HTML body", contentType: "image/png",
+			body: []byte("<!DOCTYPE html><html></html>")},
+		{name: "a non-image content type", contentType: "text/html", body: jpegFixture},
+		{name: "an empty type with unrecognisable bytes", contentType: "",
+			body: []byte("not an image at all")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				_, _ = w.Write(tt.body)
+			}))
+			t.Cleanup(origin.Close)
+
+			proxy, err := New(Config{
+				BaseURL:  origin.URL,
+				CacheDir: t.TempDir(),
+				Logger:   testLogger(),
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			recorder := httptest.NewRecorder()
+			proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/", nil), "w500", "abc.jpg")
+
+			if recorder.Code == http.StatusOK {
+				t.Error("a response that is not an image was served")
+			}
+			if proxy.CachedCount() != 0 {
+				t.Error("a response that is not an image was cached")
+			}
+		})
 	}
 }

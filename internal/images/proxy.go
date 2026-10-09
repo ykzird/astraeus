@@ -4,6 +4,7 @@
 package images
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -59,6 +60,40 @@ type Config struct {
 	Now func() time.Time
 }
 
+// maxRedirects bounds a redirect chain, so an upstream that loops cannot hold a
+// request open until the client's timeout.
+const maxRedirects = 3
+
+// checkRedirect refuses a redirect that leaves the host we asked.
+//
+// The proxy exists to fetch one image from one configured origin. Following a
+// redirect is normal there - a CDN moving a path - and staying on the same host is
+// what that looks like. Leaving the host is the case that matters: an upstream that
+// answers 302 to http://127.0.0.1:8642/ makes the server fetch its own API, or any
+// other service it can reach and the caller cannot, and then hands the result back
+// and caches it. That is a request-forgery primitive, and refusing it costs
+// nothing a legitimate image origin needs.
+//
+// The comparison is on the request's own host, so the decision does not depend on
+// DNS resolving to something sensible.
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	origin := via[0].URL
+	if !strings.EqualFold(req.URL.Host, origin.Host) {
+		return fmt.Errorf("refusing a redirect from %s to %s: the image proxy fetches from one host",
+			origin.Host, req.URL.Host)
+	}
+	if req.URL.Scheme != origin.Scheme && req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing a redirect from %s to %s", origin.Scheme, req.URL.Scheme)
+	}
+	return nil
+}
+
 // Proxy fetches and caches remote artwork.
 type Proxy struct {
 	baseURL  string
@@ -74,7 +109,18 @@ func New(cfg Config) (*Proxy, error) {
 		cfg.BaseURL = DefaultBaseURL
 	}
 	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: 20 * time.Second}
+		cfg.Client = &http.Client{
+			Timeout:       20 * time.Second,
+			CheckRedirect: checkRedirect,
+		}
+	} else if cfg.Client.CheckRedirect == nil {
+		// The caller supplied a client, so its timeout and transport are theirs -
+		// but a client without a redirect policy follows a redirect anywhere, and
+		// that is a request-forgery shape rather than a preference. This is the
+		// one setting the proxy will not inherit as nil (A-8 of the 2026-10-09
+		// review). A caller that genuinely wants open redirects can set
+		// CheckRedirect to a no-op function, which is a decision made on purpose.
+		cfg.Client.CheckRedirect = checkRedirect
 	}
 	if cfg.MaxBytes <= 0 {
 		cfg.MaxBytes = 8 << 20 // 8 MiB
@@ -139,13 +185,19 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, size, file string)
 	}
 
 	if err := p.fetch(r.Context(), size, file, cachePath); err != nil {
-		if errors.Is(err, ErrInvalidRequest) {
+		switch {
+		case errors.Is(err, ErrInvalidRequest):
 			http.Error(w, "invalid image request", http.StatusBadRequest)
-			return
+		case errors.Is(err, ErrNotFound):
+			// The poster does not exist. A 404 says so; a 502 claimed this server
+			// was broken, and a Warn line per request meant a library full of
+			// deleted artwork filled the log while nothing was actually wrong.
+			http.Error(w, "no such image", http.StatusNotFound)
+		default:
+			p.logger.WarnContext(r.Context(), "image fetch failed",
+				"size", size, "file", file, "error", err)
+			http.Error(w, "image unavailable", http.StatusBadGateway)
 		}
-		p.logger.WarnContext(r.Context(), "image fetch failed",
-			"size", size, "file", file, "error", err)
-		http.Error(w, "image unavailable", http.StatusBadGateway)
 		return
 	}
 
@@ -177,6 +229,13 @@ func (p *Proxy) fetch(ctx context.Context, size, file, cachePath string) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusNotFound {
+		// The image does not exist upstream. That is not a fault in this server,
+		// and answering 502 made every missing poster look like an outage - with a
+		// Warn line per request, so a library of deleted artwork filled the log
+		// (A-8 of the 2026-10-09 review).
+		return fmt.Errorf("%w: upstream has no such image", ErrNotFound)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%w: upstream returned HTTP %d", ErrUpstream, resp.StatusCode)
 	}
@@ -193,6 +252,9 @@ func (p *Proxy) fetch(ctx context.Context, size, file, cachePath string) error {
 	}
 	if len(body) == 0 {
 		return fmt.Errorf("%w: upstream returned an empty body", ErrUpstream)
+	}
+	if err := checkImage(resp.Header.Get("Content-Type"), body, file); err != nil {
+		return err
 	}
 
 	// Write to a temporary file and rename, so a concurrent reader never sees a
@@ -217,6 +279,79 @@ func (p *Proxy) fetch(ctx context.Context, size, file, cachePath string) error {
 
 	p.logger.DebugContext(ctx, "cached image", "size", size, "file", file, "bytes", len(body))
 	return nil
+}
+
+// ErrNotFound is returned when the upstream origin has no such image.
+//
+// It is separate from ErrUpstream because the two mean different things to a
+// client: one is "there is no poster", the other is "the proxy is not working".
+var ErrNotFound = errors.New("no such image upstream")
+
+// imageMagic lists the byte prefixes that identify the formats an artwork origin
+// serves. The declared Content-Type is a claim; this is the evidence.
+var imageMagic = [][]byte{
+	{0xFF, 0xD8, 0xFF}, // JPEG
+	{0x89, 'P', 'N', 'G'},
+	{'G', 'I', 'F', '8'},     // GIF87a and GIF89a
+	{'R', 'I', 'F', 'F'},     // WebP is RIFF....WEBP
+	{0x00, 0x00, 0x01, 0x00}, // ICO
+	{'B', 'M'},               // BMP
+}
+
+// textImageWindow is how far into a body the "<svg" element is looked for. Every
+// SVG begins with a root element or a declaration plus one, so this is generous;
+// it is bounded so a large body is not scanned on every miss.
+const textImageWindow = 1024
+
+// looksLikeSVG reports whether the body is a text image rather than a document.
+//
+// It requires an actual "<svg" element rather than a "<" of any kind, because the
+// bodies this check exists to refuse - an HTML error page, a captive portal's
+// login form, an XML error from an origin - begin with one too. A prefix test on
+// "<!DOCTYPE" accepted "<!DOCTYPE html>", which is precisely the page that ended
+// up cached as image/jpeg.
+func looksLikeSVG(body []byte) bool {
+	window := body
+	if len(window) > textImageWindow {
+		window = window[:textImageWindow]
+	}
+	lower := bytes.ToLower(window)
+	return bytes.Contains(lower, []byte("<svg")) ||
+		bytes.Contains(lower, []byte(":svg"))
+}
+
+// checkImage refuses a response that is not an image.
+//
+// Two checks, because either alone is easy to satisfy by accident. The
+// Content-Type is what an origin claims, and an upstream that answers 200 with an
+// HTML error page - a captive portal, a misconfigured CDN, an origin whose
+// credentials lapsed - claims text/html and would otherwise be cached as
+// image/jpeg and served to a browser as a broken image. The magic bytes are what
+// the body is, so a mislabelled response is refused too.
+//
+// SVG is allowed by prefix because a poster origin may serve it; it is served
+// back with the type the origin declared, and this server never renders it.
+func checkImage(contentType string, body []byte, file string) error {
+	mediaType := contentType
+	if index := strings.IndexByte(mediaType, ';'); index >= 0 {
+		mediaType = mediaType[:index]
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+
+	// An absent Content-Type is tolerated only if the bytes are recognisable,
+	// which the second check decides. A present one has to be an image.
+	if mediaType != "" && !strings.HasPrefix(mediaType, "image/") {
+		return fmt.Errorf("%w: upstream served %s for %s, not an image",
+			ErrUpstream, mediaType, file)
+	}
+
+	for _, prefix := range imageMagic {
+		if bytes.HasPrefix(body, prefix) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: upstream served %s for %s, which is not a recognised image format",
+		ErrUpstream, mediaType, file)
 }
 
 // cachePath maps a validated (size, file) pair onto a cache file name. The

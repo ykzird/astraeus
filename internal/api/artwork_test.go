@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -15,6 +16,11 @@ import (
 )
 
 // artworkOrigin stands in for the remote image CDN.
+// artworkBytes is what the stub origin serves: a body with JPEG magic, so the
+// proxy's own checks accept it. Named rather than repeated, so the fixture and the
+// assertion cannot drift apart.
+var artworkBytes = append([]byte{0xFF, 0xD8, 0xFF, 0xE0}, []byte("artwork-bytes")...)
+
 func artworkOrigin(t *testing.T) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 
@@ -22,7 +28,11 @@ func artworkOrigin(t *testing.T) (*httptest.Server, *atomic.Int64) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
 		w.Header().Set("Content-Type", "image/jpeg")
-		_, _ = w.Write([]byte("artwork-bytes"))
+		// A body the proxy recognises as an image. The bytes have to be a real
+		// format now: the proxy checks the magic bytes as well as the declared
+		// type, so a placeholder string is refused rather than cached as a JPEG
+		// (A-8 of the 2026-10-09 review).
+		_, _ = w.Write(artworkBytes)
 	}))
 	t.Cleanup(server.Close)
 
@@ -86,7 +96,7 @@ func TestEntityResponsesExposeArtworkURLs(t *testing.T) {
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("GET %s status = %d, want 200", path, recorder.Code)
 		}
-		if recorder.Body.String() != "artwork-bytes" {
+		if !bytes.Equal(recorder.Body.Bytes(), artworkBytes) {
 			t.Errorf("GET %s body = %q, want the upstream bytes", path, recorder.Body.String())
 		}
 	}
