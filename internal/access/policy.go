@@ -81,6 +81,11 @@ func LoadPolicy(path string) (*Policy, error) {
 //
 // A grant names a library by its name (case-insensitive) or by its id (exact).
 // A viewer that appears twice has its grants combined.
+//
+// A comment runs from a "#" that starts a line or follows whitespace to the end
+// of that line, so a note may sit beside a directive or a grant. A "#" with no
+// whitespace before it is part of the value rather than the start of a comment,
+// which is what lets a library or identity whose name contains one be granted.
 func ParsePolicy(r io.Reader) (*Policy, error) {
 	policy := &Policy{
 		viewers: make(map[string]grant),
@@ -99,6 +104,16 @@ func ParsePolicy(r io.Reader) (*Policy, error) {
 		lineNumber++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// A comment may follow a directive, which is how the documented example
+		// is written: "default: none            # an unlisted viewer sees
+		// nothing". Only a line-leading comment used to be recognised, so every
+		// such note became part of the value: the default failed to parse, and
+		// on an identity line the note was split at its commas into junk
+		// identities (D-1 of the 2026-10-09 review).
+		line = stripPolicyComment(line)
+		if line == "" {
 			continue
 		}
 
@@ -147,6 +162,25 @@ func ParsePolicy(r io.Reader) (*Policy, error) {
 	}
 
 	return policy, nil
+}
+
+// stripPolicyComment removes a trailing comment from one line.
+//
+// A "#" starts a comment when it begins the line or follows whitespace, so
+// "alice@example.com: Kids # the children" is a grant with a note, while a "#"
+// inside a value - an identity or a library name that contains one - is left
+// alone. The parser has no quoting rules, so this is the rule that lets the
+// documented example work without inventing an escape syntax nobody writes.
+func stripPolicyComment(line string) string {
+	for i := 0; i < len(line); i++ {
+		if line[i] != '#' {
+			continue
+		}
+		if i == 0 || line[i-1] == ' ' || line[i-1] == '	' {
+			return strings.TrimSpace(line[:i])
+		}
+	}
+	return line
 }
 
 // splitList splits a comma-separated value, dropping empty entries so that
