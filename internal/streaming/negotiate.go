@@ -142,6 +142,30 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 			fmt.Sprintf("client cannot decode audio codec %q", audioTrack.Codec))
 	}
 
+	// A file opened directly is a file whose stream selection this server does not
+	// control, so every track a player might pick has to be decodable. Where the
+	// default flag points past the first track, a player that honours the flag and
+	// one that takes the first stream disagree - and the disagreement is silent
+	// (S-16). The client has named a track when AudioTrackIndex is set and the file
+	// has it, which is the same condition the mode switch spells as trackChosen
+	// further down; it is repeated here because the audio check comes first.
+	clientNamedATrack := hasAudio && capability.AudioTrackIndex > 0 && !trackRequestIgnored
+	ambiguousAudio := false
+	for _, candidate := range info.DirectPlayAudioTracks(audioTrack, clientNamedATrack) {
+		// The chosen track has already been checked above; this loop is about the
+		// *other* track a player might pick instead.
+		if candidate.Index == audioTrack.Index {
+			continue
+		}
+		if !capability.SupportsAudio(candidate.Codec) {
+			ambiguousAudio = true
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("this file's tracks disagree about which audio stream is first, and the client cannot decode %q, so the original file is not delivered untouched",
+					candidate.Codec))
+			break
+		}
+	}
+
 	containerCompatible := capability.SupportsContainer(info.Container)
 	if !containerCompatible {
 		decision.Reasons = append(decision.Reasons,
@@ -255,7 +279,7 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	segmentCarriesAudio := !hasAudio || segmentContainerCanCarry(audioTrack.Codec)
 
 	switch {
-	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany || hdrMismatch || bitrateTooHigh || burning:
+	case !videoCompatible || !audioCompatible || ambiguousAudio || needsDownscale || tooDeep || channelsTooMany || hdrMismatch || bitrateTooHigh || burning:
 		decision.Mode = ModeTranscode
 	case trackChosen:
 		decision.Mode = ModeRemux

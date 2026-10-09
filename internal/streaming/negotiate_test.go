@@ -2649,3 +2649,134 @@ func TestNegotiate_BuiltInProfileStillRefusesDeepVideo(t *testing.T) {
 func reasonSays(capability ClientCapability, info *MediaInfo, word string) bool {
 	return strings.Contains(strings.Join(Negotiate(info, capability).Reasons, "; "), word)
 }
+
+// TestNegotiate_DirectPlayRequiresEveryTrackAPlayerMightChoose is the regression
+// test for S-16.
+//
+// A file opened directly is one whose stream selection this server does not
+// control: the player picks. Where the default flag points past the first track,
+// a player that honours the flag and one that takes the first stream disagree -
+// and the review measured the server assuming the former while browsers did the
+// latter. For an MP4 with AC3 first and AAC flagged default, a browser that takes
+// the first track plays AC3 and the viewer gets no sound, while the decision said
+// the client could decode the audio it had checked.
+//
+// Direct play therefore requires every track a player might choose to be
+// decodable. Remux and transcode are unaffected, because there the server maps one
+// stream explicitly and what it decided is what plays.
+func TestNegotiate_DirectPlayRequiresEveryTrackAPlayerMightChoose(t *testing.T) {
+	t.Parallel()
+
+	// AC3 first, AAC second and flagged default - the arrangement that is silent
+	// for a client that takes the first stream.
+	ambiguous := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "ac3", AudioChannels: 6,
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []AudioTrack{
+			{Index: 1, Codec: "ac3", Channels: 6},
+			{Index: 2, Codec: "aac", Channels: 2, Default: true},
+		},
+	}
+
+	// A client that cannot decode AC3 must not be handed the original file: it
+	// might play the track it cannot decode.
+	client := ClientCapability{
+		Containers: []string{"mp4"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, MaxBitDepth: 8, MaxAudioChannels: 6,
+	}.Normalise()
+
+	decision := Negotiate(ambiguous, client)
+	if decision.Mode == ModeDirectPlay {
+		t.Errorf("the original file was handed to a client that cannot decode its first "+
+			"audio track; mode = %q, reasons = %v", decision.Mode, decision.Reasons)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "disagree") {
+		t.Errorf("the decision does not say why the original file was not delivered "+
+			"untouched: %v", decision.Reasons)
+	}
+
+	// A client that can decode both is unaffected: there is nothing to disagree
+	// about if every answer works.
+	both := ClientCapability{
+		Containers: []string{"mp4"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac", "ac3"}, MaxBitDepth: 8, MaxAudioChannels: 6,
+	}.Normalise()
+	if got := Negotiate(ambiguous, both).Mode; got != ModeDirectPlay {
+		t.Errorf("a client that can decode every track was not given the original file; "+
+			"mode = %q", got)
+	}
+
+	// And a client that names the track it wants is not affected either: the
+	// server maps that stream, so what it decided is what plays.
+	named := ClientCapability{
+		Containers: []string{"mp4"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, MaxBitDepth: 8, MaxAudioChannels: 6,
+		AudioTrackIndex: 2,
+	}.Normalise()
+	if named.AudioTrackIndex != 2 {
+		t.Fatalf("the fixture did not keep the requested track: %+v", named)
+	}
+	if got := Negotiate(ambiguous, named).Mode; got == ModeDirectPlay {
+		t.Errorf("a client that named the second track was given the original file, but " +
+			"naming a track is what makes the mapping the server's")
+	}
+
+	// An unambiguous file - one track, or the default is the first - is unaffected.
+	plain := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "ac3", AudioChannels: 6,
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []AudioTrack{
+			{Index: 1, Codec: "ac3", Channels: 6, Default: true},
+			{Index: 2, Codec: "aac", Channels: 2},
+		},
+	}
+	// The chosen track is ac3, which this client cannot decode, so it is not
+	// direct play for that reason - not for ambiguity. The message must be the
+	// codec one rather than the disagreement one.
+	reasons := strings.Join(Negotiate(plain, client).Reasons, "; ")
+	if strings.Contains(reasons, "disagree") {
+		t.Errorf("an unambiguous file was reported as having disagreeing tracks: %s", reasons)
+	}
+}
+
+// TestDirectPlayAudioTracks pins the rule itself, including when it applies.
+func TestDirectPlayAudioTracks(t *testing.T) {
+	t.Parallel()
+
+	first := AudioTrack{Index: 1, Codec: "ac3"}
+	second := AudioTrack{Index: 2, Codec: "aac", Default: true}
+	info := &MediaInfo{AudioTracks: []AudioTrack{first, second}}
+
+	// The default points past the first track, so two players can disagree.
+	got := info.DirectPlayAudioTracks(second, false)
+	if len(got) != 2 {
+		t.Errorf("a file whose default is not its first track reported %d possible "+
+			"tracks, want 2", len(got))
+	}
+
+	// One track: one possible answer.
+	single := &MediaInfo{AudioTracks: []AudioTrack{first}}
+	if got := single.DirectPlayAudioTracks(first, false); len(got) != 1 {
+		t.Errorf("a single-track file reported %d possible tracks, want 1", len(got))
+	}
+
+	// The default is the first track: the two candidates coincide.
+	agreeing := &MediaInfo{AudioTracks: []AudioTrack{
+		{Index: 1, Codec: "aac", Default: true},
+		{Index: 2, Codec: "ac3"},
+	}}
+	if got := agreeing.DirectPlayAudioTracks(agreeing.AudioTracks[0], false); len(got) != 1 {
+		t.Errorf("a file whose default is its first track reported %d possible tracks, "+
+			"want 1", len(got))
+	}
+
+	// A client that named a track gets exactly that one.
+	if got := info.DirectPlayAudioTracks(second, true); len(got) != 1 || got[0].Index != 2 {
+		t.Errorf("a named track produced %+v, want just the named one", got)
+	}
+
+	// No track list, no rule.
+	if got := (&MediaInfo{}).DirectPlayAudioTracks(AudioTrack{}, false); got != nil {
+		t.Errorf("a file with no track list reported %+v", got)
+	}
+}

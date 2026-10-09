@@ -192,6 +192,39 @@ func (m *MediaInfo) ChosenAudioTrack(requested int) (track AudioTrack, hasAudio 
 	return fallback, true, false
 }
 
+// DirectPlayAudioTracks returns the audio tracks a player might open by itself.
+//
+// A file opened directly is a file whose stream selection this server does not
+// control: the player picks. A file with one audio track has one possible answer,
+// and one whose selected track is the first track has one too. A file whose
+// default flag points past the first track has two, because a player that honours
+// the flag and a player that takes the first stream will disagree - and the review
+// measured the server assuming the former while browsers did the latter, which for
+// an AC3-first/AAC-default MP4 is a film with no sound (S-16 of the 2026-10-09
+// review).
+//
+// The caller uses this to require that *every* track a direct-playing client
+// might choose is one it can decode. Remux and transcode are unaffected: there the
+// server maps one stream explicitly, so what it decided is what plays.
+func (m *MediaInfo) DirectPlayAudioTracks(chosen AudioTrack, trackChosen bool) []AudioTrack {
+	if m == nil || len(m.AudioTracks) == 0 {
+		return nil
+	}
+	if trackChosen {
+		// The client named a track, so the server's mapping is what it gets.
+		return []AudioTrack{chosen}
+	}
+	if len(m.AudioTracks) == 1 || m.AudioTracks[0].Index == chosen.Index {
+		// One possible answer: the first track and the selected one are the same
+		// track, so there is nothing for two players to disagree about. Returning
+		// it once, and not a second copy, is what keeps the caller's check from
+		// reporting the chosen track as a *disagreement* when it is simply
+		// undecodable - two different problems that deserve two different reasons.
+		return []AudioTrack{chosen}
+	}
+	return []AudioTrack{m.AudioTracks[0], chosen}
+}
+
 // AudioTrackByIndex returns the track with this ffmpeg stream index.
 func (m *MediaInfo) AudioTrackByIndex(index int) (AudioTrack, bool) {
 	if m == nil {
