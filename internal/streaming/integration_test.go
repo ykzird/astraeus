@@ -382,12 +382,21 @@ func startSession(t *testing.T, root, source string, decision Decision) (*Manage
 	t.Helper()
 
 	metrics := observability.New()
+	// The detected capability is logged because it decides which encoder every
+	// session below actually uses, and a run where the hardware path was not
+	// taken looks identical to one where it was - which is how S-1 stayed
+	// hidden behind software-only CI for as long as it did.
+	server := DetectServerCapability(context.Background(), "ffmpeg", "ffprobe", "")
+	t.Logf("detected capability: encoders=%v hardware=%v render_node=%q rejected=%d",
+		server.VideoEncoders, server.HardwareAcceleration, server.RenderNode,
+		len(server.RejectedEncoders))
+
 	manager, err := NewManager(context.Background(), ManagerConfig{
 		FFmpegBin:      "ffmpeg",
 		RootDir:        filepath.Join(root, "sessions"),
 		SegmentSeconds: 1,
 		SessionTTL:     time.Minute,
-		Server:         DetectServerCapability(context.Background(), "ffmpeg", "ffprobe", ""),
+		Server:         server,
 		Metrics:        metrics,
 		Logger:         discardLogger(),
 	})
