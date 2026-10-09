@@ -82,6 +82,58 @@ bob@example.com: Kids    # a name, matched case-insensitively
 	}
 }
 
+// TestLoadPolicy_AcceptsTheDocumentedGrammarExample is the regression test for
+// the policy-file grammar gap in 05-docs.md's missing-documentation list.
+//
+// This is the extended example in docs/configuration.md's "Which libraries a
+// viewer may see", verbatim, including the escaped subject. A grammar nobody can
+// copy is not documentation, and this one had to grow an escape before the
+// identity deploy/tls/ produces could be listed at all - so the example is the
+// thing to hold the parser to.
+func TestLoadPolicy_AcceptsTheDocumentedGrammarExample(t *testing.T) {
+	t.Parallel()
+
+	documented := `# /etc/astraeus/access-policy.conf
+default: none            # an unlisted viewer sees nothing (the default)
+admin: jok@example.com   # may scan, enrich, add and remove libraries
+
+jok@example.com: *       # "*" is every library, including ones added later
+alice@example.com: Movies, Documentaries
+bob@example.com: Kids    # a name, matched case-insensitively
+
+# A client-certificate proxy forwards the whole subject, which contains commas.
+# Backslash escapes the next character, so the subject stays one identity:
+admin: CN=alice\,O=Acme
+CN=alice\,O=Acme: Movies
+`
+	policy, err := LoadPolicy(writePolicy(t, documented))
+	if err != nil {
+		t.Fatalf("the documented policy example does not load:\n%v", err)
+	}
+
+	// One comment line and one real line for the subject under each directive,
+	// so two admins and the viewer the proxy names.
+	if got := policy.Admins(); got != 2 {
+		t.Errorf("admins = %d, want 2 (jok and the certificate subject)", got)
+	}
+	if !policy.IsAdmin("CN=alice,O=Acme") {
+		t.Error("the escaped subject is not an admin")
+	}
+	if policy.IsAdmin("CN=alice") || policy.IsAdmin("O=Acme") {
+		t.Error("the subject was split at its comma, so its halves became identities")
+	}
+	if !policy.AllowsLibrary("CN=alice,O=Acme", "lib-movies", "Movies") {
+		t.Error("the escaped subject was not granted Movies")
+	}
+	// And the example's other grants still work.
+	if !policy.AllowsLibrary("alice@example.com", "lib-docs", "Documentaries") {
+		t.Error("alice was not granted Documentaries")
+	}
+	if policy.AllowsLibrary("bob@example.com", "lib-docs", "Documentaries") {
+		t.Error("bob was granted a library the example does not give him")
+	}
+}
+
 // TestStripPolicyComment pins the rule, including the case it must not break.
 func TestStripPolicyComment(t *testing.T) {
 	t.Parallel()
@@ -143,5 +195,93 @@ alice@example.com: Movies
 	}
 	if policy.AllowsLibrary("alice@example.com", "lib-kids", "Kids") {
 		t.Error("alice was granted a library the file does not give her")
+	}
+}
+
+// TestLoadPolicy_EscapesACommaInAnIdentity is the regression test for the
+// grammar gap in 05-docs.md's missing-documentation list.
+//
+// Values are comma-separated, so an identity containing a comma could not be
+// listed at all. That is exactly the identity a client-certificate proxy
+// forwards: Caddy's `{http.request.tls.client.subject}` is the whole subject,
+// "CN=alice,O=Acme", and deploy/tls/README.md tells an operator to use it. The
+// line was split into "CN=alice" and "O=Acme", neither of which matched the
+// viewer the proxy actually names - so the install had an admin who was not one.
+func TestLoadPolicy_EscapesACommaInAnIdentity(t *testing.T) {
+	t.Parallel()
+
+	policy, err := LoadPolicy(writePolicy(t, `
+default: none
+admin: CN=alice\,O=Acme
+CN=alice\,O=Acme: *
+`))
+	if err != nil {
+		t.Fatalf("LoadPolicy: %v", err)
+	}
+
+	// One admin, named by the whole subject.
+	if admins := policy.Admins(); admins != 1 {
+		t.Errorf("admins = %d, want 1: the escaped subject is one identity, not two", admins)
+	}
+	if !policy.IsAdmin("CN=alice,O=Acme") {
+		t.Error("the escaped subject is not an admin, so the escape was not applied")
+	}
+	// And the fragments the split used to produce are not admins.
+	if policy.IsAdmin("CN=alice") || policy.IsAdmin("O=Acme") {
+		t.Error("the subject was split at its comma, so its halves became identities")
+	}
+
+	// The grant on the same subject works too.
+	if !policy.AllowsLibrary("CN=alice,O=Acme", "lib-1", "Movies") {
+		t.Error("the escaped subject was not granted a library")
+	}
+}
+
+// TestSplitList pins the grammar, including what must keep working.
+func TestSplitList(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		value string
+		want  []string
+	}{
+		{name: "one item", value: "Movies", want: []string{"Movies"}},
+		{name: "two items", value: "Movies, Documentaries", want: []string{"Movies", "Documentaries"}},
+		{name: "empty entries dropped", value: "Movies,,", want: []string{"Movies"}},
+		{name: "whitespace trimmed", value: "  Movies  ,  Kids  ", want: []string{"Movies", "Kids"}},
+		{
+			name:  "an escaped comma is one item",
+			value: `CN=alice\,O=Acme`,
+			want:  []string{"CN=alice,O=Acme"},
+		},
+		{
+			name:  "escaped and unescaped beside each other",
+			value: `CN=alice\,O=Acme, bob@example.com`,
+			want:  []string{"CN=alice,O=Acme", "bob@example.com"},
+		},
+		{
+			name:  "an escaped backslash is literal",
+			value: `a\\b, c`,
+			want:  []string{`a\b`, "c"},
+		},
+		{name: "a trailing backslash is kept", value: `Movies\`, want: []string{`Movies\`}},
+		{name: "empty", value: "", want: []string{}},
+		{name: "only separators", value: " , , ", want: []string{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := splitList(tt.value)
+			if len(got) != len(tt.want) {
+				t.Fatalf("splitList(%q) = %v, want %v", tt.value, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("splitList(%q)[%d] = %q, want %q", tt.value, i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }

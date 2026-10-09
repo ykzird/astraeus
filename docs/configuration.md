@@ -213,7 +213,31 @@ admin: jok@example.com   # may scan, enrich, add and remove libraries
 jok@example.com: *       # "*" is every library, including ones added later
 alice@example.com: Movies, Documentaries
 bob@example.com: Kids    # a name, matched case-insensitively
+
+# A client-certificate proxy forwards the whole subject, which contains commas.
+# Backslash escapes the next character, so the subject stays one identity:
+admin: CN=alice\,O=Acme
+CN=alice\,O=Acme: Movies
 ```
+
+The grammar, in full:
+
+- **One directive or grant per line**, `key: value`.
+- **Comments** run from a `#` that starts a line or follows whitespace to the end
+  of that line, so a note may sit beside a grant. A `#` with no whitespace before
+  it is part of the value, which is what lets a library or identity containing one
+  be named.
+- **Values are comma-separated** (`Movies, Documentaries`), and **a backslash
+  escapes the next character**. That is the only way to name an identity or a
+  library that contains a comma, and it is required rather than optional: the
+  identity `deploy/tls/README.md` produces is a whole certificate subject such as
+  `CN=alice,O=Acme`, so it is written `CN=alice\,O=Acme` on both the `admin:` line
+  and the grant. Without the escape the line is split at the comma and the install
+  ends up with two identities that match nobody.
+- **A key appears more than once** and its grants are combined. `default` may
+  appear only once.
+
+`deploy/tls/README.md` shows the same escape in the identity its proxy forwards.
 
 ```sh
 ./astraeus-server serve --auth-mode proxy --trusted-proxy 127.0.0.1/32 \

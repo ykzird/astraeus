@@ -86,6 +86,14 @@ func LoadPolicy(path string) (*Policy, error) {
 // of that line, so a note may sit beside a directive or a grant. A "#" with no
 // whitespace before it is part of the value rather than the start of a comment,
 // which is what lets a library or identity whose name contains one be granted.
+//
+// Values are comma-separated, and a backslash escapes the next character. That
+// is how an identity containing a comma is listed at all:
+//
+//	admin: CN=alice\,O=Acme
+//
+// which deploy/tls/README.md needs, because the identity a client-certificate
+// proxy forwards is the whole subject rather than its common name.
 func ParsePolicy(r io.Reader) (*Policy, error) {
 	policy := &Policy{
 		viewers: make(map[string]grant),
@@ -146,7 +154,7 @@ func ParsePolicy(r io.Reader) (*Policy, error) {
 				policy.admins[strings.ToLower(identity)] = true
 			}
 		default:
-			existing := policy.viewers[strings.ToLower(key)]
+			existing := policy.viewers[strings.ToLower(unescapePolicy(key))]
 			for _, library := range splitList(value) {
 				if library == "*" {
 					existing.all = true
@@ -154,7 +162,7 @@ func ParsePolicy(r io.Reader) (*Policy, error) {
 				}
 				existing.libraries = append(existing.libraries, library)
 			}
-			policy.viewers[strings.ToLower(key)] = existing
+			policy.viewers[strings.ToLower(unescapePolicy(key))] = existing
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -187,12 +195,81 @@ func stripPolicyComment(line string) string {
 // "Movies," and "Movies, Documentaries" mean the same thing.
 func splitList(value string) []string {
 	out := make([]string, 0, 2)
-	for _, part := range strings.Split(value, ",") {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
+	var current strings.Builder
+
+	// A backslash makes the next character literal, which is what lets an
+	// identity that contains a comma be listed. This is not decoration: the
+	// client-certificate identity deploy/tls/ produces is a whole subject -
+	// "CN=alice,O=Acme" - and without an escape it was split into two identities,
+	// neither of which matched the viewer the proxy actually names.
+	//
+	// A trailing backslash is kept literally rather than treated as an error.
+	// The file is a human's, and refusing to load it over a stray backslash helps
+	// nobody.
+	escaped := false
+	flush := func() {
+		if trimmed := strings.TrimSpace(current.String()); trimmed != "" {
 			out = append(out, trimmed)
 		}
+		current.Reset()
 	}
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if escaped {
+			current.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		switch ch {
+		case '\\':
+			escaped = true
+		case ',':
+			flush()
+		default:
+			current.WriteByte(ch)
+		}
+	}
+	// A trailing backslash escapes nothing, so it is kept rather than dropped.
+	// Dropping it would silently rename an identity or a library.
+	if escaped {
+		current.WriteByte('\\')
+	}
+	flush()
 	return out
+}
+
+// unescapePolicy resolves backslash escapes in a key.
+//
+// A key is not split on commas, so it does not go through splitList - but it can
+// carry an escape for the same reason a value can: the identity a
+// client-certificate proxy forwards contains a comma, and "CN=alice\,O=Acme" has
+// to become the one identity the proxy will actually name. Leaving the backslash
+// in place produced a key nothing ever matched, so the grant was silently
+// ignored - an admin who was not one, and a viewer who saw nothing.
+func unescapePolicy(value string) string {
+	if !strings.Contains(value, "\\") {
+		return value
+	}
+	var out strings.Builder
+	out.Grow(len(value))
+	escaped := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if escaped {
+			out.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		out.WriteByte(ch)
+	}
+	if escaped {
+		out.WriteByte('\\')
+	}
+	return out.String()
 }
 
 // AllowsLibrary reports whether viewer may see the library with this id and

@@ -238,6 +238,13 @@ astraeus.example.com {
 
 	reverse_proxy 127.0.0.1:8642 {
 		header_up X-Astraeus-User {http.request.tls.client.subject}
+
+	# The subject is the whole distinguished name - "CN=alice,O=Acme" - not just
+	# its common name, and it contains commas. In the access policy that means it
+	# has to be escaped, or the line is read as two identities:
+	#
+	#	admin: CN=alice\,O=Acme
+	#	CN=alice\,O=Acme: Movies
 	}
 }
 ```
