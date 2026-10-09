@@ -36,6 +36,8 @@
     subtitleSelectable: subtitleSelectable, orphanedSessionId: orphanedSessionId,
     shouldRenegotiateAfterFailure: shouldRenegotiateAfterFailure,
     fetchFailure: fetchFailure, rollbackSubtitleSelection: rollbackSubtitleSelection,
+    unloadTeardownIsPending: unloadTeardownIsPending, bfcacheRestore: bfcacheRestore,
+    prunedSummary: prunedSummary, shouldCheckHealth: shouldCheckHealth,
   } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */
@@ -1959,6 +1961,11 @@
       formatCount(info.objects_created) + " objects added",
       formatCount(info.objects_updated) + " objects updated",
     ];
+    /* Pruning, when there was any: the one number that says the scan removed
+       something (W-10). */
+    for (const pruned of prunedSummary(info)) {
+      parts.push(formatCount(pruned.count) + " " + pruned.label);
+    }
     const warnings = Array.isArray(info.warnings) ? info.warnings : [];
     return (
       "Scan complete — " +
@@ -4575,6 +4582,12 @@
     render();
   }
 
+  /* The pill is checked once at startup and then periodically. A single check told
+     the truth for as long as the tab stayed open: the server could stop, or come
+     back, and the pill went on saying whatever it said when the page loaded
+     (W-10). */
+  const HEALTH_INTERVAL_MS = 30000;
+
   async function checkHealth() {
     try {
       const health = await api.health();
@@ -4586,6 +4599,31 @@
       dom.healthPill.dataset.state = "down";
     }
   }
+
+  function startHealthChecks() {
+    checkHealth();
+    /* The listener is registered once, outside the timer guard below: inside it, a
+       second call would add a second listener and check twice per visibility change,
+       which is the same class of mistake as the double teardown this round is
+       fixing. */
+    if (!healthListenerRegistered) {
+      healthListenerRegistered = true;
+      /* A phone that was in the background comes back to a pill that has not been
+         checked in however long it was away, so becoming visible is its own check. */
+      document.addEventListener("visibilitychange", function () {
+        if (!shouldCheckHealth({ hidden: document.hidden })) return;
+        checkHealth();
+      });
+    }
+    if (healthTimer !== null) return;
+    healthTimer = setInterval(function () {
+      if (!shouldCheckHealth({ hidden: document.hidden })) return;
+      checkHealth();
+    }, HEALTH_INTERVAL_MS);
+  }
+
+  let healthTimer = null;
+  let healthListenerRegistered = false;
 
   /* ── 12. Events ──────────────────────────────────────────────────────── */
 
@@ -4699,9 +4737,24 @@
   /* Last chance to stop a transcoder: the tab is going away, so the request
      has to outlive the document. A beacon cannot issue DELETE, so this is a
      keepalive fetch instead. */
+  /* The session the leaving page already tore down, and where the viewer was. Both
+     are module state rather than part of state.playback, because the playback
+     object is rebuilt when the page comes back. */
+  let unloadReleasedSessionId = null;
+  let unloadResumePosition = 0;
+
   function releaseSessionOnUnload() {
     const pb = state.playback;
     if (!pb || !pb.url) return;
+    /* Both pagehide and beforeunload call this, so it does its work once. The
+       second DELETE asks for a session that is already gone (W-10). */
+    if (!unloadTeardownIsPending({ releasedSessionId: unloadReleasedSessionId, sessionId: pb.sessionId })) {
+      return;
+    }
+    unloadReleasedSessionId = pb.sessionId;
+    /* Remember where the viewer was, because the session is about to be gone and
+       a restored page has nothing else to resume from. */
+    unloadResumePosition = currentSourceTime(pb);
     /* The last position rides along with the stream teardown: keepalive is
        what lets both requests outlive the document. */
     reportProgress(pb, { final: true, keepalive: true });
@@ -4710,6 +4763,28 @@
 
   window.addEventListener("pagehide", releaseSessionOnUnload);
   window.addEventListener("beforeunload", releaseSessionOnUnload);
+
+  /* A page restored from the back/forward cache is the same document, but its
+     session was released as it was hidden - so the player has no url and cannot
+     resume by itself. Without this it sat dead, and the only way back was to
+     navigate in again. */
+  window.addEventListener("pageshow", function (event) {
+    const pb = state.playback;
+    const decision = bfcacheRestore({
+      persisted: event.persisted === true,
+      hasUrl: !!(pb && pb.url),
+      position: unloadResumePosition,
+    });
+    if (decision.action !== "renegotiate") return;
+
+    /* The document is alive again, so the next teardown is a new one. */
+    unloadReleasedSessionId = null;
+    resumeSession({
+      startSeconds: decision.position,
+      preferredHeight: pb.preferredHeight,
+      audioTrackIndex: pb.audioTrackIndex,
+    });
+  });
 
   /* ── Player overlay: interaction, auto-hide, fullscreen, shortcuts ───── */
 
@@ -4799,7 +4874,7 @@
     render();
     /* Prime the element with the remembered volume before anything plays. */
     applyAudioPreference();
-    checkHealth();
+    startHealthChecks();
     boot();
   }
 

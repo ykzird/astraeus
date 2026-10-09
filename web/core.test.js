@@ -607,3 +607,55 @@ test("the rollback never invents a choice", () => {
   // than one that is not there being called "off".
   assert.equal(core.rollbackSubtitleSelection(undefined, undefined), undefined);
 });
+
+// ── page lifecycle ──────────────────────────────────────────────────────────
+//
+// W-10: pagehide and beforeunload both call the same teardown, so the final
+// position was PUT twice and the session DELETEd twice; a page restored from the
+// back/forward cache had its session released while hidden and could not resume;
+// the scan summary never mentioned what was pruned; and the health pill was checked
+// once, so it said whatever it said when the page loaded.
+
+test("the leaving page tears down once", () => {
+  // Nothing released yet: there is work to do.
+  assert.equal(core.unloadTeardownIsPending({ releasedSessionId: null, sessionId: "s1" }), true);
+  // Already released: the second event of the pair has nothing to do.
+  assert.equal(core.unloadTeardownIsPending({ releasedSessionId: "s1", sessionId: "s1" }), false);
+  // A different session means the viewer started a new stream after the first
+  // teardown, so this is not the same work.
+  assert.equal(core.unloadTeardownIsPending({ releasedSessionId: "s1", sessionId: "s2" }), true);
+});
+
+test("a restored page renegotiates, a fresh load does not", () => {
+  assert.deepEqual(
+    core.bfcacheRestore({ persisted: true, hasUrl: false, position: 754.5 }),
+    { action: "renegotiate", position: 754.5 }
+  );
+  // A fresh load rebuilds the app; resuming would start a stream nobody asked for.
+  assert.equal(core.bfcacheRestore({ persisted: false, hasUrl: false, position: 754.5 }).action, "none");
+  // The stream is still alive, so there is nothing to restore.
+  assert.equal(core.bfcacheRestore({ persisted: true, hasUrl: true, position: 754.5 }).action, "none");
+  // Nothing to resume from - a restored page that never played anything.
+  assert.equal(core.bfcacheRestore({ persisted: true, hasUrl: false, position: 0 }).action, "none");
+});
+
+test("the scan summary mentions pruning only when there was any", () => {
+  const pruned = core.prunedSummary({ entities_pruned: 2, objects_pruned: 3, files_seen: 40 });
+  assert.deepEqual(pruned, [
+    { count: 2, label: "entities removed" },
+    { count: 3, label: "objects removed" },
+  ]);
+  // Zero is silence, not a line saying "0 removed" on every scan.
+  assert.deepEqual(core.prunedSummary({ entities_pruned: 0, objects_pruned: 0 }), []);
+  // A payload without the fields, or without anything, is not an error.
+  assert.deepEqual(core.prunedSummary({}), []);
+  assert.deepEqual(core.prunedSummary(null), []);
+});
+
+test("a hidden tab does not ask for health, a visible one does", () => {
+  assert.equal(core.shouldCheckHealth({ hidden: true }), false);
+  assert.equal(core.shouldCheckHealth({ hidden: false }), true);
+  // The first check is unconditional: a page that opens hidden still has to show
+  // something when it is looked at.
+  assert.equal(core.shouldCheckHealth({ hidden: true, firstCheck: true }), true);
+});

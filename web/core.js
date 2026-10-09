@@ -232,6 +232,82 @@
     return offered === undefined ? current : offered;
   }
 
+  /**
+   * Whether the page-leaving teardown still has work to do.
+   *
+   * pagehide and beforeunload both fire as a tab goes away, and both call the same
+   * handler - so without this the final position was PUT twice and the session
+   * DELETEd twice. The second DELETE is a request for a session that no longer
+   * exists, which is noise in the log at best (W-10 of the 2026-10-09 review).
+   *
+   * `release` is the session id already sent; a different one means the viewer
+   * started a new stream after the first teardown, so it is not the same work.
+   */
+  function unloadTeardownIsPending(options) {
+    const opts = options || {};
+    if (opts.releasedSessionId === null || opts.releasedSessionId === undefined) {
+      return true;
+    }
+    return opts.releasedSessionId !== opts.sessionId;
+  }
+
+  /**
+   * What to do when a page comes back from the back/forward cache.
+   *
+   * A restored page is the same document with everything still in memory, but its
+   * stream session was released as the page was hidden - so the player has no url
+   * and cannot resume on its own. Without this it sat dead, and the only way back
+   * was to navigate in again. `persisted` is how a browser says it came from the
+   * cache rather than from a fresh load; a fresh load rebuilds the app and must not
+   * take this path, or it would try to resume a stream it never started.
+   */
+  function bfcacheRestore(options) {
+    const opts = options || {};
+    if (opts.persisted !== true) return { action: "none" };
+    if (opts.hasUrl) return { action: "none" };
+    const position = Number(opts.position);
+    if (!isFinite(position) || position <= 0) return { action: "none" };
+    return { action: "renegotiate", position: position };
+  }
+
+  /**
+   * The pruning counts a scan summary should mention.
+   *
+   * Only the non-zero ones. Pruning is the number that says the scan *removed*
+   * something - a deleted film leaving the library, a file that moved - and leaving
+   * it out of the summary meant a scan that dropped half a library read exactly like
+   * one that did nothing (W-10 of the 2026-10-09 review). Reporting "0 pruned" on
+   * every scan would be noise, so it is the non-zero values that earn a line.
+   */
+  function prunedSummary(result) {
+    const info = result && typeof result === "object" ? result : {};
+    const out = [];
+    for (const [key, label] of [
+      ["entities_pruned", "entities removed"],
+      ["objects_pruned", "objects removed"],
+    ]) {
+      const count = Number(info[key]);
+      if (isFinite(count) && count > 0) {
+        out.push({ count: count, label: label });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Whether the health check should run now.
+   *
+   * A hidden tab asks nothing: the answer is not being looked at, and a phone left
+   * on this page should not poll all day. The check on becoming visible again is
+   * what keeps the pill honest, and the check at startup is unconditional because a
+   * page that opens hidden still has to show something when it is looked at.
+   */
+  function shouldCheckHealth(options) {
+    const opts = options || {};
+    if (opts.firstCheck === true) return true;
+    return opts.hidden !== true;
+  }
+
   /** The message a request that ran out of time produces. */
   function timeoutMessage(timeoutMs) {
     return (
@@ -466,6 +542,10 @@
     shouldRenegotiateAfterFailure: shouldRenegotiateAfterFailure,
     fetchFailure: fetchFailure,
     rollbackSubtitleSelection: rollbackSubtitleSelection,
+    unloadTeardownIsPending: unloadTeardownIsPending,
+    bfcacheRestore: bfcacheRestore,
+    prunedSummary: prunedSummary,
+    shouldCheckHealth: shouldCheckHealth,
     entityListIsCurrent: entityListIsCurrent,
     clearedEntityList: clearedEntityList,
     timeoutMessage: timeoutMessage,
