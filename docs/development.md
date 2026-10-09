@@ -95,9 +95,11 @@ the domain most worth isolating: they are pure, they are fiddly, and the scanner
 and the schema migration both depend on them agreeing with each other — an
 entity renamed by a migration has to end up named the way a scan would name it.
 
-The composition root in `cmd` is the one place that names the concrete adapter,
-which is also where the port and the adapter are checked against each other at
-compile time.
+The composition root in `cmd` is the one place that names the concrete adapter.
+The port and the adapter are checked against each other at compile time, but not
+there: the assertions live beside the adapters that satisfy them
+(`sqlite/repository.go` for `library.Repository`, `metadata/worker.go` for the
+narrower `Store`), which is where a method added to a port is noticed.
 
 `metadata` is a service over that domain rather than part of it: it depends on
 `library`, and nothing in `library` depends on it, so a library can be scanned

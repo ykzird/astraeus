@@ -7,7 +7,9 @@ Both run the same server; pick by how you already run things.
 Whatever you pick, four facts decide whether the install is sound:
 
 - **ffmpeg and ffprobe are dependencies, not extras.** The server reports their
-  absence at startup and refuses playback without them.
+  absence at startup and degrades rather than refusing to start: the library
+  still lists, direct play still works if `ffprobe` is present, and the routes
+  that need a probe or a transcode answer `503 streaming_unavailable`.
 - **tesseract is optional, and its absence changes behaviour rather than breaking
   anything.** With it, image subtitle tracks (PGS and VobSub) are read into text
   a browser can toggle and search; without it they are offered as a burn-in

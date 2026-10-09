@@ -35,7 +35,9 @@ What is missing is listed honestly in [TODO.md](TODO.md).
 ## Requirements
 
 - Linux, macOS or Windows to build; the container image is Linux
-- [ffmpeg](https://ffmpeg.org/) and `ffprobe` — a hard dependency, checked at startup
+- [ffmpeg](https://ffmpeg.org/) and `ffprobe` — needed for playback and checked at
+  startup; without them the server still starts and lists the library, and the
+  media routes answer 503
 - [tesseract](https://github.com/tesseract-ocr/tesseract) — optional, for reading
   image subtitles into text instead of burning them into the picture
 

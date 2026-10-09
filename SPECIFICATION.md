@@ -29,7 +29,9 @@ The goal is to build a "media-first" spatial environment that moves away from th
 Both shapes exist as of 0.3.0 (`Dockerfile`, `deploy/astraeus.service`, and
 `deploy/README.md` as the runbook). The binary is pure Go with no cgo, so the
 image is a two-stage build: one stage compiles a static binary, the runtime stage
-adds the one hard dependency, ffmpeg. The container runs as a fixed non-root uid
+adds ffmpeg as its one external dependency. Without it the server still starts
+and lists a library, and the routes that need to probe or transcode a file answer
+503. The container runs as a fixed non-root uid
 with every writable path inside a single volume, and the unit binds loopback with
 the access gate on, so neither shape publishes an unauthenticated library by
 default. Deployment is where the server's own honesty matters most: the startup
@@ -185,8 +187,12 @@ reference.
 The MVP uses **SQLite** (`modernc.org/sqlite`, pure Go, no cgo) through `sqlx`,
 behind a `library.Repository` interface. PostgreSQL remains the production
 target; a `PostgresRepository` implementing the same interface is the only
-change required. Schema creation is versioned and idempotent in Go rather than
-delegated to an external migration tool: the project has no migration
+change required. Schema creation is idempotent and atomic in Go rather than
+delegated to an external migration tool - one transaction per run, so a failed
+upgrade leaves the previous database intact. It is **not** versioned in the sense
+of an ordered list of numbered steps: `schema_migrations` records a single
+version and is never read, so an upgrade is detected by the shape of the schema.
+That is a known limitation: the project has no migration
 dependency, and the migrations also repair data written by the earlier
 prototype (backfilling `name`, resetting entities that were marked `Complete`
 without a `MetadataSet`).

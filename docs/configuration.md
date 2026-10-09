@@ -46,10 +46,11 @@ rather than here:
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--addr` | `127.0.0.1:8642` | Listen address; loopback, so publishing it is an explicit choice |
+| `--device-dir` | `/dev/dri` | Directory holding the transcoding devices the encoder probe uses |
 | `--allowed-hosts` | loopback, this host's name, `--addr`'s host | Host names the server answers for; anything else is `421` |
 | `--cross-origin-protection` | on | Refuse state-changing requests a browser made from another origin |
 | `--web-dir` | `web` | Static UI directory |
-| `--ffmpeg`, `--ffprobe` | `ffmpeg`, `ffprobe` | Binaries to run (both are hard dependencies) |
+| `--ffmpeg`, `--ffprobe` | `ffmpeg`, `ffprobe` | Binaries to run. Without them the server starts and lists the library; the media routes answer `503 streaming_unavailable` |
 | `--stream-root` | temp | HLS session directories |
 | `--segment-seconds` | 6 | HLS target segment duration |
 | `--max-sessions` | 8 | Concurrent segmented streams |

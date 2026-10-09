@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -212,4 +214,65 @@ func buildBinary(t *testing.T) string {
 		t.Fatal(buildErr)
 	}
 	return builtBinary
+}
+
+// TestServeFlagsAreDocumented is the regression test for D-4.
+//
+// The flag table in docs/configuration.md was maintained by hand beside the code
+// that declares the flags, and it drifted: two intervals were shown as having no
+// default when both are 6h, three flags were missing entirely, and two documents
+// claimed the table covered "every flag". The review's recommendation was to
+// generate it from the binary; checking it against the binary is the part that
+// catches drift, and it does not need a generator to write Markdown nobody reads.
+//
+// This test is deliberately one-directional: every flag the binary offers must
+// appear in the table. A table entry for something that is not a flag would be a
+// different mistake, and the command's own -h output is the authority on what
+// exists.
+func TestServeFlagsAreDocumented(t *testing.T) {
+	t.Parallel()
+
+	binary := buildBinary(t)
+
+	// The flags come from the binary, not from a list here, because a list here
+	// would be the same hand-maintained duplicate the test exists to catch.
+	help := exec.Command(binary, "serve", "-h")
+	output, _ := help.CombinedOutput()
+
+	flagLine := regexp.MustCompile(`(?m)^\s+-([a-z][a-z0-9-]*)`)
+	offered := map[string]bool{}
+	for _, match := range flagLine.FindAllStringSubmatch(string(output), -1) {
+		offered[match[1]] = true
+	}
+	if len(offered) < 20 {
+		t.Fatalf("only %d flags were parsed from the help output, so the parsing is wrong "+
+			"rather than the documentation:\n%s", len(offered), output)
+	}
+
+	// Any backticked --flag counts as documented, because the reference groups
+	// several flags into one row ("`--auth-mode`, `--auth-header`, ...") and a
+	// pattern that only matched the first flag of a row reported the rest as
+	// missing. The file is named rather than located by line, so the test does
+	// not depend on where the table sits.
+	docs, err := os.ReadFile(filepath.Join("..", "..", "docs", "configuration.md"))
+	if err != nil {
+		t.Fatalf("reading docs/configuration.md: %v", err)
+	}
+	anywhere := regexp.MustCompile("`--([a-z][a-z0-9-]*)`")
+	documented := map[string]bool{}
+	for _, match := range anywhere.FindAllStringSubmatch(string(docs), -1) {
+		documented[match[1]] = true
+	}
+
+	var missing []string
+	for flag := range offered {
+		if !documented[flag] {
+			missing = append(missing, "--"+flag)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("these flags exist but are not in the table in docs/configuration.md, so "+
+			"the reference does not cover the binary:\n  %s", strings.Join(missing, "\n  "))
+	}
 }
