@@ -10,12 +10,16 @@ its own entry, so "partial" is a claim you can check rather than a shrug. The
 review's own documents are in `docs/review/`, which is deliberately untracked: they
 are a working record, not part of the product, and `scripts/build-release.sh` fails
 the build if any of them reach a release archive.** The review's commits are on
-`main`; `v0.17.0`, `v0.18.0` and **`v0.19.0`** are released and the review work is
-in `v0.19.0`, so the in-tree version is `dev` and the next tag would be `v0.19.1`
-for a fix, or `v0.20.0` for anything that adds surface. Worth remembering from this
-release: the listen default moved from `:8642` to `127.0.0.1:8642`, which is the
-first change here that can take an existing install off the network, and the
-release notes carry the `--addr :8642` escape hatch for it. (`git log` names
+`main`; `v0.17.0`, `v0.18.0`, `v0.19.0` and **`v0.19.1`** are released, so the
+in-tree version is `dev` and the next tag would be `v0.19.2` for a fix, or `v0.20.0`
+for anything that adds surface. Two things from this pair of releases worth not
+rediscovering. **v0.19.0 had a shipping regression**: two names added to `core.js`
+were called from `app.js` without being bound, and scanning a library threw
+`entityListIsCurrent is not defined` — v0.19.1 fixes it, and
+`web/core-bindings.test.js` now guards that seam, which nothing did before. And the
+listen default moved from `:8642` to `127.0.0.1:8642` in v0.19.0, the first change
+here that can take an existing install off the network; its release notes carry the
+`--addr :8642` escape hatch. (`git log` names
 the commits. Round 17 disproved the note that had been blocking the VobSub
 reader for two rounds: ffmpeg cannot *mux* VobSub, but it can *encode* it, so
 the project's PGS fixture re-encodes into a real sample that ffmpeg decodes and
