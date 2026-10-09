@@ -374,7 +374,17 @@ func decodePGSObject(data []byte) (*pgsObject, error) {
 // decodePGSRLE expands the object's run-length encoding into width*height
 // palette indexes. The encoding has four forms, chosen by the top two bits of
 // the byte after a zero: a short clear run, a long clear run, a short coloured
-// run, and a long coloured run. A non-zero first byte is itself a run length.
+// run, and a long coloured run.
+//
+// A non-zero first byte is not a run length. It is one pixel of that palette
+// index, and reading it as "count then colour" is L-1 of the 2026-10-09 review:
+// it also swallows the byte that follows, which on real Blu-ray subtitles is
+// very often the 0x00 that opens the next escape, so every later run is
+// misframed. The fixture encoder made the same misreading, which is why the
+// tests agreed with the code.
+//
+// ffmpeg's pgssubdec.c is the reference: a non-zero byte is the colour and the
+// run is one pixel.
 func decodePGSRLE(data []byte, width, height int) ([]byte, error) {
 	total := width * height
 	indexes := make([]byte, 0, total)
@@ -389,12 +399,9 @@ func decodePGSRLE(data []byte, width, height int) ([]byte, error) {
 			count int
 		)
 		if first := data[offset]; first != 0 {
+			// One pixel of this colour; nothing follows it in the stream.
 			offset++
-			if offset >= len(data) {
-				return nil, fmt.Errorf("%w: object data ended inside a run", ErrInvalidPGS)
-			}
-			value, count = data[offset], int(first)
-			offset++
+			value, count = first, 1
 		} else {
 			offset++
 			if offset >= len(data) {

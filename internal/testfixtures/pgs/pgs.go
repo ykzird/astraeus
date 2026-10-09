@@ -174,11 +174,16 @@ func ods(cue BitmapCue) []byte {
 	return append(out, data...)
 }
 
-// run encodes one run of n pixels of a palette index. A zero index uses the
-// two transparent forms; any other index uses a coloured form. A run of one or
-// two pixels uses the format's shortest coloured form - a count byte and a
-// colour byte - which is what its own encoders write and which is otherwise
-// never exercised.
+// run encodes one run of n pixels of a palette index, in the form the PGS
+// specification defines and ffmpeg's pgssubdec.c decodes: a zero byte followed
+// by an escape byte for a run, and the palette index alone for a single pixel.
+//
+// It used to write a count byte before the colour for runs of one or two - "what
+// its own encoders write" - and the decoder read it back the same way. Both were
+// wrong together, so the tests passed while real Blu-ray subtitles, whose
+// anti-aliased edges are full of single-pixel runs, decoded as garbage (L-1 of
+// the 2026-10-09 review). A fixture that encodes what the decoder expects proves
+// nothing; it has to encode what the format says.
 func run(color byte, n int) []byte {
 	var out []byte
 	for n > 0 {
@@ -191,8 +196,9 @@ func run(color byte, n int) []byte {
 			out = append(out, 0x00, byte(chunk))
 		case color == 0:
 			out = append(out, 0x00, 0x40|byte(chunk>>8), byte(chunk))
-		case chunk <= 2:
-			out = append(out, byte(chunk), color)
+		case chunk == 1:
+			// A single pixel is just its palette index.
+			out = append(out, color)
 		case chunk <= 63:
 			out = append(out, 0x00, 0x80|byte(chunk), color)
 		default:
