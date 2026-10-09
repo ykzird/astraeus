@@ -101,8 +101,70 @@
     return !!track && track.text === false && !subtitleDeliverable(track);
   }
 
+  /* ── progress reporting ───────────────────────────────────────────────── */
+
+  /** A position shorter than this is not worth remembering. */
+  const RESUME_MIN_SECONDS = 5;
+
+  /** A position past this fraction of the runtime counts as finished. */
+  const FINISHED_FRACTION = 0.95;
+
+  /**
+   * Decide what a progress report should do, as a pure function of the
+   * playback's state and where it is.
+   *
+   * This exists because the decision was spread through `reportProgress` and
+   * `rememberProgress`, and the two disagreed in the one case that lost data.
+   * Stopping or navigating away before the media's metadata has loaded reports
+   * position 0 - the timeline is not known yet - and 0 is below the resume
+   * threshold, so the old code called `clearProgress` and deleted a position
+   * the viewer had. Pressing Play on a film stored at 45:00 and changing your
+   * mind during the load lost the bookmark, and a slow link or a `moov` atom at
+   * the end of the file made that window long (W-1 of the 2026-10-09 review).
+   *
+   * The rule that falls out: a position of zero from a passive report means
+   * "the player does not know yet", which is not the same statement as "the
+   * viewer is at the beginning", and only the second one should delete
+   * anything.
+   *
+   * `started` says whether playback has actually begun. A report from before
+   * that is a report about nothing.
+   *
+   * There is deliberately no restart flag. Starting over clears the position
+   * through `forgetProgress`, which is an explicit request from the viewer, and
+   * this function is only ever asked about passive reports.
+   *
+   * Returns one of:
+   *   "skip"   - say nothing; the player does not know where it is yet
+   *   "save"   - record the position
+   *   "clear"  - forget the stored position
+   */
+  function progressAction(input) {
+    const state = input || {};
+    if (state.started !== true) return "skip";
+
+    const position = Number(state.position);
+    if (!isFinite(position) || position < 0) return "skip";
+
+    /* A finished position is not worth resuming either, so it is dropped - but
+       only when the report is a real one from a player that knows its timeline.
+       The `started` check above is what keeps that from firing at load time. */
+    const duration = Number(state.duration);
+    if (duration > 0 && position >= duration * FINISHED_FRACTION) return "clear";
+
+    if (position < RESUME_MIN_SECONDS) {
+      /* Below the threshold, and the viewer is at the very beginning of
+         something the player has loaded: there is nothing to remember. */
+      return "clear";
+    }
+    return "save";
+  }
+
   return {
+    FINISHED_FRACTION: FINISHED_FRACTION,
+    RESUME_MIN_SECONDS: RESUME_MIN_SECONDS,
     formatClock: formatClock,
+    progressAction: progressAction,
     mediaTime: mediaTime,
     pad2: pad2,
     producedWindow: producedWindow,

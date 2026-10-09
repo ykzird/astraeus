@@ -23,7 +23,8 @@
      (web/core.test.js). Aliasing them here keeps every call site below reading
      exactly as it did when they were local. */
   const {
-    formatClock, mediaTime, pad2, producedWindow, sourceTime,
+    FINISHED_FRACTION, RESUME_MIN_SECONDS,
+    formatClock, mediaTime, pad2, producedWindow, progressAction, sourceTime,
     subtitleDeliverable, subtitleNeedsBurn,
   } = window.AstraeusCore;
 
@@ -2263,11 +2264,12 @@
      The server has its own rule for the other end — a report in the closing
      minutes is treated as finished and clears the row instead. */
 
-  const RESUME_MIN_SECONDS = 5;
+  /* RESUME_MIN_SECONDS and FINISHED_FRACTION come from core.js with
+     progressAction, so the decision and the numbers it uses cannot drift. */
   /* The server's own rule for the other end: a position in the last 5% is
      "watched through" and is cleared rather than stored. Mirrored locally so a
      remembered position can never offer a resume the server has refused. */
-  const FINISHED_FRACTION = 0.95;
+
   /* A report on every timeupdate would be several PUTs a second for a number
      that barely moved; ten seconds of playback is the most that can be lost
      to a crash or a hard close. */
@@ -2330,9 +2332,31 @@
 
     const duration = sourceDurationOf(pb);
     const position = currentSourceTime(pb);
-    rememberProgress(pb.entityId, position, duration);
+
+    /* What to do with this report is a pure decision, in core.js, because the
+       case that lost data was a disagreement between two callers: the request
+       and the local copy each applied their own rule, and both of them read a
+       position of 0 as "the viewer is at the beginning".
+       `pb.started` is the flag the play handler sets, so a report from before
+       playback began says nothing about where the viewer is. StartVideo sets
+       status "ready" synchronously, before a byte of media has loaded, and
+       stopping or navigating away inside that window used to send 0 - which the
+       old code answered with a DELETE. The bookmark was gone (W-1 of the
+       2026-10-09 review). */
+    const action = progressAction({
+      started: pb.started === true,
+      position: position,
+      duration: duration,
+    });
+    if (action === "skip") return;
+
+    /* The local copy takes the same decision as the request, so the detail can
+       never claim a position the server was not told about, or keep offering a
+       resume the server has cleared. */
+    rememberProgress(pb.entityId, action === "save" ? position : null, duration);
+
     const attempt =
-      position >= RESUME_MIN_SECONDS
+      action === "save"
         ? api.saveProgress(pb.entityId, { position_seconds: position, duration_seconds: duration }, opts)
         : api.clearProgress(pb.entityId, opts);
     attempt.then(
@@ -2383,7 +2407,11 @@
   function rememberProgress(entityId, position, duration) {
     const detail = state.detail;
     if (!detail || !detail.entity || detail.entity.id !== entityId) return;
-    if (position < RESUME_MIN_SECONDS || (duration > 0 && position >= duration * FINISHED_FRACTION)) {
+    /* `position` is the decision's answer: a number to remember, or null to
+       forget. It does not re-decide, because that re-decision is what cleared
+       the bookmark - a passive report of 0 was read here as "at the beginning"
+       even when the request path had already decided to say nothing. */
+    if (position === null || position === undefined) {
       detail.progress = null;
       return;
     }

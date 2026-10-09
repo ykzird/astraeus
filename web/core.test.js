@@ -97,3 +97,67 @@ test("subtitleNeedsBurn is an image track the server could not read", () => {
   assert.equal(core.subtitleNeedsBurn(null), false);
   assert.equal(core.subtitleNeedsBurn(undefined), false);
 });
+
+// ── progress reporting ──────────────────────────────────────────────────────
+//
+// W-1 of the 2026-10-09 review: stopping or navigating away before the media's
+// metadata had loaded reported position 0, and 0 is below the resume threshold,
+// so the report call cleared the stored position. A bookmark at 45:00 was
+// deleted by pressing Play and changing your mind during the load. The decision
+// is now this pure function, so the case is testable without a browser.
+
+test("progressAction says nothing before playback has started", () => {
+  // This is the W-1 case: the player does not know its timeline yet, so it must
+  // not be read as "the viewer is at the beginning".
+  assert.equal(core.progressAction({ started: false, position: 0 }), "skip");
+  assert.equal(core.progressAction({ started: false, position: 12 }), "skip");
+  assert.equal(core.progressAction({ started: false }), "skip");
+  assert.equal(core.progressAction({}), "skip");
+  assert.equal(core.progressAction(), "skip");
+});
+
+test("progressAction saves a position worth resuming", () => {
+  assert.equal(core.progressAction({ started: true, position: 45 * 60, duration: 5400 }), "save");
+  assert.equal(
+    core.progressAction({ started: true, position: core.RESUME_MIN_SECONDS, duration: 5400 }),
+    "save"
+  );
+});
+
+test("progressAction clears at the very beginning of a loaded timeline", () => {
+  // Past the start and below the threshold, with the media loaded: the viewer
+  // is at the beginning, and there is nothing to resume.
+  assert.equal(core.progressAction({ started: true, position: 0, duration: 5400 }), "clear");
+  assert.equal(
+    core.progressAction({ started: true, position: core.RESUME_MIN_SECONDS - 0.1, duration: 5400 }),
+    "clear"
+  );
+});
+
+test("progressAction clears a finished position", () => {
+  const duration = 1000;
+  assert.equal(
+    core.progressAction({ started: true, position: duration * core.FINISHED_FRACTION, duration }),
+    "clear"
+  );
+  assert.equal(core.progressAction({ started: true, position: duration - 1, duration }), "clear");
+  // Just under the finished fraction is still resumable.
+  assert.equal(
+    core.progressAction({ started: true, position: duration * core.FINISHED_FRACTION - 1, duration }),
+    "save"
+  );
+});
+
+test("progressAction refuses a position that is not a number", () => {
+  assert.equal(core.progressAction({ started: true, position: NaN }), "skip");
+  assert.equal(core.progressAction({ started: true, position: Infinity }), "skip");
+  assert.equal(core.progressAction({ started: true, position: -1 }), "skip");
+  assert.equal(core.progressAction({ started: true, position: "45" }), "save");
+});
+
+test("progressAction shares its thresholds with the UI", () => {
+  // The numbers are exported so app.js cannot use a different rule from the one
+  // this function decides with.
+  assert.equal(core.RESUME_MIN_SECONDS, 5);
+  assert.equal(core.FINISHED_FRACTION, 0.95);
+});
