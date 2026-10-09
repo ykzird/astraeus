@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # Astraeus Media in one image: the server, the web UI it serves, and the ffmpeg
 # it shells out to for probing, transcoding and subtitle extraction.
 #
@@ -11,6 +9,11 @@
 # one, so a multi-arch build needs no emulation: the Go toolchain is native and
 # only the runtime base image differs per architecture.
 FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+
+# The official image pins GOTOOLCHAIN=local, so it uses the Go it ships and never
+# reads go.mod's `toolchain` line. That is how a lagging image silently builds a
+# release with an older patch than the module asks for.
+ENV GOTOOLCHAIN=auto
 
 WORKDIR /src
 
@@ -36,7 +39,7 @@ RUN go version \
  && required="$(sed -n 's/^toolchain go//p' go.mod)" \
  && current="$(go env GOVERSION | sed 's/^go//')" \
  && if [ -n "$required" ] && [ "$(printf '%s\n%s\n' "$required" "$current" | sort -V | tail -1)" != "$current" ]; then \
-      echo "the builder is running Go $current but go.mod pins toolchain go$required" >&2; \
+      echo "the effective Go here is $current but go.mod pins toolchain go$required, and GOTOOLCHAIN=auto could not fetch it (no network, or a proxy that blocks it)" >&2; \
       exit 1; \
     fi
 
