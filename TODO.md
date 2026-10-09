@@ -304,6 +304,17 @@ Status as of the current build. Evidence for each claim is the test suite
 - `--auth-mode` defaults to `none`. That is right for a trusted LAN and wrong
   for anything reachable from the internet; use `proxy` or `token` before
   exposing it.
+- **The gate treats an identity header as an assertion and does not verify it.**
+  In `proxy` mode it believes `Tailscale-User-Login` or
+  `Cf-Access-Authenticated-User-Email` from a trusted address, and neither header
+  is signed. That is sound where the header can only arrive through the proxy you
+  configured — a client-certificate handshake, or Tailscale Serve, which strips
+  its own headers from incoming requests — and unsound wherever the port is
+  reachable another way, which is why the backend belongs on loopback.
+  Cloudflare Access signs `Cf-Access-Jwt-Assertion` for exactly this reason;
+  validating it at the origin is the missing second control if an Access path is
+  ever added. [`deploy/tls/README.md`](deploy/tls/README.md) has the arrangement
+  that does not rest on an assertion at all.
 - `--stream-root`, `--image-cache` and `--subtitle-cache` default to temporary
   directories, so caches do not survive a reboot. Stale stream directories from
   a previous run are swept at startup.

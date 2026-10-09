@@ -1112,6 +1112,21 @@ surface. What is left:
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
+4. **Validating an identity-aware proxy's assertion, if one is ever put in
+   front.** In `proxy` mode the gate believes `Tailscale-User-Login` or
+   `Cf-Access-Authenticated-User-Email` from a trusted address, and neither is
+   signed — so the whole control is that the proxy is the only path to the port
+   (which is why the backend stays on loopback). Cloudflare Access signs
+   `Cf-Access-Jwt-Assertion` (RS256 against the team's JWKS, with `iss` and
+   `aud`) precisely so an origin can verify the claim instead of trusting it, and
+   Go's `crypto/rsa` and `crypto/x509` would let that be done here without a
+   dependency. Not needed for the Caddy + client-certificate arrangement, whose
+   verification is the TLS handshake — but it is the missing control the moment
+   an Access path is added. Round 15 evaluated consolidating the whole ingress on
+   `tailscale serve` instead and did not take it: Serve's identity headers are an
+   assertion too, its HTTPS mode under Headscale needs `dns.https_certs` plus an
+   authoritative DNS server for the ACME challenge (PR #3300), Headscale does not
+   ship Funnel, and a header is not populated for traffic from tagged devices.
 
 `TODO.md` carries the complete list with detail.
 

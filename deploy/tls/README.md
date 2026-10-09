@@ -212,6 +212,51 @@ answers `000` the server is bound to loopback and the test proved nothing. Bind
 it to the LAN address temporarily, or trust the `::1` result above, which
 exercises the same check.
 
+## If Caddy already runs on the host
+
+The steps above start Caddy in a container because that is the shortest path from
+nothing. On a host that already runs Caddy as a service — with its own
+certificates, its own DNS challenge and other sites — do not stand up a second
+proxy. Add a site block instead:
+
+```caddyfile
+astraeus.example.com {
+	tls /etc/astraeus/tls/server.crt /etc/astraeus/tls/server.key {
+		client_auth {
+			mode require_and_verify
+			trust_pool file /etc/astraeus/tls/clients-ca.pem
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:8642 {
+		header_up X-Astraeus-User {http.request.tls.client.subject}
+	}
+}
+```
+
+If that Caddy already obtains its certificates over a DNS challenge, drop the two
+arguments after `tls` so it reads `tls {` and leave issuance and renewal to it.
+The `tls` and `reverse_proxy` directives are the ones
+[verified below](#what-was-verified); only the way Caddy is started differs.
+
+Two permissions details differ from the container, because a host Caddy runs as
+its own account rather than as root in a container:
+
+- that account must be able to read `clients-ca.pem`, `server.crt` and
+  `server.key` — a shared group and `install -d -m 0750` is usually enough;
+- it must **not** be able to read `clients-ca.key`. That key mints identities, is
+  needed only while issuing a certificate, and belongs to you rather than to the
+  proxy.
+
+A name with no public DNS record works identically, provided the name resolves
+for your clients (split DNS, MagicDNS) and the certificate covers it. A wildcard
+for the parent domain already covers a single-label name beneath it.
+
 ## Any other proxy
 
 nginx, Traefik, HAProxy and `tailscale serve` all work, and the requirements are
@@ -270,6 +315,17 @@ Everything above was run, not reasoned about: a Debian host serving
 - **HSTS is a commitment.** `max-age=31536000` tells browsers to refuse plain
   HTTP to that hostname for a year. Do not send it for a name you also want to
   reach over HTTP, and consider a short `max-age` for the first week.
+- **A client certificate is verified; an identity header is only asserted.** This
+  arrangement is the stronger of the two, and it is why it is the one written up:
+  Caddy refuses the connection unless the client proves possession of a
+  certificate signed by your CA, so the identity is established by the handshake
+  rather than claimed. Replace it with an identity-aware proxy — Cloudflare
+  Access, or Tailscale Serve — and the server believes a header instead, which is
+  not signed. That is sound only while the proxy is the *only* path to the port,
+  which is the real reason the backend stays on loopback. Cloudflare signs
+  `Cf-Access-Jwt-Assertion` so an origin can check the claim rather than trust
+  it; this server does not validate it, so an Access deployment rests on path
+  control alone.
 - **Revocation is your problem.** A client certificate is valid until it expires
   and there is no list to consult. For a beta, short lifetimes and reissuing are
   simpler than standing up CRL or OCSP infrastructure.
