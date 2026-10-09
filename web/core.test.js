@@ -415,3 +415,52 @@ test("nothing that is unselectable may be shown as checked", () => {
     assert.equal(checked, false);
   }
 });
+
+// ── the transcode a stale negotiation leaves behind ─────────────────────────
+//
+// W-4: navigating during a negotiation discarded the response and its
+// session_id, but the server had already started ffmpeg for it. That transcode
+// ran until the idle reaper collected it, so clicking through titles stacked
+// them on a host that had been asked for one at a time.
+
+test("a superseded negotiation's session is released", () => {
+  const abandoned = { title: "Dune" };
+  const current = { title: "Arrival" };
+  assert.equal(
+    core.orphanedSessionId({ session_id: "sess-orphan" }, current, abandoned),
+    "sess-orphan"
+  );
+});
+
+test("a session still on screen is not released", () => {
+  // The response belongs to the session being handled, so there is nothing
+  // stale about it and the caller takes the normal path.
+  const session = { title: "Dune" };
+  assert.equal(core.orphanedSessionId({ session_id: "sess-live" }, session, session), null);
+});
+
+test("a response with no session id releases nothing", () => {
+  // Direct play has no server session, so there is nothing to stop.
+  const abandoned = { title: "Dune" };
+  const current = { title: "Arrival" };
+  assert.equal(core.orphanedSessionId({}, current, abandoned), null);
+  assert.equal(core.orphanedSessionId(null, current, abandoned), null);
+  assert.equal(core.orphanedSessionId({ session_id: "" }, current, abandoned), null);
+});
+
+test("an id already released is not released again", () => {
+  // `resumeSession` releases the previous id before it renegotiates, and the
+  // response can name that same id again. A second DELETE for it would stop
+  // whatever is now using it.
+  const renegotiating = { title: "Dune", sessionId: "sess-same" };
+  const current = { title: "Dune" }; // a new session object for the same title
+  assert.equal(
+    core.orphanedSessionId({ session_id: "sess-same" }, current, renegotiating),
+    null
+  );
+  // A different id from the same session is still released.
+  assert.equal(
+    core.orphanedSessionId({ session_id: "sess-new" }, current, renegotiating),
+    "sess-new"
+  );
+});

@@ -4,12 +4,21 @@
 This is test scaffolding, not a deliverable: it exists so the analyzer can be
 exercised without a Docker host. Run it, then point the analyzer at the
 directory it prints.
+
+    make-fixture-bundle.py <dir> [--all-rejected]
+
+`--all-rejected` makes the bundle self-consistent for the case where no
+hardware encoder was accepted: the API reports an empty
+`hardware_acceleration`, every encoder is in `rejected_encoders`, and no log
+line claims an acceptance. The default is a host where VAAPI works.
 """
 import json
 import os
 import sys
 
-root = sys.argv[1] if len(sys.argv) > 1 else "/tmp/astfix/bundle"
+ALL_REJECTED = "--all-rejected" in sys.argv[2:] or "--all-rejected" in sys.argv[1:2]
+_root_arg = [a for a in sys.argv[1:] if not a.startswith("--")]
+root = _root_arg[0] if _root_arg else "/tmp/astfix/bundle"
 
 
 def w(rel, body):
@@ -100,15 +109,32 @@ w("inside/nvidia-libs.txt", """# command: docker exec abc123 sh -c ...
 == nvidia-smi ==
 nvidia-smi not in the image
 """)
-w("api/capabilities.json", json.dumps({
-    "ffmpeg": True, "ffprobe": True, "image_subtitles": "read as text",
-    "subtitle_ocr_enabled": True, "render_node": "/dev/dri/renderD128",
-    "hardware_acceleration": ["vaapi"],
-    "video_encoders": ["h264_vaapi", "hevc_vaapi", "libx264", "libx265", "aac"],
-    "rejected_encoders": [
-        {"encoder": "h264_nvenc", "reason": "Cannot load libnvidia-encode.so.1"},
-        {"encoder": "h264_qsv", "reason": "Device creation failed: -2"},
-    ]}, indent=2))
+if ALL_REJECTED:
+    # A self-consistent all-rejected bundle: nothing in hardware_acceleration,
+    # every hardware family in rejected_encoders, libva present with no vendor
+    # backend. This is the shape a stock image in a container produces.
+    w("api/capabilities.json", json.dumps({
+        "ffmpeg": True, "ffprobe": True, "image_subtitles": "read as text",
+        "subtitle_ocr_enabled": True, "render_node": "/dev/dri/renderD128",
+        "hardware_acceleration": [],
+        "video_encoders": ["libaom-av1", "libsvtav1", "libvpx-vp9", "libx264", "libx265", "aac"],
+        "rejected_encoders": [
+            {"encoder": "h264_nvenc", "reason": "exit status 1: Cannot load libnvidia-encode.so.1"},
+            {"encoder": "hevc_nvenc", "reason": "exit status 1: Cannot load libnvidia-encode.so.1"},
+            {"encoder": "h264_vaapi", "reason": "exit status 1: Failed to initialise VAAPI connection: -1 (unknown libva error)."},
+            {"encoder": "hevc_vaapi", "reason": "exit status 1: Failed to initialise VAAPI connection: -1 (unknown libva error)."},
+            {"encoder": "h264_qsv", "reason": "exit status 1: Device creation failed: -2"},
+        ]}, indent=2))
+else:
+    w("api/capabilities.json", json.dumps({
+        "ffmpeg": True, "ffprobe": True, "image_subtitles": "read as text",
+        "subtitle_ocr_enabled": True, "render_node": "/dev/dri/renderD128",
+        "hardware_acceleration": ["vaapi"],
+        "video_encoders": ["h264_vaapi", "hevc_vaapi", "libx264", "libx265", "aac"],
+        "rejected_encoders": [
+            {"encoder": "h264_nvenc", "reason": "Cannot load libnvidia-encode.so.1"},
+            {"encoder": "h264_qsv", "reason": "Device creation failed: -2"},
+        ]}, indent=2))
 w("api/health.json", json.dumps({"status": "ok", "version": "0.18.0"}))
 w("metrics/prometheus.txt", """# HELP astraeus_http_requests_total Requests served.
 # TYPE astraeus_http_requests_total counter
@@ -134,13 +160,27 @@ astraeus_rate_limited_total 0
 astraeus_spans_dropped_total 0
 """)
 
+probe_lines = [
+    '2026-10-09T21:00:02.000000000Z level=INFO msg="probing hardware encoders" families=5',
+]
+if ALL_REJECTED:
+    probe_lines += [
+        '2026-10-09T21:00:03.000000000Z level=WARN msg="hardware encoder rejected" encoder=h264_nvenc reason="exit status 1: Cannot load libnvidia-encode.so.1"',
+        '2026-10-09T21:00:04.000000000Z level=WARN msg="hardware encoder rejected" encoder=h264_qsv reason="exit status 1: Device creation failed: -2"',
+        '2026-10-09T21:00:05.000000000Z level=WARN msg="hardware encoder rejected" encoder=h264_vaapi reason="exit status 1: Failed to initialise VAAPI connection: -1 (unknown libva error)."',
+        '2026-10-09T21:00:05.500000000Z level=WARN msg="no hardware encoder is usable on this host; transcoding will use the CPU" rejected=5',
+    ]
+else:
+    probe_lines += [
+        '2026-10-09T21:00:03.000000000Z level=WARN msg="hardware encoder rejected" encoder=h264_nvenc reason="Cannot load libnvidia-encode.so.1"',
+        '2026-10-09T21:00:04.000000000Z level=WARN msg="hardware encoder rejected" encoder=h264_qsv reason="Device creation failed: -2"',
+        '2026-10-09T21:00:05.000000000Z level=INFO msg="hardware encoder verified" encoder=h264_vaapi',
+        '2026-10-09T21:00:05.500000000Z level=INFO msg="hardware encoder verified" encoder=hevc_vaapi',
+    ]
+
 log = "\n".join([
     '2026-10-09T21:00:01.000000000Z level=INFO msg="astraeus starting" version=dev',
-    '2026-10-09T21:00:02.000000000Z level=INFO msg="probing hardware encoders" families=5',
-    '2026-10-09T21:00:03.000000000Z level=WARN msg="hardware encoder rejected" encoder=h264_nvenc reason="Cannot load libnvidia-encode.so.1"',
-    '2026-10-09T21:00:04.000000000Z level=WARN msg="hardware encoder rejected" encoder=h264_qsv reason="Device creation failed: -2"',
-    '2026-10-09T21:00:05.000000000Z level=INFO msg="hardware encoder verified" encoder=h264_vaapi',
-    '2026-10-09T21:00:05.500000000Z level=INFO msg="hardware encoder verified" encoder=hevc_vaapi',
+    *probe_lines,
     '2026-10-09T21:00:06.000000000Z level=INFO msg="image_subtitles=\\"read as text\\" subtitle_ocr_enabled=true"',
     '2026-10-09T21:05:00.000000000Z level=INFO msg="http request" method=GET path=/api/health status=200',
     '2026-10-09T21:06:00.000000000Z level=ERROR msg="stream start failed" code=stream_start_failed error="Impossible to convert between the formats supported by the filter \'Parsed_scale2ref_3\'"',
@@ -152,5 +192,5 @@ log = "\n".join([
 w("logs/container-stdout-stderr.log", log)
 w("logs/container-tail.log", log)
 w("logs/errors-warnings.log", "\n".join(l for l in log.splitlines() if "ERROR" in l or "WARN" in l))
-w("logs/summary.txt", "total_lines=13\ntail_lines=3000\nerror_lines=5\n")
+w("logs/summary.txt", f"total_lines={len(log.splitlines())}\ntail_lines=3000\nerror_lines=5\n")
 print(root)

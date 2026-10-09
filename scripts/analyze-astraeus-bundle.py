@@ -384,18 +384,36 @@ def classify_hw_failure(encoder: str, reason: str) -> tuple[str, str]:
         "vaapi" if "vaapi" in encoder.lower() else (
             "qsv" if "qsv" in encoder.lower() else "other"))
 
+    # `firstComplaint` returns ffmpeg's first non-blank stderr line, and for a
+    # failed encode that is often the input banner rather than the error. The
+    # rejection then reads as a failure with no stated cause, which is a
+    # weakness in the diagnostic rather than in the encoder.
+    if re.search(r"(^|[: ]\s*)(Input #\d|Guessed Channel|Stream mapping)", reason):
+        return ("reason not captured",
+                "the recorded reason is ffmpeg's input banner, not its error, so this "
+                "rejection does not say why the encoder failed. The real message is in the "
+                "same ffmpeg run's stderr, which the probe does not keep. Work around it by "
+                "running the same command by hand inside the container with "
+                "`ffmpeg -loglevel error ...`.")
+
     if "cannot load" in lowered or "libnvidia" in lowered:
         return ("missing userspace driver",
-                "the NVIDIA encode library is not present. The image is Debian with no CUDA "
-                "userspace, so it has to be injected by the NVIDIA container toolkit: run the "
-                "container with `--gpus all` (or `--runtime=nvidia`) and confirm `nvidia-smi` "
-                "works inside it.")
+                "the NVIDIA encode library (`libnvidia-encode.so`, and `libcuda.so` behind it) "
+                "cannot be loaded. This is separate from the device: `/dev/nvidia*` can be "
+                "present and the library still absent. The base image is Debian with no CUDA "
+                "userspace, so those libraries have to be injected by the NVIDIA container "
+                "toolkit — the container needs `--gpus all` (or `--runtime=nvidia`), and the "
+                "toolkit must be installed on the host. Confirm with `nvidia-smi` *inside* "
+                "the container; if that works, the device plumbing is right and what is "
+                "missing is specifically the encode library.")
     if "unknown libva error" in lowered or "failed to initialise vaapi" in lowered:
         return ("missing userspace driver",
-                "the device is reachable but libva has no vendor backend. The runtime image "
-                "does not ship one — install `intel-media-va-driver` (Intel) or "
-                "`mesa-va-drivers` (AMD/Intel) inside the container, or rebuild the image "
-                "with it. Mounting `/dev/dri` alone is not enough.")
+                "the device is reachable but libva has no vendor backend for it. This is a "
+                "driver-package gap, not a missing device: the runtime image ships ffmpeg's "
+                "VAAPI support but deliberately no `*_drv_video.so`. Install the driver for "
+                "the GPU that owns the render node — `intel-media-va-driver-non-free` or "
+                "`i965-va-driver` for Intel, `mesa-va-drivers` for AMD or older Intel — or "
+                "rebuild the image with it. Mounting `/dev/dri` alone will never be enough.")
     if "no such file" in lowered or "cannot open" in lowered or "permission denied" in lowered:
         return ("device not passed in",
                 "the device node is absent or unreadable inside the container. Pass it in: "
@@ -404,7 +422,8 @@ def classify_hw_failure(encoder: str, reason: str) -> tuple[str, str]:
         return ("device not passed in",
                 "ffmpeg could not create the hardware device. Check that the right device is "
                 "passed in for this family and that its userspace driver is installed.")
-    if "maxrate" in lowered or "bitrate" in lowered or "cbr" in lowered:
+    if "maxrate" in lowered or "bitrate" in lowered or "cbr" in lowered \
+            or "ceiling" in lowered or "kbps" in lowered:
         return ("ceiling not enforced",
                 "the family ignored the bitrate ceiling, which is why the startup probe "
                 "rejects it: an unenforced limit is worse than a slower encoder (S-1).")
@@ -466,16 +485,18 @@ def hardware_verdict(bundle: Bundle, report: Report, log_lines: list[str]) -> di
         report.caveat("`/api/system/capabilities` did not answer, so the encoder set is "
                       "inferred from the startup log alone")
 
-    # The probe's verdict, from the authoritative source when it answered. The
-    # API's `hardware_acceleration` is what the server will actually negotiate
-    # with; the log is a fallback for when the endpoint did not answer, because
-    # a message-matching heuristic must never override the server's own report.
+    # The probe's verdict. `/api/system/capabilities` is authoritative for what
+    # the server will negotiate, but an empty `hardware_acceleration` is not
+    # evidence that nothing was accepted — it is silence. Only a non-empty list
+    # overrides the log; otherwise keep any acceptance the log recorded and say
+    # that the two sources are not saying the same thing.
     api_answered = isinstance(capabilities, dict)
-    if api_answered and "hardware_acceleration" in capabilities:
-        accepted = list(hardware_accel)
+    api_says_accepted = list(hardware_accel) if api_answered else []
+    if api_says_accepted:
+        accepted = api_says_accepted
         log_only = []
     else:
-        log_only = accepted
+        log_only = list(accepted)
         accepted = []
         if not api_answered:
             report.caveat("`/api/system/capabilities` did not answer, so the hardware verdict "
@@ -487,15 +508,24 @@ def hardware_verdict(bundle: Bundle, report: Report, log_lines: list[str]) -> di
         report.conclude(f"the probe accepted {named} — this is real-hardware evidence, which "
                         "the project has not had for any family before")
     elif log_only:
-        # The log claimed an acceptance the API did not confirm; report the
-        # disagreement rather than picking a winner silently.
+        # The log claimed an acceptance the API did not confirm. Report the
+        # disagreement rather than picking a winner silently: the API is what
+        # negotiation actually consults, but a log line saying otherwise is a
+        # real signal that something is inconsistent.
         named = ", ".join(f"`{a}`" for a in log_only)
         report.line(f"**The startup log mentions an accepted encoder ({named}) but the API's "
-                    "`hardware_acceleration` is empty.** The API is authoritative: treat this "
-                    "as not accepted, and keep the log line.")
+                    "`hardware_acceleration` is empty.** The API is authoritative for what the "
+                    "server will negotiate, so treat this as not accepted — and keep the log "
+                    "line, because the two disagreeing is itself worth knowing.")
         report.caveat("the startup log and `/api/system/capabilities` disagree about which "
                       "encoder was accepted")
-    elif hardware_accel or encoders:
+        if no_hardware:
+            report.conclude(
+                f"no hardware encoder was accepted; the log names {rejected_count} rejected "
+                "families")
+    elif api_answered and "hardware_acceleration" in capabilities:
+        # The API answered and named nothing, which is a verdict: this host has
+        # no usable hardware encoder.
         report.line("**No hardware encoder was accepted by the probe.**")
         if no_hardware:
             report.conclude(
@@ -542,24 +572,19 @@ def hardware_verdict(bundle: Bundle, report: Report, log_lines: list[str]) -> di
             cause, _advice = classify_hw_failure(encoder, best_reason[encoder])
             report.line(f"| `{encoder}` | {cause} | {best_reason[encoder]} |")
 
-        # Group by cause so the fix reads first, with every encoder it explains.
-        by_cause: dict[str, list[str]] = defaultdict(list)
-        advice: dict[str, set[str]] = defaultdict(set)
+        # Group by the fix, not by the cause label: VAAPI and NVENC are both
+        # "missing userspace driver" but need different packages installed, so
+        # naming every encoder under either fix would be wrong about one of them.
+        by_fix: dict[tuple[str, str], list[str]] = defaultdict(list)
         for encoder, reason in best_reason.items():
-            cause, why = classify_hw_failure(encoder, reason)
-            by_cause[cause].append(encoder)
-            advice[cause].add(why)
+            by_fix[classify_hw_failure(encoder, reason)].append(encoder)
         report.line()
         report.line("### What each failure needs")
         report.line()
-        for cause in sorted(by_cause):
-            names = ", ".join(f"`{e}`" for e in sorted(by_cause[cause]))
-            # A cause with several distinct explanations (VAAPI and NVENC are
-            # both "missing userspace driver" but need different packages) lists
-            # each one rather than picking a representative.
-            for why in sorted(advice[cause]):
-                report.line(f"- **{cause}** ({names}): {why}")
-            report.conclude(f"{cause} — {names} rejected for that reason")
+        for (cause, why), names in sorted(by_fix.items()):
+            joined = ", ".join(f"`{e}`" for e in sorted(names))
+            report.line(f"- **{cause}** ({joined}): {why}")
+            report.conclude(f"{cause} — {joined} rejected for that reason")
     if api_rejects:
         report.line()
         report.line("`rejected_encoders` from the API (verbatim):")
@@ -718,11 +743,16 @@ def gpu_visibility(bundle: Bundle, report: Report, log_lines: list[str], hw: dic
     if not host_smi:
         report.line("- `nvidia-smi` is not on the host, so there is no NVIDIA driver "
                     "userspace for any container to be given.")
-    if vaapi_needs_driver or nvidia_needs_driver:
+    if (vaapi_needs_driver or nvidia_needs_driver) and not hw.get("accepted"):
         report.caveat("the GPU-side evidence is a *failure to initialise* rather than a "
                       "successful encode, so it does not yet show that a hardware encode "
                       "works on this host. Getting one accepted family is the higher-value "
                       "result: the project has never run any of them on real hardware")
+    elif hw.get("accepted"):
+        report.caveat("the probe accepted a hardware encoder, but this bundle has no session "
+                      "that actually used it. A bundle collected during a hardware transcode "
+                      "is what shows the ceiling holding and the arguments the real session "
+                      "got (S-1, S-15)")
 
     report.line("### Userspace drivers inside the container")
     report.line()

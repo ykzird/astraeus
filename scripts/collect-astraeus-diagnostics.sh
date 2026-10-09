@@ -574,5 +574,9 @@ fi
 say ""
 say "Check it before sending:"
 say "  tar tzf $(basename "$BUNDLE") | head -40"
-say "  scripts/analyze-astraeus-bundle.py $(basename "$BUNDLE") > report.md"
+if have python3; then
+    say "  python3 scripts/analyze-astraeus-bundle.py $(basename "$BUNDLE") > report.md"
+else
+    say "  (python3 is not on this host; README.sh inside the bundle summarises it)"
+fi
 exit 0

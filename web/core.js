@@ -123,6 +123,42 @@
     return isFinite(index) && index > 0;
   }
 
+  /**
+   * The session a stale negotiation left running on the server, or null.
+   *
+   * A negotiation that has been superseded - the viewer navigated away, pressed
+   * Stop, or started another title - is discarded by the caller, but the server
+   * has already started ffmpeg for it. Dropping the id meant that transcode ran
+   * until the idle reaper collected it, so clicking through titles stacked
+   * transcodes on a host that had been asked for one (W-4 of the 2026-10-09
+   * review).
+   *
+   * `result` is the playback response the caller is about to discard, `current`
+   * is the session that replaced this one, and `session` is the one the response
+   * belongs to.
+   *
+   * Two things keep this from releasing something it should not. A session that
+   * is still the one on screen is not stale at all, so nothing is returned. And a
+   * session that has *already* been given this id - which is what happens when a
+   * quality change renegotiates: `resumeSession` releases the previous id and the
+   * response may name it again - must not be released a second time, because the
+   * second request would stop whatever is now using that id.
+   *
+   * Returns null when there is nothing to release, so the caller's stale branch
+   * stays a single call rather than a decision it could get wrong.
+   */
+  function orphanedSessionId(result, current, session) {
+    const started = result && typeof result.session_id === "string" ? result.session_id : "";
+    if (!started) return null;
+    /* The response belongs to the session being handled; if that session is
+       still the one on screen there is nothing stale about it. */
+    if (current === session) return null;
+    /* An older session's id must not be released by a newer response, and one
+       already released must not be released again. */
+    if (session && session.sessionId === started) return null;
+    return started;
+  }
+
   /* ── progress reporting ───────────────────────────────────────────────── */
 
   /** A position shorter than this is not worth remembering. */
@@ -318,5 +354,6 @@
     subtitleDeliverable: subtitleDeliverable,
     subtitleNeedsBurn: subtitleNeedsBurn,
     subtitleSelectable: subtitleSelectable,
+    orphanedSessionId: orphanedSessionId,
   };
 });

@@ -35,3 +35,9 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+
+# Python bytecode from the helper scripts in scripts/. A .pyc is an artifact of
+# whatever interpreter last ran them, and one was committed by accident before
+# this line existed.
+__pycache__/
+*.py[cod]

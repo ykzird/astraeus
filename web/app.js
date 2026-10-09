@@ -33,7 +33,7 @@
   const {
     ENGINE_NATIVE: ENGINE_NATIVE, ENGINE_NATIVE_HLS: ENGINE_NATIVE_HLS,
     ENGINE_HLS_JS: ENGINE_HLS_JS, engineLabel: engineLabelFor,
-    subtitleSelectable: subtitleSelectable,
+    subtitleSelectable: subtitleSelectable, orphanedSessionId: orphanedSessionId,
   } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */
@@ -3816,8 +3816,14 @@
       /* Auto quality. The body still carries the full capability manifest,
          because a body replaces the server's browser defaults. */
       const result = await api.playback(entity.id, playbackRequestBody(resumeSeconds, null));
-      /* Navigation or Stop may have replaced the session during the request. */
-      if (state.playback !== session) return;
+      /* Navigation or Stop may have replaced the session during the request. The
+         server has already started ffmpeg for this one, so its id is released
+         rather than dropped: the reaper would otherwise be the only thing that
+         stopped it, and clicking through titles stacked transcodes (W-4). */
+      if (state.playback !== session) {
+        releaseStreamSession(orphanedSessionId(result, state.playback, session), true);
+        return;
+      }
       applyPlaybackResult(session, result, entity, { startSeconds: resumeSeconds, preferredHeight: null });
       startSessionMedia(session, entity, true);
       /* Direct play applies the offset client-side, so its sessionStart is 0
@@ -4133,8 +4139,12 @@
         entity.id,
         playbackRequestBody(startSeconds, preferredHeight, audioTrackIndex, burnSubtitleIndex)
       );
-      /* Navigation or Stop may have replaced the session meanwhile. */
-      if (state.playback !== pb) return;
+      /* Navigation or Stop may have replaced the session meanwhile. Its
+         transcode is released rather than left to the reaper (W-4). */
+      if (state.playback !== pb) {
+        releaseStreamSession(orphanedSessionId(result, state.playback, pb), true);
+        return;
+      }
       applyPlaybackResult(pb, result, entity, {
         startSeconds: startSeconds,
         preferredHeight: preferredHeight,
