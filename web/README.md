@@ -86,11 +86,11 @@ Subtitle tracks returned by the playback endpoint are served as WebVTT
 (`text/vtt; charset=utf-8`) and attached to the player as `<track>` elements,
 which works on both the native and the MSE path. The player's subtitle menu
 offers an **Off** option plus one per track. A track with a URL is delivered as
-a `<track>` and toggles instantly — text tracks always, and a PGS image track
-too once the server has read it into text. An image track the server *cannot*
-deliver has no URL; it is offered anyway, labelled "(burned in)", and choosing it
-re-negotiates a session that composites the bitmap into the picture. The two
-predicates that decide which case applies — `subtitleDeliverable` and
+a `<track>` and toggles instantly — text tracks always, and an image track (PGS
+or VobSub) too once the server has read it into text. An image track the server
+*cannot* deliver has no URL; it is offered anyway, labelled "(burned in)", and
+choosing it re-negotiates a session that composites the bitmap into the picture.
+The two predicates that decide which case applies — `subtitleDeliverable` and
 `subtitleNeedsBurn` — are pure functions in `core.js`, so `core.test.js` covers
 them without a browser. Nothing is selected unless the server marks a track as
 default — and a choice the viewer made sticks: a quality change or a

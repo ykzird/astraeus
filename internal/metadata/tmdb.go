@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -50,6 +51,41 @@ type tmdbResult struct {
 
 type tmdbSearchResponse struct {
 	Results []tmdbResult `json:"results"`
+}
+
+// redactURLError strips the credential out of a transport error before it is
+// wrapped and logged.
+//
+// net/http reports a failed request as *url.Error, whose Error() string embeds
+// the full URL - and this provider's URL carries the API key as a query
+// parameter, because that is how the v3 API authenticates. "TMDB is
+// unreachable" is therefore also "the key is in the log", which a log
+// aggregator then keeps. The wrapped error keeps the cause, the operation and
+// the redacted URL, which is everything the message needed.
+func redactURLError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	redacted := *urlErr
+	redacted.URL = redactQuery(urlErr.URL)
+	return &redacted
+}
+
+// redactQuery replaces every query value with "REDACTED", keeping the parameter
+// names. The key is not the only secret a query can carry, so the rule is to
+// keep none of them.
+func redactQuery(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "REDACTED"
+	}
+	query := parsed.Query()
+	for name := range query {
+		query.Set(name, "REDACTED")
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 // FetchMetadata looks the entity up on TMDB.
@@ -108,7 +144,7 @@ func (p *TMDB) search(ctx context.Context, kind string, entity *library.MediaEnt
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("tmdb: requesting %s: %w", kind, err)
+		return nil, fmt.Errorf("tmdb: requesting %s: %w", kind, redactURLError(err))
 	}
 	defer resp.Body.Close()
 

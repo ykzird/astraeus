@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -575,14 +576,45 @@ func TestVideoFilters_HDRStatesItsColourOnTheFrames(t *testing.T) {
 
 // TestVideoFilters_PlainSDROutputIsUntouched guards the common path: changing
 // nothing about a picture that needs no colour work.
+//
+// "Nothing" still includes the even-dimension scaler, which is the S-4 fix: a
+// re-encode with no downscale used to emit no filter at all, and libx264 then
+// refused a 640x271 source outright.
 func TestVideoFilters_PlainSDROutputIsUntouched(t *testing.T) {
 	t.Parallel()
 
 	if got := videoFilters("libx264", videoPlan{Height: 720}); len(got) != 1 || got[0] != "scale=-2:720" {
 		t.Errorf("a plain SDR scale-down = %v, want just the scale filter", got)
 	}
-	if got := videoFilters("libx264", videoPlan{}); len(got) != 0 {
-		t.Errorf("a plain SDR transcode with no scaling = %v, want no filters", got)
+	got := videoFilters("libx264", videoPlan{})
+	if len(got) != 1 || got[0] != evenDimensions {
+		t.Errorf("a plain SDR transcode with no scaling = %v, want only the even-dimension scaler", got)
+	}
+	// The no-op is a no-op: it must not be an upscale or a fixed size.
+	if strings.Contains(got[0], "1080") || strings.Contains(got[0], "-2") {
+		t.Errorf("the even-dimension scaler must not pin or guess a size:\n%s", got[0])
+	}
+}
+
+// TestVideoFilters_OddSourceGetsAnEvenOutput is the regression test for S-4.
+//
+// The failure was reported against an Xvid 640x271 source with the browser
+// profile: the source already fitted the client's box, so no scale was emitted,
+// and libx264 failed the session with "height not divisible by 2". The filter
+// chain now always carries an even-dimension clamp, and this test pins that for
+// every encoder family, including the VAAPI spelling.
+func TestVideoFilters_OddSourceGetsAnEvenOutput(t *testing.T) {
+	t.Parallel()
+
+	for _, encoder := range []string{"libx264", "libx265", "h264_vaapi", "h264_nvenc", "h264_qsv", "h264_amf"} {
+		t.Run(encoder, func(t *testing.T) {
+			t.Parallel()
+
+			got := strings.Join(videoFilters(encoder, videoPlan{}), ",")
+			if !strings.Contains(got, "trunc(iw/2)*2") || !strings.Contains(got, "trunc(ih/2)*2") {
+				t.Errorf("%s must clamp both dimensions to even:\n%s", encoder, got)
+			}
+		})
 	}
 }
 
@@ -774,27 +806,235 @@ func TestSoftwareOnlyDecision_ToneMapsWhenHDRCannotSurvive(t *testing.T) {
 	}
 }
 
-// TestEncoderOutputArgs_BitrateCeiling covers the VBV constraint that makes a
-// client's bitrate limit real. -maxrate with -bufsize is the spelling every
-// family understands, so the ceiling is applied uniformly rather than each
-// family inventing a target bitrate.
+// TestEncoderOutputArgs_BitrateCeiling covers the bitrate ceiling that makes a
+// client's bitrate limit real.
+//
+// The previous version asserted that no family receives -b:v, on the theory that
+// "-maxrate bounds the rate without dictating it". That is true of libx264 and
+// false of every hardware family: with no -b:v, h264_vaapi picks CQP and treats
+// -maxrate as advice, so a 308 kbps target shipped at 5.4 Mbps (S-1 of the
+// 2026-10-09 review). The test agreed with the code, and the code disagreed with
+// the world. What each family needs is now asserted per family, and the software
+// encoders are still held to the old invariant, because for them it holds.
 func TestEncoderOutputArgs_BitrateCeiling(t *testing.T) {
 	t.Parallel()
 
-	for _, encoder := range []string{"libx264", "libx265", "h264_nvenc", "h264_qsv", "h264_amf", "h264_vaapi"} {
+	tests := []struct {
+		encoder string
+		// want are substrings that must appear.
+		want []string
+		// forbid are substrings that must not.
+		forbid []string
+	}{
+		{
+			encoder: "libx264",
+			want:    []string{"-maxrate 5000k", "-bufsize 10000k", "-crf 21"},
+			forbid:  []string{"-b:v"},
+		},
+		{
+			encoder: "libx265",
+			want:    []string{"-maxrate 5000k", "-bufsize 10000k", "-crf 21"},
+			forbid:  []string{"-b:v"},
+		},
+		{
+			// VP9 already carries -b:v 0 to mean "constant quality"; the
+			// ceiling is added beside it, so nothing is forbidden here.
+			encoder: "libvpx-vp9",
+			want:    []string{"-maxrate 5000k", "-bufsize 10000k", "-b:v 0"},
+		},
+		{
+			encoder: "h264_vaapi",
+			want:    []string{"-rc_mode VBR", "-b:v 5000k", "-maxrate 5000k", "-bufsize 10000k"},
+			forbid:  []string{"-cq "},
+		},
+		{
+			encoder: "h264_qsv",
+			want:    []string{"-b:v 5000k", "-maxrate 5000k", "-bufsize 10000k"},
+			// ICQ and a target bitrate are alternatives; leaving
+			// -global_quality in place is what made the ceiling advisory.
+			forbid: []string{"-global_quality"},
+		},
+		{
+			encoder: "h264_nvenc",
+			want:    []string{"-b:v 5000k", "-maxrate 5000k", "-bufsize 10000k", "-preset p4"},
+			forbid:  []string{"-cq "},
+		},
+		{
+			encoder: "h264_amf",
+			want:    []string{"-rc vbr_peak", "-b:v 5000k", "-maxrate 5000k"},
+			// -rc cqp and -rc vbr_peak cannot both apply.
+			forbid: []string{"-rc cqp", "-qp_i"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.encoder, func(t *testing.T) {
+			t.Parallel()
+
+			joined := strings.Join(encoderOutputArgs(tt.encoder, videoPlan{BitrateKbps: 5_000}, encoderDevice{}, 1, 0), " ")
+			for _, want := range tt.want {
+				if !strings.Contains(joined, want) {
+					t.Errorf("%s is missing %q:\n%s", tt.encoder, want, joined)
+				}
+			}
+			for _, forbid := range tt.forbid {
+				if strings.Contains(joined, forbid) {
+					t.Errorf("%s must not carry %q:\n%s", tt.encoder, forbid, joined)
+				}
+			}
+			if !strings.Contains(joined, "-maxrate") {
+				t.Errorf("%s has no ceiling at all:\n%s", tt.encoder, joined)
+			}
+		})
+	}
+}
+
+// TestEncoderOutputArgs_CappedLadderKeepsSpecifiers guards the ladder spelling:
+// a cap on one rendition must not land on every rendition.
+func TestEncoderOutputArgs_CappedLadderKeepsSpecifiers(t *testing.T) {
+	t.Parallel()
+
+	joined := strings.Join(encoderOutputArgs("h264_vaapi", videoPlan{BitrateKbps: 5_000}, encoderDevice{}, 2, 1), " ")
+	for _, want := range []string{"-b:v:1 5000k", "-maxrate:1 5000k", "-bufsize:1 10000k", "-rc_mode:1 VBR"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("a ladder rendition is missing the specifier on %q:\n%s", want, joined)
+		}
+	}
+}
+
+// TestEncoderVideoArgs_UncappedKeepsQualityMode guards the other half: without a
+// ceiling nothing changes, so a quality-driven encode stays quality-driven.
+func TestEncoderVideoArgs_UncappedKeepsQualityMode(t *testing.T) {
+	t.Parallel()
+
+	for encoder, want := range map[string]string{
+		"h264_nvenc":        "-cq 22",
+		"h264_qsv":          "-global_quality 22",
+		"h264_amf":          "-rc cqp",
+		"h264_vaapi":        "-c:v h264_vaapi",
+		"h264_videotoolbox": "-q:v 60",
+	} {
 		t.Run(encoder, func(t *testing.T) {
 			t.Parallel()
 
-			joined := strings.Join(encoderOutputArgs(encoder, videoPlan{BitrateKbps: 5_000}, encoderDevice{}, 1, 0), " ")
-			for _, want := range []string{"-maxrate 5000k", "-bufsize 10000k"} {
-				if !strings.Contains(joined, want) {
-					t.Errorf("%s is missing %q:\n%s", encoder, want, joined)
-				}
+			joined := strings.Join(encoderOutputArgs(encoder, videoPlan{Height: 720}, encoderDevice{}, 1, 0), " ")
+			if !strings.Contains(joined, want) {
+				t.Errorf("%s without a ceiling should keep %q:\n%s", encoder, want, joined)
 			}
-			// Quality-driven encodes must stay quality-driven: a hard -b:v would
-			// turn CRF and CQ modes into fixed-rate ones.
-			if strings.Contains(joined, "-b:v") {
-				t.Errorf("%s should bound the rate, not dictate it:\n%s", encoder, joined)
+			if strings.Contains(joined, "-b:v") || strings.Contains(joined, "-maxrate") {
+				t.Errorf("%s without a ceiling must gain no rate control:\n%s", encoder, joined)
+			}
+		})
+	}
+}
+
+// probeSummary is the line ffmpeg's null muxer prints for one second of video.
+func probeSummary(videoKiB int) string {
+	return "frame=   10 fps=0.0 q=-0.0 Lsize=N/A time=00:00:01.00 bitrate=N/A speed=50x\n" +
+		"[out#0/null @ 0x55] video:" + strconv.Itoa(videoKiB) + "KiB audio:0KiB subtitle:0KiB"
+}
+
+// TestProbeVideoKib reads ffmpeg's own accounting of what the probe encoded.
+func TestProbeVideoKib(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		output string
+		want   int
+		wantOK bool
+	}{
+		{name: "the null muxer summary", output: probeSummary(38), want: 38, wantOK: true},
+		{name: "no summary at all", output: "some other ffmpeg chatter", wantOK: false},
+		{name: "the last summary wins", output: probeSummary(3) + "\n" + probeSummary(41), want: 41, wantOK: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, ok := probeVideoKib(tt.output)
+			if ok != tt.wantOK {
+				t.Fatalf("probeVideoKib ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && got != tt.want {
+				t.Errorf("probeVideoKib = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestVerifyProbeCeiling is the regression test for the half of S-1 that keeps
+// the per-family spellings honest.
+//
+// The QSV, AMF and NVENC options are reasoned from their documented option sets
+// rather than measured on hardware, so the code cannot know they work. What it
+// can do is refuse a family whose encode comes back over the ceiling, which is
+// what turns "very likely also broken" into a startup rejection with the
+// measured rate in it.
+func TestVerifyProbeCeiling(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		encoder string
+		plan    videoPlan
+		output  string
+		wantErr bool
+	}{
+		{
+			name:    "a hardware encoder that holds the ceiling",
+			encoder: "h264_vaapi",
+			plan:    videoPlan{BitrateKbps: 308},
+			output:  probeSummary(38), // 304 kbps
+		},
+		{
+			name:    "a hardware encoder that ignores it",
+			encoder: "h264_vaapi",
+			plan:    videoPlan{BitrateKbps: 308},
+			output:  probeSummary(657), // 5256 kbps, the measured VAAPI failure
+			wantErr: true,
+		},
+		{
+			name:    "a hardware encoder that overshoots within tolerance",
+			encoder: "h264_nvenc",
+			plan:    videoPlan{BitrateKbps: 308},
+			output:  probeSummary(90), // 720 kbps, inside the 2.5x allowance
+		},
+		{
+			name:    "software is exempt: it holds -maxrate alone",
+			encoder: "libx264",
+			plan:    videoPlan{BitrateKbps: 308},
+			output:  probeSummary(657),
+		},
+		{
+			name:    "no ceiling was declared",
+			encoder: "h264_vaapi",
+			plan:    videoPlan{},
+			output:  probeSummary(657),
+		},
+		{
+			name:    "the summary is missing, so the ceiling is unverified",
+			encoder: "h264_vaapi",
+			plan:    videoPlan{BitrateKbps: 308},
+			output:  "ffmpeg said something else",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := verifyProbeCeiling(tt.encoder, tt.plan, tt.output)
+			if tt.wantErr && err == nil {
+				t.Fatal("expected the probe to reject this encoder")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected rejection: %v", err)
+			}
+			if tt.wantErr && err != nil && !strings.Contains(err.Error(), "ceiling") {
+				t.Errorf("the rejection should name the ceiling: %v", err)
 			}
 		})
 	}

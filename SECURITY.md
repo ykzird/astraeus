@@ -22,10 +22,13 @@ some installs, on the public internet. The parts worth attacking, and the parts
 that have had the most thought:
 
 - **The access gate** (`internal/access`) and anything that lets a request past
-  it — including the `proxy` mode's trusted-address check and identity headers.
+  it — including the `proxy` mode's trusted-address check and its single identity
+  header.
 - **The API** (`internal/api`): path traversal in the artwork and subtitle
   routes, the media-object allow-list, request-body handling, and anything that
-  turns a request into a filesystem path or an outbound URL.
+  turns a request into a filesystem path or an outbound URL. That includes the
+  cross-origin, Host and `Content-Type` checks, which are all that stands between
+  a page on another origin and an unauthenticated library.
 - **The artwork proxy** (`internal/images`), which fetches from an upstream and
   is the closest thing here to an SSRF surface.
 - **The streaming session manager** (`internal/streaming`): whether a client can
@@ -44,8 +47,13 @@ that have had the most thought:
 - **A progress position the client made up.** The server validates the range and
   clears a finished position; it cannot tell a real position from a plausible
   wrong one, and the worst case is a resume in the wrong place.
-- **`--auth-mode none` on a public address.** The default is documented as
-  LAN-only, and the runbook turns the gate on before publishing a port.
+- **`--auth-mode none` on a public address.** The server binds loopback by
+  default, so reaching this state takes an explicit `--addr`; the runbook turns
+  the gate on before publishing a port. An operator who does both anyway has
+  published an unauthenticated library, which is a configuration problem.
+- **A Host header the operator listed.** `--allowed-hosts` is the control; a name
+  added to it is trusted to reach this server, and the check is not a substitute
+  for the gate.
 
 ## Supported versions
 

@@ -65,8 +65,38 @@ func TestNew_FailsClosed(t *testing.T) {
 		cfg  Config
 	}{
 		{
+			name: "proxy mode without an identity header",
+			cfg: Config{
+				Mode:           ModeProxy,
+				TrustedProxies: mustPrefixes(t, "127.0.0.1/32"),
+				Logger:         testLogger(),
+			},
+		},
+		{
+			name: "proxy mode with both known identity headers",
+			cfg: Config{
+				Mode:           ModeProxy,
+				IdentityHeader: HeaderTailscaleLogin + "," + HeaderCloudflareEmail,
+				TrustedProxies: mustPrefixes(t, "127.0.0.1/32"),
+				Logger:         testLogger(),
+			},
+		},
+		{
+			name: "proxy mode with an invalid header name",
+			cfg: Config{
+				Mode:           ModeProxy,
+				IdentityHeader: "Tailscale User Login",
+				TrustedProxies: mustPrefixes(t, "127.0.0.1/32"),
+				Logger:         testLogger(),
+			},
+		},
+		{
 			name: "proxy mode without trusted proxies",
-			cfg:  Config{Mode: ModeProxy, Logger: testLogger()},
+			cfg: Config{
+				Mode:           ModeProxy,
+				IdentityHeader: HeaderTailscaleLogin,
+				Logger:         testLogger(),
+			},
 		},
 		{
 			name: "token mode without a token",
@@ -112,6 +142,7 @@ func TestProxyMode(t *testing.T) {
 
 	gate, err := New(Config{
 		Mode:           ModeProxy,
+		IdentityHeader: HeaderTailscaleLogin,
 		TrustedProxies: mustPrefixes(t, "127.0.0.1/32", "100.64.0.0/10", "::1/128"),
 		Metrics:        observability.New(),
 		Logger:         testLogger(),
@@ -132,13 +163,6 @@ func TestProxyMode(t *testing.T) {
 			name:       "trusted proxy with a tailscale identity",
 			remote:     "127.0.0.1:5000",
 			headers:    map[string]string{"Tailscale-User-Login": "viewer@example.com"},
-			wantStatus: http.StatusOK,
-			wantCodes:  "identity=viewer@example.com",
-		},
-		{
-			name:       "trusted proxy with a cloudflare identity",
-			remote:     "100.101.102.103:5000",
-			headers:    map[string]string{"Cf-Access-Authenticated-User-Email": "viewer@example.com"},
 			wantStatus: http.StatusOK,
 			wantCodes:  "identity=viewer@example.com",
 		},
@@ -205,12 +229,143 @@ func TestProxyMode(t *testing.T) {
 	}
 }
 
+// A deployment behind Cloudflare Access names that header instead, and then the
+// Tailscale header is not believed at all.
+func TestProxyMode_CloudflareHeader(t *testing.T) {
+	t.Parallel()
+
+	gate, err := New(Config{
+		Mode:           ModeProxy,
+		IdentityHeader: HeaderCloudflareEmail,
+		TrustedProxies: mustPrefixes(t, "127.0.0.1/32"),
+		Metrics:        observability.New(),
+		Logger:         testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	req := request(http.MethodGet, "/api/libraries", "127.0.0.1:5000")
+	req.Header.Set(HeaderCloudflareEmail, "viewer@example.com")
+	recorder := httptest.NewRecorder()
+	gate.Middleware(okHandler()).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "identity=viewer@example.com") {
+		t.Errorf("body = %q, want the Cloudflare identity", recorder.Body.String())
+	}
+}
+
+// TestProxyMode_RefusesACompetingIdentityHeader is the regression test for A-1.
+//
+// Before this, the gate believed whichever of the two known proxy headers was
+// non-empty, first match winning. Each real proxy overwrites only its own
+// header, so a user of the proxy that was actually deployed could send the
+// other one and be believed as anyone — an administrator included. The
+// deployment now names exactly one header, and a value in any other known
+// identity header is a refusal rather than a silent second chance.
+func TestProxyMode_RefusesACompetingIdentityHeader(t *testing.T) {
+	t.Parallel()
+
+	gate, err := New(Config{
+		Mode:           ModeProxy,
+		IdentityHeader: HeaderTailscaleLogin,
+		TrustedProxies: mustPrefixes(t, "127.0.0.1/32"),
+		Metrics:        observability.New(),
+		Logger:         testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	handler := gate.Middleware(okHandler())
+
+	tests := []struct {
+		name       string
+		headers    map[string]string
+		wantStatus int
+		wantCode   string
+		wantTwice  bool
+	}{
+		{
+			name: "the other proxy's header alongside the configured one",
+			headers: map[string]string{
+				HeaderTailscaleLogin:  "viewer@example.com",
+				HeaderCloudflareEmail: "admin@example.com",
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   "competing_identity_header",
+		},
+		{
+			name: "the other proxy's header with no configured one",
+			headers: map[string]string{
+				HeaderCloudflareEmail: "admin@example.com",
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   "competing_identity_header",
+		},
+		{
+			name: "the configured header twice",
+			headers: map[string]string{
+				HeaderTailscaleLogin: "viewer@example.com",
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   "ambiguous_identity",
+			wantTwice:  true,
+		},
+		{
+			name: "the configured header as a comma-separated list",
+			headers: map[string]string{
+				HeaderTailscaleLogin: "viewer@example.com,admin@example.com",
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   "ambiguous_identity",
+		},
+		{
+			// The honest single-header request still works.
+			name: "only the configured header",
+			headers: map[string]string{
+				HeaderTailscaleLogin: "viewer@example.com",
+			},
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := request(http.MethodGet, "/api/libraries", "127.0.0.1:5000")
+			for name, value := range tt.headers {
+				if tt.wantTwice {
+					req.Header.Add(name, value)
+					req.Header.Add(name, "second@example.com")
+					continue
+				}
+				req.Header.Set(name, value)
+			}
+
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body %s)", recorder.Code, tt.wantStatus, recorder.Body.String())
+			}
+			if tt.wantCode != "" && !strings.Contains(recorder.Body.String(), `"code":"`+tt.wantCode+`"`) {
+				t.Errorf("body = %q, want the %s code", recorder.Body.String(), tt.wantCode)
+			}
+		})
+	}
+}
+
 func TestProxyMode_IgnoresForwardedFor(t *testing.T) {
 	t.Parallel()
 
 	// Honouring X-Forwarded-For would let any client claim to be the proxy.
 	gate, err := New(Config{
 		Mode:           ModeProxy,
+		IdentityHeader: HeaderTailscaleLogin,
 		TrustedProxies: mustPrefixes(t, "127.0.0.1/32"),
 		Logger:         testLogger(),
 	})
@@ -284,6 +439,7 @@ func TestExemptPaths(t *testing.T) {
 			name: "proxy mode",
 			cfg: Config{
 				Mode:           ModeProxy,
+				IdentityHeader: HeaderTailscaleLogin,
 				TrustedProxies: mustPrefixes(t, "127.0.0.1/32"),
 				ExemptPaths:    []string{"/api/health"},
 				Logger:         testLogger(),
@@ -340,6 +496,7 @@ func TestDenialsAreJSONAndCounted(t *testing.T) {
 	metrics := observability.New()
 	gate, err := New(Config{
 		Mode:           ModeProxy,
+		IdentityHeader: HeaderTailscaleLogin,
 		TrustedProxies: mustPrefixes(t, "127.0.0.1/32"),
 		Metrics:        metrics,
 		Logger:         testLogger(),
@@ -372,6 +529,7 @@ func TestSuccessIsCounted(t *testing.T) {
 	metrics := observability.New()
 	gate, err := New(Config{
 		Mode:           ModeProxy,
+		IdentityHeader: HeaderTailscaleLogin,
 		TrustedProxies: mustPrefixes(t, "127.0.0.1/32"),
 		Metrics:        metrics,
 		Logger:         testLogger(),

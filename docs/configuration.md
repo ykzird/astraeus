@@ -45,19 +45,43 @@ rather than here:
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--addr` | `127.0.0.1:8642` | Listen address |
+| `--addr` | `127.0.0.1:8642` | Listen address; loopback, so publishing it is an explicit choice |
+| `--allowed-hosts` | loopback, this host's name, `--addr`'s host | Host names the server answers for; anything else is `421` |
+| `--cross-origin-protection` | on | Refuse state-changing requests a browser made from another origin |
 | `--web-dir` | `web` | Static UI directory |
 | `--ffmpeg`, `--ffprobe` | `ffmpeg`, `ffprobe` | Binaries to run (both are hard dependencies) |
 | `--stream-root` | temp | HLS session directories |
 | `--segment-seconds` | 6 | HLS target segment duration |
 | `--max-sessions` | 8 | Concurrent segmented streams |
 | `--image-cache`, `--subtitle-cache` | temp | Artwork and WebVTT caches |
-| `--tesseract-bin`, `--ocr-language` | `tesseract`, tesseract's own | OCR of image subtitles; a missing binary leaves them burn-only |
+| `--tesseract-bin`, `--ocr-language` | `tesseract`, tesseract's own | OCR of image subtitles (PGS, VobSub); a missing binary leaves them burn-only |
 | `--tmdb-image-base` | TMDB's own root | Upstream artwork root |
-| `--enrich-interval`, `--scan-interval` | — | Background passes; `0` disables |
-| `--auth-mode`, `--auth-header`, `--trusted-proxy`, `--auth-token`, `--auth-exempt` | see [Access gate](#access-gate) | Gate configuration |
+| `--enrich-interval`, `--scan-interval` | `6h` | Background passes; `0` disables |
+| `--auth-mode`, `--auth-header`, `--auth-provider`, `--trusted-proxy`, `--auth-token`, `--auth-exempt` | see [Access gate](#access-gate) | Gate configuration |
 | `--rate-limit`, `--rate-limit-burst` | `0` (off) | API limit |
 | `--otel-endpoint`, `--otel-service-name` | off | Trace export |
+
+The listen address is loopback by default. Serving the LAN, the tailnet or a
+container network is `--addr 0.0.0.0:8642` or a named interface, and that choice
+belongs with the gate: `none` mode plus a published port is an unauthenticated
+library on that network. The container image passes `0.0.0.0` explicitly for
+exactly this reason.
+
+`--allowed-hosts` closes DNS rebinding, which is what a browser does when a page
+it loaded from `attacker.example` re-resolves that name to this server: the page
+becomes same-origin with the API and can read it with no credential of its own.
+A Host the operator did not list is answered `421 Misdirected Request`. The
+default covers loopback, this machine's hostname and whatever `--addr` names; a
+reverse proxy in front needs its public name added, and a wildcard `--addr` adds
+nothing, because every name resolves to a wildcard bind.
+
+Cross-origin protection refuses `POST`, `PUT`, `PATCH` and `DELETE` requests a
+browser made from another origin, which is the other half of the CSRF defence
+described under [Access gate](#access-gate). State-changing endpoints also
+require `Content-Type: application/json`, so the shapes a cross-origin form can
+actually produce (`text/plain`, form encoding) are refused before the body is
+read. Disable it only for a scripted client that cannot send the headers it
+checks.
 
 ## Security headers
 
@@ -96,6 +120,13 @@ HTTP, where browsers ignore it. A reverse proxy that terminates TLS is where it
 belongs — [`deploy/tls/README.md`](../deploy/tls/README.md) is the runbook for
 that, and for the identity the gate needs a proxy to assert.
 
+Response headers are the last layer, not the only one. A request has to pass the
+[Host allowlist](#top) and, if it changes state, cross-origin protection; a JSON
+body has to be declared as JSON. Those refusals are `421` and `415` with the same
+error envelope as the rest of the API, and they are why a page on another origin
+cannot add a library, scan, enrich or start a transcode through this server, and
+why a hostname that rebinds to it cannot read the library.
+
 ## Access gate
 
 Per the specification, authentication is delegated to an identity-aware proxy
@@ -104,24 +135,41 @@ rather than a built-in user database. `--auth-mode` selects the policy:
 | Mode | Behaviour |
 | --- | --- |
 | `none` (default) | No gate. Correct for a trusted LAN; **never** expose this to the internet |
-| `proxy` | Believe an identity header — but only when the request arrives from a configured trusted address |
+| `proxy` | Believe one named identity header — but only when the request arrives from a configured trusted address |
 | `token` | Require `Authorization: Bearer <token>`, compared in constant time |
 
 ```sh
-# Behind Tailscale (tailscale serve sets Tailscale-User-Login) or Cloudflare Access
-./astraeus-server serve --auth-mode proxy --trusted-proxy 100.64.0.0/10,127.0.0.1/32
+# Behind Tailscale (tailscale serve sets Tailscale-User-Login)
+./astraeus-server serve --auth-mode proxy --auth-provider tailscale \
+  --trusted-proxy 127.0.0.1/32,::1/128
+
+# Behind Cloudflare Access (sets Cf-Access-Authenticated-User-Email)
+./astraeus-server serve --auth-mode proxy --auth-provider cloudflare \
+  --trusted-proxy 127.0.0.1/32,::1/128
 
 # For API clients and scripts
 ASTRAEUS_AUTH_TOKEN=$(openssl rand -hex 32) ./astraeus-server serve --auth-mode token
 ```
 
+Proxy mode names **exactly one** header, and there is no default: an install
+that has not said which proxy is in front refuses to start. This is deliberate.
+The gate believes a configured header whenever it is non-empty, and each proxy
+overwrites only its own header, so a deployment that accepted both
+`Tailscale-User-Login` and `Cf-Access-Authenticated-User-Email` would let a user
+of whichever proxy is actually deployed supply the other header and be believed
+as any identity, an administrator included. For a proxy that is not one of the
+two known names, `--auth-header X-Your-Header` sets it directly. A request
+carrying a known identity header the deployment does not accept is refused with
+`403 competing_identity_header` rather than ignored.
+
 The security property that matters: **an identity header is only believed from a
 trusted address.** Headers are trivially forgeable by anyone who can reach the
 port, so trusting them without that check would be worse than no gate at all.
 `X-Forwarded-For` is deliberately ignored for the same reason — the address the
-connection actually came from is the only trustworthy one. Configuration fails
-closed: `proxy` mode without `--trusted-proxy`, or `token` mode without a token,
-refuses to start.
+connection actually came from is the only trustworthy one. Name one address or a
+narrow range, never a whole VPN range: every host in it can forge a header.
+Configuration fails closed: `proxy` mode without `--trusted-proxy`, or `token`
+mode without a token, refuses to start.
 
 `--auth-exempt` (default `/api/health`) lists exact paths that bypass the gate,
 so liveness probes keep working. `/metrics` is **not** exempt: point Prometheus

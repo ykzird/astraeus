@@ -128,17 +128,34 @@ func (e *testEnv) do(t *testing.T, method, path, body string) *httptest.Response
 // empty one sends no header, which is the ungated single-viewer case.
 func (e *testEnv) doAs(t *testing.T, identity, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	return e.doWithContentTypeAs(t, identity, method, path, body, "application/json")
+}
+
+// doWithContentType is doAs with an explicit Content-Type, so a test can check
+// what the server does with a body that is not declared as JSON. An empty
+// contentType sends no header at all.
+func (e *testEnv) doWithContentType(t *testing.T, method, path, body, contentType string) *httptest.ResponseRecorder {
+	t.Helper()
+	identity := ""
+	if e.gate != nil {
+		identity = defaultTestIdentity
+	}
+	return e.doWithContentTypeAs(t, identity, method, path, body, contentType)
+}
+
+func (e *testEnv) doWithContentTypeAs(t *testing.T, identity, method, path, body, contentType string) *httptest.ResponseRecorder {
+	t.Helper()
 
 	var reader io.Reader
 	if body != "" {
 		reader = strings.NewReader(body)
 	}
 	req := httptest.NewRequest(method, path, reader)
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	if identity != "" {
-		req.Header.Set(access.DefaultIdentityHeaders[0], identity)
+		req.Header.Set(access.HeaderTailscaleLogin, identity)
 	}
 	recorder := httptest.NewRecorder()
 
@@ -203,24 +220,68 @@ func TestCreateLibrary_Validation(t *testing.T) {
 	missingDir := filepath.Join(t.TempDir(), "nope")
 
 	tests := []struct {
-		name       string
-		body       string
-		wantStatus int
+		name        string
+		body        string
+		contentType string
+		wantStatus  int
 	}{
-		{name: "missing name", body: `{"path":"` + validDir + `","kind":"movies"}`, wantStatus: http.StatusBadRequest},
-		{name: "missing path", body: `{"name":"Movies","kind":"movies"}`, wantStatus: http.StatusBadRequest},
-		{name: "unknown kind", body: `{"name":"Movies","path":"` + validDir + `","kind":"music"}`, wantStatus: http.StatusBadRequest},
-		{name: "path does not exist", body: `{"name":"Movies","path":"` + missingDir + `","kind":"movies"}`, wantStatus: http.StatusBadRequest},
-		{name: "unknown field", body: `{"name":"Movies","path":"` + validDir + `","kind":"movies","extra":1}`, wantStatus: http.StatusBadRequest},
-		{name: "malformed json", body: `{"name":`, wantStatus: http.StatusBadRequest},
-		{name: "empty body", body: "", wantStatus: http.StatusBadRequest},
+		{
+			name:        "missing name",
+			body:        `{"path":"` + validDir + `","kind":"movies"}`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "missing path",
+			body:        `{"name":"Movies","kind":"movies"}`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "unknown kind",
+			body:        `{"name":"Movies","path":"` + validDir + `","kind":"music"}`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "path does not exist",
+			body:        `{"name":"Movies","path":"` + missingDir + `","kind":"movies"}`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "unknown field",
+			body:        `{"name":"Movies","path":"` + validDir + `","kind":"movies","extra":1}`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "malformed json",
+			body:        `{"name":`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "empty body",
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			// A body is present but is not declared as JSON. This is the
+			// shape a cross-origin form can produce, which is why it is
+			// refused before the body is read at all.
+			name:        "not declared as json",
+			body:        `{"name":"Movies","path":"` + validDir + `","kind":"movies"}`,
+			contentType: "text/plain",
+			wantStatus:  http.StatusUnsupportedMediaType,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			recorder := env.do(t, http.MethodPost, "/api/libraries", tt.body)
+			recorder := env.doWithContentType(t, http.MethodPost, "/api/libraries", tt.body, tt.contentType)
 			if recorder.Code != tt.wantStatus {
 				t.Errorf("status = %d, want %d (body %s)", recorder.Code, tt.wantStatus, recorder.Body.String())
 			}

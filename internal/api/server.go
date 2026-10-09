@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"mime"
 	"net/http"
 	"os"
 	"strconv"
@@ -51,8 +52,8 @@ type StreamManager interface {
 // handler tests do not need ffmpeg.
 type SubtitleConverter interface {
 	Convert(ctx context.Context, mediaPath string, trackIndex int) (string, error)
-	// ConvertImage renders an image-based track (PGS) as WebVTT by reading the
-	// text out of its bitmaps. Without an OCR engine it returns
+	// ConvertImage renders an image-based track (PGS or VobSub) as WebVTT by
+	// reading the text out of its bitmaps. Without an OCR engine it returns
 	// subtitles.ErrUnsupportedFormat, which the handler answers as it always
 	// did rather than as a server fault.
 	ConvertImage(ctx context.Context, mediaPath string, trackIndex int) (string, error)
@@ -99,7 +100,12 @@ type Deps struct {
 	// Tracer, when set, records a span per request and correlates the request
 	// log with it. A nil or disabled tracer is a no-op.
 	Tracer *tracing.Tracer
-	Logger *slog.Logger
+	// CrossOrigin enables browser cross-origin request protection, which
+	// refuses a state-changing request a page on another origin made with the
+	// browser's own credentials attached. It is on by default and disabled
+	// only for a client that cannot send the headers it checks.
+	CrossOrigin bool
+	Logger      *slog.Logger
 }
 
 // Server renders library state as JSON over HTTP.
@@ -119,6 +125,10 @@ type Server struct {
 	rateLimit func(http.Handler) http.Handler
 	tracer    *tracing.Tracer
 	logger    *slog.Logger
+	// crossOrigin protects state-changing requests from other origins. The
+	// zero value is still a valid protection object, so this is only nil for a
+	// Server built by hand in a test.
+	crossOrigin *http.CrossOriginProtection
 }
 
 // NewServer creates a Server.
@@ -143,6 +153,9 @@ func NewServer(deps Deps) *Server {
 		rateLimit: deps.RateLimit,
 		tracer:    deps.Tracer,
 		logger:    logger,
+	}
+	if deps.CrossOrigin {
+		server.crossOrigin = http.NewCrossOriginProtection()
 	}
 
 	// The UI is served from the same origin as the API, so the browser needs
@@ -198,6 +211,13 @@ func (s *Server) Handler() http.Handler {
 	// any other, so it carries the same headers and appears in the same log. The
 	// tracer is outermost so a span covers the whole request, a refusal included.
 	handler := http.Handler(mux)
+	if s.crossOrigin != nil {
+		// Cross-origin protection refuses a state-changing request a browser
+		// made from another origin with credentials attached. It is outermost
+		// so a refusal happens before routing, and it is wrapped by the log and
+		// security headers like any other response.
+		handler = s.crossOrigin.Handler(handler)
+	}
 	if s.rateLimit != nil {
 		handler = s.rateLimit(handler)
 	}
@@ -1359,7 +1379,23 @@ func filterEntities(entities []library.MediaEntity, status string) []library.Med
 	return filtered
 }
 
+// decodeJSON decodes a JSON request body, refusing anything that is not
+// presented as JSON.
+//
+// The Content-Type check is the primary cross-site request forgery defence, and
+// it is not decoration. A cross-origin HTML form can only send
+// application/x-www-form-urlencoded, multipart/form-data or text/plain, and a
+// `fetch` in no-cors mode can only send one of the three, so requiring JSON
+// means a page on another origin cannot get a browser to attach the visitor's
+// credentials to a well-formed request here. `json.Decoder` stops after the
+// first value, so a form's trailing "=" would otherwise not even be a problem.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type",
+			"this endpoint requires Content-Type: application/json")
+		return false
+	}
+
 	body := http.MaxBytesReader(w, r.Body, maxRequestBody)
 	defer func() { _ = body.Close() }()
 
@@ -1375,6 +1411,18 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
 		return false
 	}
 	return true
+}
+
+// isJSONContentType reports whether a Content-Type header names JSON. The
+// charset parameter is accepted and ignored; anything else, including an empty
+// header, is not.
+func isJSONContentType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return false
+	}
+	mediaType = strings.ToLower(mediaType)
+	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

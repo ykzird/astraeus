@@ -24,6 +24,22 @@ ARG TARGETARCH
 # The module files are copied first so the dependency layer survives a source
 # change, which is most of the build time.
 COPY go.mod go.sum ./
+
+# go.mod's `toolchain` line is what decides the Go that compiles this, and it is
+# what keeps the image and the release tarball on the same patched toolchain. A
+# base image tag only carries the major.minor, so without this check a lagging
+# `golang:1.26-bookworm` could quietly build the image with a Go that has the
+# range-header and MIME-header vulnerabilities the tarball was rebuilt to avoid.
+# `go` reads go.mod here, downloads the pinned toolchain if the image lacks it,
+# and this fails the build if it cannot.
+RUN go version \
+ && required="$(sed -n 's/^toolchain go//p' go.mod)" \
+ && current="$(go env GOVERSION | sed 's/^go//')" \
+ && if [ -n "$required" ] && [ "$(printf '%s\n%s\n' "$required" "$current" | sort -V | tail -1)" != "$current" ]; then \
+      echo "the builder is running Go $current but go.mod pins toolchain go$required" >&2; \
+      exit 1; \
+    fi
+
 RUN go mod download
 
 COPY cmd ./cmd
@@ -57,7 +73,8 @@ LABEL org.opencontainers.image.title="Astraeus Media" \
 # ffmpeg is a hard dependency, not a convenience: without it the server can still
 # list a library but cannot probe a file, so it reports that at startup and
 # refuses playback. tesseract is the opposite - an optional one: with it, image
-# subtitle tracks (PGS) are read into text a browser can toggle and search;
+# subtitle tracks (PGS and VobSub) are read into text a browser can toggle and
+# search;
 # without it they keep the burn-in path. It is included so the packaged server
 # offers the better of the two. ca-certificates is for the TMDB metadata provider
 # over HTTPS; curl exists only for the container health check.

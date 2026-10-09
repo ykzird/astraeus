@@ -278,10 +278,27 @@ the same four:
 
 If you would rather use an identity-aware proxy than client certificates, the
 gate already knows two: **`Tailscale-User-Login`** (set by `tailscale serve`) and
-**`Cf-Access-Authenticated-User-Email`** (set by Cloudflare Access). Both are
-believed by default, so with either of those in front you can drop
-`--auth-header` and keep `--auth-mode proxy`. Their advantage over client
-certificates is that testers install nothing.
+**`Cf-Access-Authenticated-User-Email`** (set by Cloudflare Access). Name the one
+your proxy actually sets:
+
+```sh
+# Tailscale, and only Tailscale, in front
+./astraeus-server serve --auth-mode proxy \
+  --auth-header Tailscale-User-Login \
+  --trusted-proxy 127.0.0.1/32,::1/128
+
+# Cloudflare Access, and only Cloudflare, in front
+./astraeus-server serve --auth-mode proxy \
+  --auth-header Cf-Access-Authenticated-User-Email \
+  --trusted-proxy 127.0.0.1/32,::1/128
+```
+
+Constraining the header is not optional. The gate believes a configured header
+whenever it is non-empty, so a deployment that accepts `Tailscale-User-Login`
+*and* `Cf-Access-Authenticated-User-Email` lets a user of whichever proxy is
+actually in front present the other proxy's header and claim any identity it
+likes, an administrator's included: each proxy only overwrites its own header.
+Their advantage over client certificates is that testers install nothing.
 
 ## What was verified
 

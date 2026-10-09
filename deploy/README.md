@@ -9,10 +9,10 @@ Whatever you pick, four facts decide whether the install is sound:
 - **ffmpeg and ffprobe are dependencies, not extras.** The server reports their
   absence at startup and refuses playback without them.
 - **tesseract is optional, and its absence changes behaviour rather than breaking
-  anything.** With it, image subtitle tracks (PGS) are read into text a browser
-  can toggle and search; without it they are offered as a burn-in instead, and
-  `/api/system/capabilities` reports `subtitle_ocr_enabled: false`. The container
-  image includes it; a systemd install can add it with
+  anything.** With it, image subtitle tracks (PGS and VobSub) are read into text
+  a browser can toggle and search; without it they are offered as a burn-in
+  instead, and `/api/system/capabilities` reports `subtitle_ocr_enabled: false`.
+  The container image includes it; a systemd install can add it with
   `apt-get install tesseract-ocr` (or the distribution's equivalent).
 - **`--auth-mode` defaults to `none`.** That is right for a trusted LAN and wrong
   for anything else. Both shapes below turn the gate on before anything is
@@ -27,8 +27,10 @@ Whatever you pick, four facts decide whether the install is sound:
 ```sh
 docker build -t astraeus-media:0.18.0 .
 
-# The image's default command serves on :8642 with every writable path inside
-# /data. This one has no access gate, so keep it on loopback.
+# The image's default command passes --addr 0.0.0.0:8642 itself, because a
+# container's port has to be reachable from outside it to be published. The
+# writable paths are all inside /data. This run has no access gate, so publish
+# it on loopback only; `-p 8642:8642` would put it on every interface.
 docker run -d --name astraeus \
   -p 127.0.0.1:8642:8642 \
   -v /srv/media:/media:ro \

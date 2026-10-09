@@ -93,6 +93,109 @@ func TestFFProbe_MissingFile(t *testing.T) {
 	}
 }
 
+// generateOddDimensionClip renders a source whose height is odd, in a container
+// that carries it unchanged.
+//
+// This is the shape S-4 was reported against: an Xvid or MPEG-4 rip at 640x271.
+// The obvious spelling does not produce one - libx264 refuses it for the very
+// reason the test exists, and even a lossless encoder inside a container that
+// wants even dimensions will quietly nudge it - so the frames go in as raw
+// video, which preserves the geometry exactly.
+func generateOddDimensionClip(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	const width, height, seconds, rate = 640, 271, 2, 10
+	raw := filepath.Join(dir, "odd.raw")
+	if output, err := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=%dx%d:rate=%d", width, height, rate),
+		"-t", fmt.Sprint(seconds),
+		"-pix_fmt", "yuv420p", "-f", "rawvideo", raw,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("rendering the raw frames: %v\n%s", err, output)
+	}
+
+	path := filepath.Join(dir, name)
+	if output, err := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "rawvideo", "-pix_fmt", "yuv420p",
+		"-s", fmt.Sprintf("%dx%d", width, height), "-r", fmt.Sprint(rate),
+		"-i", raw,
+		"-c:v", "ffv1", "-level", "3",
+		path,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("wrapping the odd frames in %s: %v\n%s", name, err, output)
+	}
+
+	// The whole point is the geometry, so refuse to test anything else.
+	info, err := NewFFProbe("ffprobe").Probe(context.Background(), path)
+	if err != nil {
+		t.Fatalf("probing the odd-dimension fixture: %v", err)
+	}
+	if info.Width != width || info.Height != height {
+		t.Fatalf("the fixture is %dx%d, want %dx%d", info.Width, info.Height, width, height)
+	}
+	return path
+}
+
+// TestManager_OddDimensionsEndToEnd covers S-4 through the session manager.
+//
+// The source already fits the client's box, so negotiation asks for no
+// downscale; before the fix that also meant no scale filter, and libx264 failed
+// the attempt with "height not divisible by 2". The session must start and
+// produce an even-dimension segment.
+//
+// Note what this test can and cannot prove. It passes whether or not the
+// even-dimension clamp is present, because a failed attempt is retried through
+// softwareOnlyDecision, and that retry changes the encoder - so on a host whose
+// negotiator picked a hardware encoder, the retry hides the first failure. The
+// load-bearing regression test for the clamp itself is
+// TestVideoFilters_OddSourceGetsAnEvenOutput, which asserts the filter chain
+// directly and fails without it. This one is kept because it is what proves the
+// viewer gets a playable stream, and because on a host with no hardware encoder
+// the first attempt is the only attempt.
+func TestManager_OddDimensionsEndToEnd(t *testing.T) {
+	requireFFmpeg(t)
+
+	root := t.TempDir()
+	source := generateOddDimensionClip(t, root, "odd.mkv")
+
+	info, err := NewFFProbe("ffprobe").Probe(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+
+	// The browser profile accepts h264 but not ffv1, so this is a transcode. Its
+	// height ceiling is above 271, so nothing needs downscaling - which is the
+	// case that used to emit no scale at all.
+	decision := Negotiate(info, BrowserCapability())
+	if decision.VideoAction != ActionTranscode {
+		t.Fatalf("video action = %q, want a transcode of ffv1", decision.VideoAction)
+	}
+	if decision.TargetHeight != 0 {
+		t.Fatalf("target height = %d, want 0: this test is about the no-downscale path",
+			decision.TargetHeight)
+	}
+
+	manager, session, _ := startSession(t, root, source, decision)
+	defer manager.Stop(session.ID)
+
+	segment := waitForSegment(t, session.Dir, 90*time.Second)
+	if segment == "" {
+		t.Fatal("no segment was produced: an odd-dimension re-encode must not fail the session")
+	}
+
+	produced, err := NewFFProbe("ffprobe").Probe(context.Background(), filepath.Join(session.Dir, segment))
+	if err != nil {
+		t.Fatalf("probing the produced segment: %v", err)
+	}
+	if produced.Width%2 != 0 || produced.Height%2 != 0 {
+		t.Errorf("the segment is %dx%d, want both dimensions even",
+			produced.Width, produced.Height)
+	}
+	t.Logf("odd source %dx%d produced a %dx%d segment", info.Width, info.Height, produced.Width, produced.Height)
+}
+
 func TestManager_RemuxEndToEnd(t *testing.T) {
 	requireFFmpeg(t)
 

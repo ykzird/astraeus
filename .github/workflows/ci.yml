@@ -168,6 +168,31 @@ jobs:
           # The action passes --no-update itself, and repeating a flag is an error.
           extra_args: --results=verified,unknown
 
+  vulnerabilities:
+    name: Scan for reachable vulnerabilities
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # `go-version-file` reads go.mod, and the `toolchain` line there is what
+      # decides the Go that runs. That matters more here than anywhere else:
+      # govulncheck reports the standard library of the toolchain it runs on, so
+      # a scan on an older patch reports vulnerabilities that the released
+      # binary does not have, and a scan on a newer one would hide the fact that
+      # the pinned toolchain is the thing shipping.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Pinned to a commit, not a tag: a tag can be moved under the job.
+      # This is the only gate on the Go standard library itself, which is where
+      # the 18 reachable vulnerabilities the 2026-10-09 review found lived.
+      - uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
+        with:
+          go-package: ./...
+
   image:
     name: Build the container image
     runs-on: ubuntu-latest
