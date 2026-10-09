@@ -192,6 +192,65 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*Session
+	// pending counts sessions that have reserved a slot but are not in
+	// sessions yet: mkdir, building the command line and cmd.Start all happen
+	// before a session can be published, and checking the limit without
+	// reserving let concurrent callers all pass the same check (S-2 of the
+	// 2026-10-09 review: ten parallel starts against a limit of two left nine
+	// ffmpeg processes running).
+	pending int
+}
+
+// ActiveSessions reports how many sessions are running, including the ones that
+// have claimed a slot but are not yet published.
+//
+// The pending count is the point: a caller that wants to know whether the limit
+// is actually respected has to see the reservations too, or it sees a number
+// that dips during exactly the window the limit exists to guard.
+func (m *Manager) ActiveSessions() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions) + m.pending
+}
+
+// reserveSlot claims one of the MaxSessions slots, or reports the limit as
+// reached.
+//
+// The claim and the check are the same critical section on purpose. A caller
+// that passes the check must already own the slot, because otherwise the work
+// between the check and the publication of the session - which includes forking
+// ffmpeg - is a window every concurrent caller can pass through at once.
+func (m *Manager) reserveSlot() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	limit := m.cfg.MaxSessions
+	active := len(m.sessions) + m.pending
+	if limit > 0 && active >= limit {
+		return fmt.Errorf("%w (%d running, limit %d)", ErrTooManySessions, active, limit)
+	}
+	m.pending++
+	return nil
+}
+
+// releaseSlot returns a reservation that did not become a session.
+func (m *Manager) releaseSlot() {
+	m.mu.Lock()
+	if m.pending > 0 {
+		m.pending--
+	}
+	m.mu.Unlock()
+}
+
+// publishSlot turns a reservation into a published session.
+func (m *Manager) publishSlot(session *Session) {
+	m.mu.Lock()
+	if m.pending > 0 {
+		m.pending--
+	}
+	m.sessions[session.ID] = session
+	m.mu.Unlock()
+	m.updateActiveGauge()
 }
 
 // NewManager creates a Manager and prepares its working directory.
@@ -390,13 +449,17 @@ func softwareOnlyDecision(decision Decision, server ServerCapability) Decision {
 
 // startOnce prepares and launches one session with the given configuration.
 func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, decision Decision, cfg ManagerConfig, startSeconds float64) (*Session, error) {
-	m.mu.Lock()
-	active := len(m.sessions)
-	limit := m.cfg.MaxSessions
-	m.mu.Unlock()
-	if limit > 0 && active >= limit {
-		return nil, fmt.Errorf("%w (%d running, limit %d)", ErrTooManySessions, active, limit)
+	if err := m.reserveSlot(); err != nil {
+		return nil, err
 	}
+	// Every path from here to publishSlot has to release the reservation, or a
+	// failed start leaks a slot until the process restarts.
+	reserved := true
+	defer func() {
+		if reserved {
+			m.releaseSlot()
+		}
+	}()
 
 	if decision.Mode == ModeDirectPlay {
 		return nil, ErrDirectPlayHasNoSession
@@ -472,10 +535,10 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 		}
 	}()
 
-	m.mu.Lock()
-	m.sessions[sessionID] = session
-	m.mu.Unlock()
-	m.updateActiveGauge()
+	// The session is published and the reservation becomes a real slot in one
+	// critical section, so the limit counts it from here on.
+	m.publishSlot(session)
+	reserved = false
 
 	startupStart := time.Now()
 	if err := m.waitForPlaylist(ctx, session); err != nil {
@@ -789,11 +852,16 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 	case ActionCopy:
 		args = append(args, "-c:a", "copy")
 	case ActionTranscode:
-		codec := decision.TargetAudioCodec
-		if codec == "" {
-			codec = "aac"
+		// The encoder, not the codec: ffmpeg's "opus" is its native
+		// experimental encoder and refuses to run, while the one that works is
+		// "libopus". NegotiateForServer resolves this into a decision; a
+		// decision built by hand with only a codec falls back to its most
+		// portable encoder here rather than passing the codec through.
+		encoder := decision.TargetAudioEncoder
+		if encoder == "" {
+			encoder = audioEncoderOrDefault(decision.TargetAudioCodec)
 		}
-		args = append(args, "-c:a", codec, "-b:a", "192k")
+		args = append(args, "-c:a", encoder, "-b:a", "192k")
 		if decision.TargetAudioChannels > 0 {
 			// Chromium refuses a 5.1 AAC SourceBuffer outright, and a browser
 			// outputs stereo anyway, so a negotiated downmix is what makes a

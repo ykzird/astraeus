@@ -250,6 +250,90 @@ func TestEncoderFor(t *testing.T) {
 	}
 }
 
+// TestNegotiateForServer_ResolvesTheAudioEncoder is the regression test for S-7
+// at the point where the two names are actually distinguished.
+//
+// Negotiate is pure and only knows codec names, so it leaves TargetAudioEncoder
+// empty. NegotiateForServer has the server capability and is the only place that
+// can turn "the client wants Opus" into "run libopus" - and until this was
+// fixed it checked the encoder and then threw the answer away, so the session
+// passed the codec name to -c:a and ffmpeg refused to run its experimental
+// native encoder.
+func TestNegotiateForServer_ResolvesTheAudioEncoder(t *testing.T) {
+	t.Parallel()
+
+	server := ServerCapability{
+		VideoEncoders: []string{"libx264"},
+		AudioEncoders: []string{"aac", "libopus", "libvorbis", "libmp3lame"},
+	}
+
+	tests := []struct {
+		name      string
+		audio     string
+		wantCodec string
+		wantEnc   string
+	}{
+		{name: "opus needs libopus", audio: "opus", wantCodec: "opus", wantEnc: "libopus"},
+		{name: "vorbis needs libvorbis", audio: "vorbis", wantCodec: "vorbis", wantEnc: "libvorbis"},
+		{name: "mp3 needs libmp3lame", audio: "mp3", wantCodec: "mp3", wantEnc: "libmp3lame"},
+		{name: "aac is its own encoder", audio: "aac", wantCodec: "aac", wantEnc: "aac"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// A source in a codec the browser cannot copy, so audio and video
+			// both transcode.
+			info := &MediaInfo{
+				Width: 1920, Height: 1080, VideoCodec: "ffv1", AudioCodec: "pcm_s16le",
+				Container: "matroska", DurationSeconds: 60,
+			}
+			capability := ClientCapability{
+				Containers: []string{"mp4"}, VideoCodecs: []string{"h264"},
+				AudioCodecs: []string{tt.audio}, MaxAudioChannels: 2,
+				// Without this the decision is undeliverable and negotiation
+				// returns before the audio encoder is resolved at all, which
+				// would make this test pass for the wrong reason.
+				SupportsHLS: true,
+			}
+
+			decision := NegotiateForServer(info, capability, server)
+			if decision.AudioAction != ActionTranscode {
+				t.Fatalf("audio action = %q, want a transcode", decision.AudioAction)
+			}
+			if decision.TargetAudioCodec != tt.wantCodec {
+				t.Fatalf("audio codec = %q, want %q", decision.TargetAudioCodec, tt.wantCodec)
+			}
+			if decision.TargetAudioEncoder != tt.wantEnc {
+				t.Errorf("audio encoder = %q, want %q: the codec name is not the encoder name",
+					decision.TargetAudioEncoder, tt.wantEnc)
+			}
+		})
+	}
+}
+
+// TestNegotiate_LeavesTheEncoderUnresolved guards the pure/total split: Negotiate
+// has no server to consult, so it must not invent an encoder name.
+func TestNegotiate_LeavesTheEncoderUnresolved(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Width: 1920, Height: 1080, VideoCodec: "ffv1", AudioCodec: "pcm_s16le",
+		Container: "matroska", DurationSeconds: 60,
+	}
+	capability := ClientCapability{
+		Containers: []string{"mp4"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"opus"}, MaxAudioChannels: 2,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.AudioAction == ActionTranscode && decision.TargetAudioEncoder != "" {
+		t.Errorf("pure Negotiate resolved %q with no server to check against",
+			decision.TargetAudioEncoder)
+	}
+}
+
 func TestBuildFFmpegArgs(t *testing.T) {
 	t.Parallel()
 
@@ -282,6 +366,60 @@ func TestBuildFFmpegArgs(t *testing.T) {
 			},
 			cfg:       software,
 			wantParts: []string{"-c:v libx264", "-crf 21", "-vf scale=-2:720", "-c:a aac", "-b:a 192k"},
+		},
+		{
+			// S-7 of the 2026-10-09 review. ffmpeg's "opus" is its native
+			// experimental encoder, which refuses to run without -strict -2;
+			// the encoder that works is "libopus". NegotiatorForServer now
+			// resolves the codec into an encoder and the session passes that.
+			name: "an opus target passes the encoder, not the codec name",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "opus",
+				TargetAudioEncoder: "libopus",
+			},
+			cfg:       software,
+			wantParts: []string{"-c:a libopus"},
+			denyParts: []string{"-c:a opus "},
+		},
+		{
+			name: "a vorbis target passes libvorbis",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "vorbis",
+				TargetAudioEncoder: "libvorbis",
+			},
+			cfg:       software,
+			wantParts: []string{"-c:a libvorbis"},
+			denyParts: []string{"-c:a vorbis "},
+		},
+		{
+			// A decision built by hand carries no resolved encoder, which is
+			// what the pure Negotiate tests produce. The builder has to fall
+			// back to the codec's known encoder rather than passing the codec
+			// name straight through.
+			name: "a hand-built decision with only a codec still gets an encoder",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "opus",
+			},
+			cfg:       software,
+			wantParts: []string{"-c:a libopus"},
+			denyParts: []string{"-c:a opus "},
+		},
+		{
+			name: "an aac target is unchanged",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+				TargetAudioEncoder: "aac",
+			},
+			cfg:       software,
+			wantParts: []string{"-c:a aac", "-b:a 192k"},
 		},
 		{
 			name: "transcode prefers quick sync when the host has it",

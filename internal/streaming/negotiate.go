@@ -45,7 +45,18 @@ type Decision struct {
 
 	TargetVideoCodec string `json:"target_video_codec,omitempty"`
 	TargetAudioCodec string `json:"target_audio_codec,omitempty"`
-	TargetHeight     int    `json:"target_height,omitempty"`
+	// TargetAudioEncoder is the ffmpeg encoder that produces TargetAudioCodec,
+	// and it is what the session command line passes to -c:a.
+	//
+	// The two are not the same string, and conflating them is S-7 of the
+	// 2026-10-09 review: ffmpeg's "opus" is its native experimental encoder,
+	// which refuses to run without -strict -2, while the encoder that works is
+	// "libopus". A session built with -c:a opus failed on the client that asked
+	// for Opus. Negotiate is pure and cannot resolve this, so
+	// NegotiateForServer fills it in; an empty value means "no server was
+	// consulted", which is what the pure unit tests produce.
+	TargetAudioEncoder string `json:"target_audio_encoder,omitempty"`
+	TargetHeight       int    `json:"target_height,omitempty"`
 	// TargetAudioChannels is set when the source carries more channels than the
 	// client accepts and the audio is being re-encoded anyway.
 	TargetAudioChannels int `json:"target_audio_channels,omitempty"`
@@ -833,6 +844,25 @@ func AudioEncoderFor(codec string, server ServerCapability) string {
 	return ""
 }
 
+// audioEncoderOrDefault is AudioEncoderFor without a server to check against: it
+// returns the most portable encoder for a codec, ignoring whether this host has
+// it.
+//
+// It exists for the one case where no server was consulted - a Decision built by
+// hand, as the pure negotiation tests do - so the session builder still gets an
+// encoder name rather than a codec name. An unknown codec is returned unchanged,
+// which is the best that can be said about it and preserves the old behaviour
+// for anything not in the table.
+func audioEncoderOrDefault(codec string) string {
+	if codec == "" {
+		return "aac"
+	}
+	if candidates := audioEncoderPreference[NormaliseAudioCodec(codec)]; len(candidates) > 0 {
+		return candidates[0]
+	}
+	return codec
+}
+
 // NegotiateForServer narrows a negotiation to what this server can actually
 // deliver.
 //
@@ -888,6 +918,12 @@ func NegotiateForServer(info *MediaInfo, capability ClientCapability, server Ser
 			decision.Reasons = append(decision.Reasons,
 				"this server has no encoder for any audio codec the client accepts")
 		}
+	}
+
+	// Resolve the encoder once here, where the server is known, so the session
+	// builder never has to guess that a codec name is also an encoder name.
+	if decision.AudioAction == ActionTranscode {
+		decision.TargetAudioEncoder = AudioEncoderFor(decision.TargetAudioCodec, server)
 	}
 
 	return decision

@@ -3,12 +3,14 @@ package streaming
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -404,5 +406,161 @@ exit 0
 	manager.Stop(first.ID)
 	if _, err := manager.Start(context.Background(), "entity-3", "/media/c.mkv", decision); err != nil {
 		t.Fatalf("a slot freed by stopping a session was not reusable: %v", err)
+	}
+}
+
+// TestManager_MaxSessionsHoldsUnderConcurrency is the regression test for S-2.
+//
+// The old check read len(m.sessions) under the lock, released it, and inserted
+// the session much later - after mkdir, after building the command line, after
+// cmd.Start. Every concurrent caller could therefore pass the same check, and
+// the review measured ten parallel starts against a limit of two leaving nine
+// ffmpeg processes running. The slot is now claimed in the same critical
+// section as the check, so the number of sessions that get to fork ffmpeg
+// cannot exceed the limit however the callers interleave.
+func TestManager_MaxSessionsHoldsUnderConcurrency(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub encoder is a shell script")
+	}
+
+	dir := t.TempDir()
+	encoder := filepath.Join(dir, "ffmpeg-stub")
+	// The sleep is what makes this a test: it holds the window between the
+	// check and the publication of the session open long enough for parallel
+	// callers to pile into it.
+	stub := `#!/bin/sh
+sleep 0.3
+out=""
+for arg in "$@"; do out="$arg"; done
+mkdir -p "$(dirname "$out")"
+printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000000,\nseg00000.ts\n' > "$out"
+printf 'segment' > "$(dirname "$out")/seg00000.ts"
+exit 0
+`
+	if err := os.WriteFile(encoder, []byte(stub), 0o755); err != nil {
+		t.Fatalf("writing the stub encoder: %v", err)
+	}
+
+	const (
+		limit   = 2
+		callers = 10
+	)
+
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		FFmpegBin:   encoder,
+		RootDir:     filepath.Join(dir, "sessions"),
+		MaxSessions: limit,
+		Server:      ServerCapability{VideoEncoders: []string{"libx264"}},
+		Metrics:     observability.New(),
+		Logger:      newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	decision := Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+	}
+
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		started   []*Session
+		refused   int
+		otherErrs []error
+	)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			session, err := manager.Start(context.Background(),
+				fmt.Sprintf("entity-%d", i), fmt.Sprintf("/media/%d.mkv", i), decision)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				started = append(started, session)
+			case errors.Is(err, ErrTooManySessions):
+				refused++
+			default:
+				otherErrs = append(otherErrs, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for _, err := range otherErrs {
+		t.Errorf("unexpected start error: %v", err)
+	}
+	if len(started) != limit {
+		t.Errorf("%d of %d concurrent starts were allowed, want exactly %d (the limit)",
+			len(started), callers, limit)
+	}
+	if refused != callers-limit {
+		t.Errorf("%d starts were refused, want %d", refused, callers-limit)
+	}
+	if got := manager.ActiveSessions(); got > limit {
+		t.Errorf("the manager reports %d live sessions, want at most the limit of %d", got, limit)
+	}
+
+	// A refused attempt must not have leaked its reservation.
+	for _, session := range started {
+		manager.Stop(session.ID)
+	}
+	if got := manager.ActiveSessions(); got != 0 {
+		t.Errorf("after stopping every session the manager still reports %d, want 0 "+
+			"(a reservation leaked on a failure path)", got)
+	}
+}
+
+// TestManager_FailedStartReleasesItsSlot guards the other half of the protocol:
+// a start that fails after claiming a slot has to give it back, or a broken
+// encoder would permanently consume the session budget.
+func TestManager_FailedStartReleasesItsSlot(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub encoder is a shell script")
+	}
+
+	dir := t.TempDir()
+	encoder := filepath.Join(dir, "ffmpeg-stub")
+	// Starts, writes nothing, exits non-zero: the playlist never appears.
+	if err := os.WriteFile(encoder, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("writing the stub encoder: %v", err)
+	}
+
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		FFmpegBin:   encoder,
+		RootDir:     filepath.Join(dir, "sessions"),
+		MaxSessions: 1,
+		Server:      ServerCapability{VideoEncoders: []string{"libx264"}},
+		Metrics:     observability.New(),
+		Logger:      newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	decision := Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+	}
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if _, err := manager.Start(context.Background(), "entity-1", "/media/a.mkv", decision); err == nil {
+			t.Fatal("a start with a failing encoder should not succeed")
+		}
+		if got := manager.ActiveSessions(); got != 0 {
+			t.Fatalf("attempt %d leaked a slot: %d sessions are still accounted for", attempt, got)
+		}
 	}
 }
