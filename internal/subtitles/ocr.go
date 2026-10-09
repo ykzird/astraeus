@@ -119,7 +119,9 @@ func (s *Service) ocrExtract(ctx context.Context, mediaPath string, trackIndex i
 	var (
 		path    string
 		palette string
-		decode  func(io.Reader) ([]ImageCue, error) = ParsePGS
+		// stream hands each cue to the caller as it is decoded, so the images
+		// are recognised and dropped one at a time.
+		stream  func(io.Reader, func(ImageCue) error) error = StreamPGS
 		cleanup func()
 	)
 	if strings.EqualFold(codec, "dvd_subtitle") {
@@ -128,7 +130,9 @@ func (s *Service) ocrExtract(ctx context.Context, mediaPath string, trackIndex i
 			return err
 		}
 		path, palette, cleanup = extracted.path, extracted.palette, extracted.cleanup
-		decode = func(r io.Reader) ([]ImageCue, error) { return ParseVobSub(r, palette) }
+		stream = func(r io.Reader, emit func(ImageCue) error) error {
+			return StreamVobSub(r, palette, emit)
+		}
 	} else {
 		supPath, remove, err := s.extractPGSStream(ctx, mediaPath, trackIndex)
 		if err != nil {
@@ -138,33 +142,40 @@ func (s *Service) ocrExtract(ctx context.Context, mediaPath string, trackIndex i
 	}
 	defer cleanup()
 
+	// The cues are consumed one at a time rather than collected first. A
+	// decoded bitmap is an RGBA image - a 4K one is tens of megabytes - and a
+	// feature-length track has thousands of them, so collecting the whole track
+	// before recognising any of it holds every image in memory at once. What is
+	// kept is the text, which is what the caller actually needs (L-3 of the
+	// 2026-10-09 review).
+	var recognised []ocrCue
+
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening the extracted image subtitle stream: %w", err)
 	}
-	cues, parseErr := decode(file)
-	closeErr := file.Close()
-	if parseErr != nil {
-		return fmt.Errorf("decoding image subtitle track %d of %s: %w", trackIndex, mediaPath, parseErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("closing the extracted image subtitle stream: %w", closeErr)
-	}
-
-	recognised := make([]ocrCue, 0, len(cues))
-	for _, cue := range cues {
+	streamErr := stream(file, func(cue ImageCue) error {
 		if cue.Image == nil {
-			continue
+			return nil
 		}
 		text, err := s.recognise(ctx, cue.Image)
 		if err != nil {
 			return err
 		}
 		if text == "" {
-			continue
+			return nil
 		}
 		recognised = mergeOCRCue(recognised, ocrCue{start: cue.Start, end: cue.End, text: text})
+		return nil
+	})
+	closeErr := file.Close()
+	if streamErr != nil {
+		return fmt.Errorf("decoding image subtitle track %d of %s: %w", trackIndex, mediaPath, streamErr)
 	}
+	if closeErr != nil {
+		return fmt.Errorf("closing the extracted image subtitle stream: %w", closeErr)
+	}
+
 	if len(recognised) == 0 {
 		return fmt.Errorf("%w (OCR found no text in track %d)", ErrNoCues, trackIndex)
 	}

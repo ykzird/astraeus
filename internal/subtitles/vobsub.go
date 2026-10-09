@@ -148,6 +148,32 @@ func ParseVobSub(r io.Reader, paletteText string) ([]ImageCue, error) {
 	return decodeVobSub(stream)
 }
 
+// StreamVobSub decodes a VobSub stream and hands each cue to emit as soon as it
+// is complete, retaining none of them.
+//
+// It is the VobSub half of StreamPGS: OCR looks at one cue at a time, so a
+// feature-length track does not need every decoded bitmap in memory at once
+// (L-3 of the 2026-10-09 review). A Matroska track's packets and a raw packet
+// stream are both handled, exactly as ParseVobSub handles them.
+//
+// emit must not retain the cue's Image.
+func StreamVobSub(r io.Reader, paletteText string, emit func(ImageCue) error) error {
+	buffered := bufio.NewReader(r)
+	if header, err := buffered.Peek(len(matroskaHeader)); err == nil && bytes.Equal(header, matroskaHeader) {
+		track, cues, err := demuxMatroskaVobSub(buffered)
+		if err != nil {
+			return err
+		}
+		return streamVobSubCues(vobsubStream{paletteText: string(track.codecPriv), cues: cues}, emit)
+	}
+	stream, err := readVobSubPackets(buffered)
+	if err != nil {
+		return err
+	}
+	stream.paletteText = paletteText
+	return streamVobSubCues(stream, emit)
+}
+
 // readVobSubPackets reads the "size: <n>\n" framed packets the extractor
 // writes. The framing is the extractor's, not the format's: it is the only way
 // to know where one SPU ends and the next begins once ffmpeg has demuxed them,
@@ -211,22 +237,51 @@ const vobsubDefaultCue = 3 * time.Second
 // it; a stream whose last cue is never cleared still has a cue, which ends
 // where the stream does.
 func decodeVobSub(stream vobsubStream) ([]ImageCue, error) {
-	_, palette, err := parseVobSubPalette(stream.paletteText)
+	var cues []ImageCue
+	err := streamVobSubCues(stream, func(cue ImageCue) error {
+		cues = append(cues, cue)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
+	return cues, nil
+}
 
-	var (
-		cues []ImageCue
-		open *ImageCue
-	)
+// streamVobSubCues turns the packet stream into cues, handing each to emit as
+// soon as it is complete and retaining none of them.
+//
+// The memory argument is the same as StreamPGS's: a decoded bitmap is an RGBA
+// image and a feature-length track has thousands of cues, so collecting them all
+// before using any of them holds the track in memory (L-3 of the 2026-10-09
+// review).
+func streamVobSubCues(stream vobsubStream, emit func(ImageCue) error) error {
+	_, palette, err := parseVobSubPalette(stream.paletteText)
+	if err != nil {
+		return err
+	}
+
+	var open *ImageCue
 	last := time.Duration(0)
+
+	// closeOpen hands the open cue on and clears it. A cue that would end at or
+	// before its own start is not handed on: an empty cue is indistinguishable
+	// from one that was never drawn, and OCR would drop it anyway.
+	closeOpen := func(end time.Duration) error {
+		if open == nil || end <= open.Start {
+			return nil
+		}
+		cue := *open
+		cue.End = end
+		open = nil
+		return emit(cue)
+	}
 
 	for _, packet := range stream.cues {
 		last = packet.start
 		img, stopAfter, err := decodeSPU(packet.spu, palette)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		// The packet's own stop-display command is the authority on when this
@@ -239,28 +294,29 @@ func decodeVobSub(stream vobsubStream) ([]ImageCue, error) {
 		}
 
 		if img == nil {
-			if open != nil {
-				open.End = pickCueEnd(open.Start, end, packet.start)
-				cues = append(cues, *open)
-				open = nil
+			if err := closeOpen(pickCueEnd(packet.start, end, packet.start)); err != nil {
+				return err
 			}
 			continue
 		}
 		if open != nil {
-			open.End = pickCueEnd(open.Start, end, packet.start)
-			cues = append(cues, *open)
+			if err := closeOpen(pickCueEnd(open.Start, end, packet.start)); err != nil {
+				return err
+			}
 		}
 		open = &ImageCue{Start: packet.start, Image: img}
 	}
 
 	if open != nil {
-		open.End = last
-		if open.End <= open.Start {
-			open.End = open.Start + vobsubDefaultCue
+		end := last
+		if end <= open.Start {
+			end = open.Start + vobsubDefaultCue
 		}
-		cues = append(cues, *open)
+		if err := closeOpen(end); err != nil {
+			return err
+		}
 	}
-	return cues, nil
+	return nil
 }
 
 // pickCueEnd chooses a cue's end time from the packet's own stop-display time

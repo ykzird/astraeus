@@ -50,14 +50,51 @@ type ImageCue struct {
 }
 
 // ParsePGS decodes a .sup stream into its cues, in presentation order.
+//
+// It collects every cue, which means every cue's decoded bitmap is held at once.
+// A caller that only needs to look at each cue in turn - OCR does - should use
+// StreamPGS instead (L-3 of the 2026-10-09 review).
 func ParsePGS(r io.Reader) ([]ImageCue, error) {
+	var cues []ImageCue
+	err := StreamPGS(r, func(cue ImageCue) error {
+		cues = append(cues, cue)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cues, nil
+}
+
+// StreamPGS decodes a .sup stream and hands each cue to emit as soon as it is
+// complete, without retaining it.
+//
+// This is the shape a feature-length track needs. A subtitle bitmap is a decoded
+// RGBA image - a 4K one is tens of megabytes - and a broadcast track has
+// thousands of cues, so collecting them all before doing anything with them
+// holds the whole track in memory at once. OCR only ever looks at one cue at a
+// time, so streaming lets each image be recognised and dropped.
+//
+// emit must not retain the cue's Image: the caller is free to reuse it.
+func StreamPGS(r io.Reader, emit func(ImageCue) error) error {
 	decoder := newPGSDecoder()
 
 	var (
-		cues    []ImageCue
 		open    *ImageCue
 		lastPTS uint32
 	)
+
+	// close hands the open cue on and clears it, so its image is released as
+	// soon as the caller has seen it.
+	closeOpen := func(end time.Duration) error {
+		if open == nil || end <= open.Start {
+			return nil
+		}
+		cue := *open
+		cue.End = end
+		open = nil
+		return emit(cue)
+	}
 
 	for {
 		segment, err := readPGSSegment(r)
@@ -65,7 +102,7 @@ func ParsePGS(r io.Reader) ([]ImageCue, error) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		lastPTS = segment.pts
 
@@ -82,10 +119,8 @@ func ParsePGS(r io.Reader) ([]ImageCue, error) {
 			var display *pgsDisplay
 			display, err = decoder.complete()
 			if err == nil && display != nil {
-				if open != nil {
-					open.End = pgsDuration(display.pts)
-					cues = append(cues, *open)
-					open = nil
+				if err := closeOpen(pgsDuration(display.pts)); err != nil {
+					return err
 				}
 				if display.image != nil {
 					open = &ImageCue{Start: pgsDuration(display.pts), Image: display.image}
@@ -93,19 +128,13 @@ func ParsePGS(r io.Reader) ([]ImageCue, error) {
 			}
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	// A stream whose last cue is never cleared still has a cue: it ends where
 	// the stream does. A zero-length one is dropped rather than handed on.
-	if open != nil {
-		if end := pgsDuration(lastPTS); end > open.Start {
-			open.End = end
-			cues = append(cues, *open)
-		}
-	}
-	return cues, nil
+	return closeOpen(pgsDuration(lastPTS))
 }
 
 // pgsDuration converts a 90 kHz presentation timestamp to a duration.
@@ -285,7 +314,20 @@ func (d *pgsDecoder) addODS(body []byte) error {
 // A set with no composition objects clears the screen, except when it is only
 // updating the palette, which leaves what is on screen in place.
 func (d *pgsDecoder) complete() (*pgsDisplay, error) {
-	defer func() { d.pending = pgsPresentation{} }()
+	defer func() {
+		d.pending = pgsPresentation{}
+		// The objects are released with the display set that used them. Only a
+		// display set whose palette is being updated without new objects leaves
+		// the screen alone, and that case has no objects to release either.
+		//
+		// Keeping them was an unbounded retention rather than a lookup cache:
+		// every bitmap ever decoded for the stream stayed reachable, so a
+		// feature-length track's worth of images stayed resident even after the
+		// cue that used them had been handed on (L-3 of the 2026-10-09 review).
+		// A display set that needs an object always sends its ODS, so nothing
+		// is lost by dropping them.
+		d.objects = make(map[uint16]*pgsObject)
+	}()
 
 	if !d.pending.havePCS {
 		return nil, nil
