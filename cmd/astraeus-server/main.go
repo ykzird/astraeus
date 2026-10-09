@@ -547,7 +547,13 @@ func runServe(args []string) error {
 		// their burn-in path, and this is said at startup rather than
 		// discovered when a client asks for one.
 		subtitleService, err := subtitles.New(subtitles.Config{
-			FFmpegBin:    *ffmpegBin,
+			FFmpegBin: *ffmpegBin,
+			// The probe binary too. Leaving it out meant the subtitle service
+			// looked up "ffprobe" in PATH whatever --ffprobe said, so an install
+			// that points at a vendored or renamed binary worked for playback and
+			// silently did not for image subtitles (L-14 of the 2026-10-09
+			// review).
+			FFprobeBin:   *ffprobeBin,
 			TesseractBin: *tesseractBin,
 			OCRLanguage:  *ocrLanguage,
 			CacheDir:     *subtitleCache,

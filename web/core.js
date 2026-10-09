@@ -213,6 +213,25 @@
     return { entities: [], entitiesLibraryId: null };
   }
 
+  /**
+   * The subtitle choice a failed re-negotiation should roll back to.
+   *
+   * `offered` is what the caller passed, when it passed anything: a caller that
+   * changed the selection *before* asking for the re-negotiation is the only one
+   * that still knows what was showing, because the session object already holds
+   * the new choice. Falling back to the session's own value is right for the
+   * other callers, which renegotiate for a reason that does not involve the
+   * subtitles.
+   *
+   * Getting this wrong is quiet rather than loud: the rollback re-asserted the
+   * choice that had just failed, so a failed burn left the menu claiming a track
+   * that was not playing while the radio for the track that *was* playing sat
+   * disabled (W-3 of the 2026-10-09 review).
+   */
+  function rollbackSubtitleSelection(offered, current) {
+    return offered === undefined ? current : offered;
+  }
+
   /** The message a request that ran out of time produces. */
   function timeoutMessage(timeoutMs) {
     return (
@@ -446,6 +465,7 @@
     orphanedSessionId: orphanedSessionId,
     shouldRenegotiateAfterFailure: shouldRenegotiateAfterFailure,
     fetchFailure: fetchFailure,
+    rollbackSubtitleSelection: rollbackSubtitleSelection,
     entityListIsCurrent: entityListIsCurrent,
     clearedEntityList: clearedEntityList,
     timeoutMessage: timeoutMessage,

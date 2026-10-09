@@ -528,3 +528,53 @@ func TestServerTimeoutsAreBoundedButWritesAreNot(t *testing.T) {
 			"length of the film")
 	}
 }
+
+// TestSubtitleServiceGetsTheProbeBinary is the regression test for L-14.
+//
+// The subtitle service was built with FFmpegBin and not FFprobeBin, and its
+// constructor falls back to looking up "ffprobe" in PATH. So an install that
+// points --ffprobe at a vendored or renamed binary worked for playback and
+// silently did not for image subtitles - the one place the operator's setting was
+// ignored, with no error to say so.
+//
+// A source-level assertion, because the construction sits in main's serve path
+// with a dozen flag values around it and the failure mode is a *missing* field
+// rather than a wrong one. It is the same technique as the unit- and
+// route-documentation checks: read the thing that would drift.
+func TestSubtitleServiceGetsTheProbeBinary(t *testing.T) {
+	t.Parallel()
+
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("reading main.go: %v", err)
+	}
+	text := string(source)
+
+	start := strings.Index(text, "subtitles.New(subtitles.Config{")
+	if start < 0 {
+		t.Fatal("the subtitle service construction was not found in main.go")
+	}
+	end := strings.Index(text[start:], "})")
+	if end < 0 {
+		t.Fatal("the subtitle service construction has no closing brace")
+	}
+	config := text[start : start+end]
+
+	// Comments explain the field; they are not the field.
+	var code []string
+	for _, line := range strings.Split(config, "\n") {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		code = append(code, line)
+	}
+	configured := strings.Join(code, "\n")
+
+	for _, field := range []string{"FFmpegBin", "FFprobeBin", "TesseractBin"} {
+		if !strings.Contains(configured, field+":") {
+			t.Errorf("the subtitle service is not given %s, so it falls back to looking "+
+				"the binary up in PATH and the operator's --%s is ignored for image "+
+				"subtitles", field, strings.ToLower(strings.TrimSuffix(field, "Bin")))
+		}
+	}
+}

@@ -35,7 +35,7 @@
     ENGINE_HLS_JS: ENGINE_HLS_JS, engineLabel: engineLabelFor,
     subtitleSelectable: subtitleSelectable, orphanedSessionId: orphanedSessionId,
     shouldRenegotiateAfterFailure: shouldRenegotiateAfterFailure,
-    fetchFailure: fetchFailure,
+    fetchFailure: fetchFailure, rollbackSubtitleSelection: rollbackSubtitleSelection,
   } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */
@@ -3012,19 +3012,25 @@
       /* Asking for the burn already running would only re-buffer for nothing. */
       if (index === burnedSubtitleIndex(pb)) return;
       /* Set the choice before re-negotiating: the preference carries it across
-         the switch, exactly as it does for a text track. */
+         the switch, exactly as it does for a text track. The previous choice is
+         passed along because this line has already overwritten it, and a failed
+         switch has to roll back to what was showing rather than to the choice
+         that never took effect (W-3 of the 2026-10-09 review). */
+      const previous = pb.subtitleSelection;
       pb.subtitleSelection = next;
       resumeSession({
         startSeconds: currentSourceTime(pb),
         preferredHeight: pb.preferredHeight,
         audioTrackIndex: pb.audioTrackIndex,
         burnSubtitleIndex: index,
+        previousSubtitleSelection: previous,
       });
       return;
     }
 
     if (burnedSubtitleIndex(pb) > 0) {
       if (!pb.url || pb.qualityBusy) return;
+      const previous = pb.subtitleSelection;
       pb.subtitleSelection = next;
       resumeSession({
         startSeconds: currentSourceTime(pb),
@@ -3032,6 +3038,7 @@
         audioTrackIndex: pb.audioTrackIndex,
         /* 0 is the contract's "no burn", which stops the re-encode. */
         burnSubtitleIndex: 0,
+        previousSubtitleSelection: previous,
       });
       return;
     }
@@ -4145,7 +4152,11 @@
     const wasPlaying = !playerVideo.paused && !playerVideo.ended;
     const previousPreferredHeight = pb.preferredHeight;
     const previousAudioTrackIndex = pb.audioTrackIndex;
-    const previousSubtitleSelection = pb.subtitleSelection;
+    /* The caller's value when it has one: a caller that changed the selection
+       before asking for a re-negotiation is the only one that knows what was
+       showing, and pb.subtitleSelection already holds the new choice. */
+    const previousSubtitleSelection =
+      rollbackSubtitleSelection(opts.previousSubtitleSelection, pb.subtitleSelection);
     const previousSessionId = pb.sessionId;
     /* The tracks are about to be rebuilt from the new response, which carries
        the server's own `default` disposition again; carry the viewer's actual
@@ -4191,12 +4202,16 @@
       );
     } catch (error) {
       if (state.playback !== pb) return;
-      /* A failed switch is not fatal: say so and keep the session selectable. */
+      /* A failed switch is not fatal, but it is not recoverable in place either:
+         resumeSession tore the media down and released the old session before it
+         sent this request, so there is no old stream to keep playing and the
+         comments that claimed otherwise were false. What the rollback does keep
+         is the *choice* - the menu must not go on claiming one that never took
+         effect, and restoring it is what makes the next attempt start from where
+         the viewer was rather than from the failure. */
       pb.qualityBusy = false;
       pb.preferredHeight = previousPreferredHeight;
       pb.audioTrackIndex = previousAudioTrackIndex;
-      /* A failed burn switch left the old stream playing, so the menu must not
-         keep claiming the choice that never took effect. */
       pb.subtitleSelection = previousSubtitleSelection;
       pb.status = "error";
       pb.error = playbackErrorMessage(entity, error);

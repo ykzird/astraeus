@@ -580,3 +580,30 @@ test("clearing the entity state clears both fields", () => {
   // what made the next view claim an empty library.
   assert.ok(!cleared.entitiesLibraryId);
 });
+
+// ── what a failed re-negotiation rolls back to ──────────────────────────────
+//
+// W-3: selectSubtitle wrote the new choice into the session before calling
+// resumeSession, which then captured "the previous choice" from that same field -
+// so the rollback re-asserted the choice that had just failed. The menu claimed a
+// burned track that was not playing while the radio for the track that was
+// playing sat disabled.
+
+test("the caller's previous choice wins over the session's", () => {
+  // The caller changed it, so the session already holds the new one.
+  assert.equal(core.rollbackSubtitleSelection("2", "3"), "2");
+  // Including "off", which is a real choice and not an absent one.
+  assert.equal(core.rollbackSubtitleSelection("off", "3"), "off");
+});
+
+test("a caller that offered nothing falls back to the session's value", () => {
+  // A quality change renegotiates without touching the subtitles, so the
+  // session's own value is what was showing.
+  assert.equal(core.rollbackSubtitleSelection(undefined, "2"), "2");
+});
+
+test("the rollback never invents a choice", () => {
+  // Both absent is both absent: the menu shows a track that is not there rather
+  // than one that is not there being called "off".
+  assert.equal(core.rollbackSubtitleSelection(undefined, undefined), undefined);
+});
