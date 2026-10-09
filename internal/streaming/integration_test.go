@@ -16,9 +16,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ykzird/astraeus/internal/ffmpegprocess"
 	"github.com/ykzird/astraeus/internal/observability"
 )
 
@@ -1253,5 +1255,96 @@ func TestManager_DeliversTheChosenAudioTrack(t *testing.T) {
 		if produced.VideoCodec != "h264" {
 			t.Errorf("video codec = %q, want h264 copied from the source", produced.VideoCodec)
 		}
+	}
+}
+
+// TestProbe_DoesNotFetchAURLInAPlaylist records what could and could not be
+// demonstrated for S-17.
+//
+// A library file whose contents name a URL is the shape the finding describes, and
+// the whitelist is the fix for it. What this test shows is that the *obvious*
+// vector does not reach the network on this build: ffprobe does not HLS-detect a
+// bare .m3u8, so the playlist is simply "Invalid data", and ffmpeg's concat
+// demuxer refuses a remote `file` directive without `-safe 0`. The whitelist is
+// therefore defence in depth here rather than the thing standing between a
+// library file and the server's network.
+//
+// It is kept, and named for what it is, because the alternative was worse: a test
+// asserting "no URL was fetched" passed whether or not the whitelist was applied,
+// which is a test that would go on passing after the protection was removed. The
+// honest version asserts the property that is actually observable - the probe
+// refuses the input and no request is made - and the review records that the
+// stronger claim is unproven.
+func TestProbe_DoesNotFetchAURLInAPlaylist(t *testing.T) {
+	requireFFmpeg(t)
+
+	var hits atomic.Int64
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(target.Close)
+
+	dir := t.TempDir()
+	playlist := filepath.Join(dir, "clip.m3u8")
+	body := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:2.0,\n" + target.URL + "/segment.ts\n#EXT-X-ENDLIST\n"
+	if err := os.WriteFile(playlist, []byte(body), 0o644); err != nil {
+		t.Fatalf("writing the playlist: %v", err)
+	}
+
+	probe := NewFFProbe("ffprobe")
+	if _, err := probe.Probe(context.Background(), playlist); err == nil {
+		t.Log("ffprobe accepted a bare m3u8 on this build, which the review did not " +
+			"expect; the whitelist is what now bounds what it may read")
+	}
+
+	if got := hits.Load(); got != 0 {
+		t.Errorf("the server fetched the URL in a library file %d times", got)
+	}
+}
+
+// TestBuildFFmpegArgs_RestrictsProtocols pins the other invocation, and this one
+// is load-bearing: it fails if the whitelist is dropped from the argument list.
+// The probe is the first thing to meet a library file, but the segment encoder
+// opens it too, and a fix applied to only one of them is a fix that does not hold.
+func TestBuildFFmpegArgs_RestrictsProtocols(t *testing.T) {
+	t.Parallel()
+
+	cfg := ManagerConfig{
+		RootDir:        "/tmp/streams",
+		SegmentSeconds: 2,
+		Server: ServerCapability{
+			VideoEncoders:        []string{"libx264"},
+			HardwareAcceleration: nil,
+		},
+	}
+	args, err := BuildFFmpegArgs("/tmp/streams/one", "/library/film.mkv", Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+	}, cfg)
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgs: %v", err)
+	}
+
+	found := false
+	for i, arg := range args {
+		if arg != "-protocol_whitelist" {
+			continue
+		}
+		found = true
+		if i+1 >= len(args) {
+			t.Fatal("-protocol_whitelist has no value")
+		}
+		if args[i+1] != ffmpegprocess.LocalProtocols {
+			t.Errorf("whitelist = %q, want %q", args[i+1], ffmpegprocess.LocalProtocols)
+		}
+		if strings.Contains(args[i+1], "http") || strings.Contains(args[i+1], "tcp") {
+			t.Errorf("the whitelist contains a network protocol: %q", args[i+1])
+		}
+	}
+	if !found {
+		t.Error("the ffmpeg arguments do not restrict protocols, so a library file shaped " +
+			"like a playlist can make the server fetch whatever it names")
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ykzird/astraeus/internal/ffmpegprocess"
 )
 
 // SubtitleTrack describes one subtitle stream in a media file.
@@ -314,13 +316,20 @@ func (p *FFProbe) Probe(ctx context.Context, path string) (*MediaInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, p.binary,
-		"-v", "error",
+	args := []string{"-v", "error"}
+	// The input is a path from a library, but ffmpeg treats an input as a URL and
+	// reads a playlist-shaped file as instructions to fetch other URLs. S-17 of
+	// the 2026-10-09 review: without this, a file in the library could make the
+	// server fetch whatever it named.
+	args = append(args, ffmpegprocess.Args()...)
+	args = append(args,
 		"-print_format", "json",
 		"-show_format",
 		"-show_streams",
 		path,
 	)
+
+	cmd := exec.CommandContext(ctx, p.binary, args...)
 
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout

@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/ykzird/astraeus/internal/ffmpegprocess"
 	"github.com/ykzird/astraeus/internal/observability"
 	"github.com/ykzird/astraeus/internal/tracing"
 )
@@ -844,6 +845,10 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		"-loglevel", "error",
 		"-y",
 	}
+	// The input is a path from the library, and ffmpeg would otherwise treat a
+	// file that looks like a playlist as instructions to fetch other URLs -
+	// making this server issue requests wherever the file says (S-17).
+	args = append(args, ffmpegprocess.Args()...)
 	if startSeconds > 0 {
 		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
 	}

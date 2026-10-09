@@ -16,6 +16,8 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+
+	"github.com/ykzird/astraeus/internal/ffmpegprocess"
 	"strings"
 )
 
@@ -105,16 +107,17 @@ func (s *Service) extractVobSubStream(ctx context.Context, mediaPath string, ord
 // remuxVobSubMatroska copies the chosen subtitle stream into a standalone
 // Matroska file, which keeps the codec private that holds the palette.
 func (s *Service) remuxVobSubMatroska(ctx context.Context, mediaPath string, ordinal int, target string) error {
-	cmd := exec.CommandContext(ctx, s.ffmpegBin,
-		"-hide_banner",
-		"-loglevel", "error",
-		"-y",
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	// A library file is a path, but ffmpeg reads an input as a URL (S-17).
+	args = append(args, ffmpegprocess.Args()...)
+	args = append(args,
 		"-i", mediaPath,
 		"-map", "0:s:"+strconv.Itoa(ordinal),
 		"-c:s", "copy",
 		"-f", "matroska",
 		target,
 	)
+	cmd := exec.CommandContext(ctx, s.ffmpegBin, args...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("extracting image subtitle stream %d from %s: %s", ordinal, mediaPath, commandMessage(output, ctx, err))
 	}
@@ -125,16 +128,17 @@ func (s *Service) remuxVobSubMatroska(ctx context.Context, mediaPath string, ord
 // framed form. ffmpeg is asked for the stream as data, which strips the
 // container's own framing without decoding the pictures.
 func (s *Service) demuxVobSubPackets(ctx context.Context, mediaPath string, ordinal int, target string) error {
-	cmd := exec.CommandContext(ctx, s.ffmpegBin,
-		"-hide_banner",
-		"-loglevel", "error",
-		"-y",
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	// A library file is a path, but ffmpeg reads an input as a URL (S-17).
+	args = append(args, ffmpegprocess.Args()...)
+	args = append(args,
 		"-i", mediaPath,
 		"-map", "0:s:"+strconv.Itoa(ordinal),
 		"-c", "copy",
 		"-f", "data",
 		target,
 	)
+	cmd := exec.CommandContext(ctx, s.ffmpegBin, args...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("extracting image subtitle stream %d from %s: %s", ordinal, mediaPath, commandMessage(output, ctx, err))
 	}

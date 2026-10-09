@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ykzird/astraeus/internal/ffmpegprocess"
 )
 
 // ErrUnsupportedFormat is returned for image-based subtitle formats (PGS,
@@ -156,15 +158,17 @@ func (s *Service) extract(ctx context.Context, mediaPath string, trackIndex int,
 	}
 	defer func() { _ = os.Remove(tmpName) }()
 
-	cmd := exec.CommandContext(ctx, s.ffmpegBin,
-		"-hide_banner",
-		"-loglevel", "error",
-		"-y",
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	// A library file is a path, but ffmpeg reads an input as a URL: a file shaped
+	// like a playlist would be fetched from wherever it points (S-17).
+	args = append(args, ffmpegprocess.Args()...)
+	args = append(args,
 		"-i", mediaPath,
 		"-map", "0:"+strconv.Itoa(trackIndex),
 		"-f", "webvtt",
 		tmpName,
 	)
+	cmd := exec.CommandContext(ctx, s.ffmpegBin, args...)
 	output, runErr := cmd.CombinedOutput()
 	if runErr != nil {
 		if ctx.Err() != nil {

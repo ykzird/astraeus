@@ -28,6 +28,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ykzird/astraeus/internal/ffmpegprocess"
 )
 
 // ocrPageSegmentation tells tesseract to treat the image as one uniform block
@@ -258,16 +260,17 @@ func (s *Service) extractPGSStream(ctx context.Context, mediaPath string, trackI
 		return "", func() {}, fmt.Errorf("closing the temporary image subtitle stream: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, s.ffmpegBin,
-		"-hide_banner",
-		"-loglevel", "error",
-		"-y",
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	// A library file is a path, but ffmpeg reads an input as a URL (S-17).
+	args = append(args, ffmpegprocess.Args()...)
+	args = append(args,
 		"-i", mediaPath,
 		"-map", "0:"+strconv.Itoa(trackIndex),
 		"-c:s", "copy",
 		"-f", "sup",
 		name,
 	)
+	cmd := exec.CommandContext(ctx, s.ffmpegBin, args...)
 	output, runErr := cmd.CombinedOutput()
 	if runErr != nil {
 		cleanup()
