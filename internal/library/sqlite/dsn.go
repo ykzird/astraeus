@@ -30,6 +30,26 @@ var sqlitePragmas = []string{
 	"_pragma=foreign_keys(1)",
 }
 
+// sqliteTxLock starts every transaction as BEGIN IMMEDIATE rather than BEGIN
+// DEFERRED, and it is the fix for the failure the other pragmas cannot reach.
+//
+// A deferred transaction takes a read lock first and upgrades to a write lock
+// when it first writes. If another connection committed in between, SQLite
+// cannot give the upgrade - the transaction's snapshot is stale - so it returns
+// SQLITE_BUSY_SNAPSHOT immediately, and the busy handler is never consulted.
+// That is why busy_timeout does not help and why a scan running beside the
+// metadata worker failed with "database is locked (517)" after zero to two files
+// (L-4 of the 2026-10-09 review). file:..._txlock=immediate takes the write lock
+// up front, where the busy handler *does* apply, so the two wait for each other
+// instead of one of them failing.
+//
+// The cost is that immediate transactions serialise writers. That is the right
+// trade here: this is a single-process server whose writers are a scan, a
+// metadata pass and the API, all of which want to finish rather than to
+// interleave. Readers are unaffected, because WAL lets them proceed against a
+// consistent snapshot.
+const sqliteTxLock = "_txlock=immediate"
+
 // DSN builds the connection string for a SQLite database at path.
 func DSN(path string) string {
 	if path == "" {
@@ -42,6 +62,9 @@ func DSN(path string) string {
 	if strings.HasPrefix(path, "file:") {
 		return appendPragmas(path)
 	}
+	// Note for the in-memory spellings: they skip the pragmas entirely, so they
+	// also skip the transaction lock. That is a test-only path, and the locking
+	// question is about files anyway.
 	if strings.HasPrefix(path, ":") {
 		return path
 	}
@@ -58,5 +81,5 @@ func appendPragmas(dsn string) string {
 	if strings.Contains(dsn, "?") {
 		separator = "&"
 	}
-	return dsn + separator + strings.Join(sqlitePragmas, "&")
+	return dsn + separator + strings.Join(append([]string{sqliteTxLock}, sqlitePragmas...), "&")
 }
