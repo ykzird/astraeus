@@ -204,3 +204,136 @@ test("resumeOffsetFor refuses a non-leaf entity", () => {
   // playback on a container.
   assert.equal(core.resumeOffsetFor({ position_seconds: 600, duration_seconds: 5400 }, false), 0);
 });
+
+// ── accepted jobs ───────────────────────────────────────────────────────────
+//
+// W-2: scanning and enriching answer 202 with a job to poll, because holding the
+// request open meant the client's own timeout cancelled the work. The waiting is
+// a decision - how long, what a failure means, what an inline answer means - so
+// it lives here with the clock and the status call injected.
+
+// Accepted stands in for the 202 body the server answers with.
+const accepted = { job_id: "job-7", key: "scan:lib-1", state: "queued", new: true };
+
+// statuses builds a status function that returns each state in turn, repeating
+// the last one if it is asked again.
+function statuses(...states) {
+  let index = 0;
+  return function () {
+    const state = states[Math.min(index, states.length - 1)];
+    index++;
+    return state;
+  };
+}
+
+const noSleep = function () {
+  return Promise.resolve();
+};
+
+test("awaitJob returns the result once the job is done", async () => {
+  const outcome = await core.awaitJob(accepted, {
+    sleep: noSleep,
+    status: statuses(
+      { state: "queued" },
+      { state: "running" },
+      { state: "done", result: { files_seen: 12 } }
+    ),
+  });
+
+  assert.equal(outcome.outcome, "result");
+  assert.deepEqual(outcome.value, { files_seen: 12 });
+});
+
+test("awaitJob reports a failed job with the work's own message", async () => {
+  const outcome = await core.awaitJob(accepted, {
+    sleep: noSleep,
+    status: statuses({ state: "done", error: "the library path is gone" }),
+  });
+
+  assert.equal(outcome.outcome, "failed");
+  assert.equal(outcome.error, "the library path is gone");
+});
+
+test("awaitJob passes an inline answer straight through", async () => {
+  // A server with no runner answers 200 with the result, and an older server
+  // answers 200 with it too. Neither has a job to wait for.
+  const inline = { files_seen: 3 };
+  const outcome = await core.awaitJob(inline, {
+    sleep: noSleep,
+    status: function () {
+      throw new Error("an inline answer must not be polled");
+    },
+  });
+
+  assert.equal(outcome.outcome, "inline");
+  assert.deepEqual(outcome.value, inline);
+});
+
+test("awaitJob reports progress while it waits", async () => {
+  const seen = [];
+  const outcome = await core.awaitJob(accepted, {
+    sleep: noSleep,
+    status: statuses({ state: "running" }, { state: "done", result: "ok" }),
+    onProgress: function (job) {
+      seen.push(job.state);
+    },
+  });
+
+  assert.equal(outcome.outcome, "result");
+  assert.deepEqual(seen, ["running", "done"]);
+});
+
+test("awaitJob gives up on a job that never finishes", async () => {
+  // A clock the test controls: each call advances a minute, so the deadline is
+  // reached without waiting for it.
+  let clock = 0;
+  const outcome = await core.awaitJob(accepted, {
+    sleep: noSleep,
+    status: statuses({ state: "running" }),
+    waitMs: 1000,
+    now: function () {
+      clock += 600;
+      return clock;
+    },
+  });
+
+  assert.equal(outcome.outcome, "timeout");
+});
+
+test("awaitJob keeps waiting while the job has not finished", async () => {
+  let polls = 0;
+  const outcome = await core.awaitJob(accepted, {
+    sleep: noSleep,
+    status: function () {
+      polls++;
+      // Not done for the first three polls.
+      if (polls < 4) return { state: "running" };
+      return { state: "done", result: "finished" };
+    },
+  });
+
+  assert.equal(outcome.outcome, "result");
+  assert.equal(outcome.value, "finished");
+  assert.equal(polls, 4);
+});
+
+test("awaitJob tolerates a status call that returns nothing", async () => {
+  let polls = 0;
+  const outcome = await core.awaitJob(accepted, {
+    sleep: noSleep,
+    status: function () {
+      polls++;
+      if (polls === 1) return null; // a 404 for a job forgotten mid-poll
+      return { state: "done", result: "ok" };
+    },
+  });
+
+  assert.equal(outcome.outcome, "result");
+  assert.equal(outcome.value, "ok");
+});
+
+test("awaitJob requires the two injected functions when there is a job", async () => {
+  await assert.rejects(function () {
+    return core.awaitJob(accepted, {});
+  }, /needs sleep and status/);
+});

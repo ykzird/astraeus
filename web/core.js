@@ -191,7 +191,66 @@
     return position;
   }
 
+  /** How long a job may run before the UI stops waiting for it.
+      Longer than the server-side work is expected to take, and short enough that
+      a wedged job does not leave a spinner forever. The work itself keeps
+      running either way - that is the point of accepting it. */
+  const JOB_WAIT_MS = 30 * 60 * 1000;
+
+  /**
+   * Wait for a job the server accepted, and report what it produced.
+   *
+   * Scanning and enriching answer `202` with a job to poll rather than holding
+   * the request open, so the work outlives the client's own timeout and a large
+   * scan finishes instead of being cancelled by the browser giving up on the
+   * response (W-2 of the 2026-10-09 review).
+   *
+   * The waiting is injected - `sleep(ms)` and `status(id)` - so the loop is
+   * testable without a browser or a server. Returns one of:
+   *
+   *   {outcome: "result", value}  - the job finished and produced this
+   *   {outcome: "inline", value}  - the server answered inline; there is no job
+   *   {outcome: "failed", error}  - the job ran and failed, with its own message
+   *   {outcome: "timeout"}        - it outlived its welcome but is still running
+   *
+   * `onProgress` is called with each status so a caller can show movement.
+   */
+  async function awaitJob(accepted, options) {
+    const opts = options || {};
+    const sleep = opts.sleep;
+    const status = opts.status;
+    const waitMs = typeof opts.waitMs === "number" ? opts.waitMs : JOB_WAIT_MS;
+    const now = typeof opts.now === "function" ? opts.now : Date.now;
+
+    /* A response with no job id is either an older server or one built without a
+       runner: both answer 200 with the result inline, and that is already what
+       the caller wants. */
+    if (!accepted || typeof accepted.job_id !== "string" || !accepted.job_id) {
+      return { outcome: "inline", value: accepted };
+    }
+    if (typeof sleep !== "function" || typeof status !== "function") {
+      throw new Error("awaitJob needs sleep and status functions");
+    }
+
+    const deadline = now() + waitMs;
+    for (;;) {
+      if (now() > deadline) return { outcome: "timeout" };
+
+      await sleep(opts.intervalMs);
+
+      const job = await status(accepted.job_id);
+      if (!job) continue;
+      if (opts.onProgress) opts.onProgress(job);
+
+      if (job.state !== "done") continue;
+      if (job.error) return { outcome: "failed", error: job.error };
+      return { outcome: "result", value: job.result };
+    }
+  }
+
   return {
+    JOB_WAIT_MS: JOB_WAIT_MS,
+    awaitJob: awaitJob,
     FINISHED_FRACTION: FINISHED_FRACTION,
     RESUME_MIN_SECONDS: RESUME_MIN_SECONDS,
     formatClock: formatClock,

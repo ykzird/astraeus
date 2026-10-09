@@ -29,6 +29,7 @@
   } = window.AstraeusCore;
   /* Aliased because the local wrapper below keeps the name call sites use. */
   const { resumeOffsetFor: resumeOffsetFromProgress } = window.AstraeusCore;
+  const { awaitJob: awaitJobOutcome, JOB_WAIT_MS: awaitJobWaitMs } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */
 
@@ -310,6 +311,13 @@
     },
     enrich: function () {
       return apiFetch("metadata/enrich", { method: "POST" });
+    },
+    /* A job's state and, once it has finished, its result. Scanning and
+       enriching answer 202 with one of these to poll rather than holding the
+       request open, because the request used to be cancelled by the client's own
+       timeout partway through a large library (W-2). */
+    job: function (id) {
+      return apiFetch("jobs/" + encodeURIComponent(id));
     },
     /* Negotiates delivery for one entity. The body is a client capability
        manifest plus where in the source to begin; see playbackRequestBody().
@@ -1947,6 +1955,48 @@
 
   /* ── 9. Actions ──────────────────────────────────────────────────────── */
 
+  /** How often a job's state is polled while it runs. */
+  const JOB_POLL_MS = 1000;
+
+  /**
+   * Wait for a job the server accepted and return its result, or throw.
+   *
+   * The decision - how long to wait, what a finished job with an error means,
+   * what an inline answer means - is `core.js`'s awaitJob, which is unit-tested.
+   * This only supplies the browser's clock and the API call.
+   */
+  async function awaitJob(accepted, onProgress) {
+    const outcome = await awaitJobOutcome(accepted, {
+      intervalMs: JOB_POLL_MS,
+      sleep: function (ms) {
+        return new Promise(function (resolve) {
+          setTimeout(resolve, ms);
+        });
+      },
+      status: function (id) {
+        return api.job(id);
+      },
+      onProgress: onProgress,
+    });
+
+    if (outcome.outcome === "timeout") {
+      throw new ApiError(
+        "The server is still working on this after " +
+          Math.round(awaitJobWaitMinutes()) +
+          " minutes. It has not been cancelled; reload the page to see the result.",
+        { code: "job_timeout" }
+      );
+    }
+    if (outcome.outcome === "failed") {
+      throw new ApiError(outcome.error, { code: "job_failed" });
+    }
+    return outcome.value;
+  }
+
+  function awaitJobWaitMinutes() {
+    return awaitJobWaitMs / 60000;
+  }
+
   async function doScan(libraryId) {
     if (state.busyAction) return;
     const library = state.libraries.find(function (item) {
@@ -1957,7 +2007,18 @@
     clearError();
     render();
     try {
-      const result = await api.scan(libraryId);
+      /* The scan is accepted rather than performed, so the caller waits for it
+         and refreshes the list as it goes: on a large library that is the
+         difference between a spinner and watching the titles appear. */
+      const accepted = await api.scan(libraryId);
+      const result = await awaitJob(accepted, function () {
+        if (state.libraryId === libraryId) {
+          refreshEntities(libraryId).catch(function () {
+            /* A refresh that fails mid-scan is not the scan failing; the
+               completed pass below refreshes again. */
+          });
+        }
+      });
       if (state.libraryId === libraryId) {
         await refreshEntities(libraryId);
       }
@@ -1989,7 +2050,12 @@
     clearError();
     render();
     try {
-      const result = await api.enrich();
+      const accepted = await api.enrich();
+      const result = await awaitJob(accepted, function (status) {
+        /* Enrichment is per entity, so the count is the useful progress. */
+        if (typeof status.result !== "undefined") return;
+        setActionStatus("Enriching…", "ok");
+      });
       if (state.libraryId) await refreshEntities(state.libraryId);
       if (state.detail) await loadEntity(state.detail.entity.id, currentToken());
       const summary = enrichSummary(result);
