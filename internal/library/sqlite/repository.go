@@ -95,7 +95,29 @@ func (r *Repository) WithTx(ctx context.Context, fn func(tx library.Repository) 
 
 // Migrate creates the schema if needed, upgrades databases written by earlier
 // versions, and backfills the data those upgrades depend on. It is idempotent.
+//
+// It is also atomic. Every step used to run on its own connection, so a step
+// that failed left the database half-upgraded: the review's failing database had
+// already gained its columns and had its statuses rewritten when the unique
+// index failed, and the process then exited, so the next start ran the remaining
+// steps against a schema nothing had expected (L-9 of the 2026-10-09 review).
+// One transaction means a failed upgrade leaves the previous version's database
+// intact and startable.
 func (r *Repository) Migrate(ctx context.Context) error {
+	if err := r.WithTx(ctx, func(tx library.Repository) error {
+		migrator, ok := tx.(*Repository)
+		if !ok {
+			return errors.New("sqlite: migration transaction is not a Repository")
+		}
+		return migrator.migrate(ctx)
+	}); err != nil {
+		return fmt.Errorf("migrating: %w", err)
+	}
+	return nil
+}
+
+// migrate is the migration proper, run inside one transaction by Migrate.
+func (r *Repository) migrate(ctx context.Context) error {
 	baseline := []string{
 		`CREATE TABLE IF NOT EXISTS schema_migrations (
 			version INTEGER PRIMARY KEY,
@@ -219,6 +241,16 @@ func (r *Repository) Migrate(ctx context.Context) error {
 	// a renamed episode file lost its progress with the entity (L-8). Identity
 	// is derived from the title and year, or the season and number, and is not
 	// shown to anyone.
+	// Legacy rows can collide on the identity the index is about to enforce.
+	// They share library_id='' and a NULL parent, so two files with the same
+	// base name - /a/Film.mkv and /b/Film.mkv - are identical under it, and
+	// older scanners could also write the same entity twice. The index cannot
+	// be created until they differ, and merging them would throw a film away, so
+	// the later rows are given an identity that says which one they are.
+	if err := r.disambiguateEntityIdentities(ctx); err != nil {
+		return err
+	}
+
 	post := []string{
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_media_objects_path ON media_objects(file_path)`,
 		`DROP INDEX IF EXISTS idx_media_entities_identity`,
@@ -315,19 +347,16 @@ func (r *Repository) rebuildProgressPerViewer(ctx context.Context) error {
 		{statement: `DROP TABLE ` + legacy},
 	}
 
-	tx, err := r.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("beginning playback_progress rebuild: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
+	// The steps run on whatever connection the caller is using. Migrate now
+	// holds one transaction over the whole migration, and beginning a second one
+	// here - which this used to do - deadlocks against it: the inner transaction
+	// waits for a write lock the outer one is holding, and after busy_timeout it
+	// fails with "database is locked". SQLite has no nested transactions, so the
+	// outer one is the transaction and this joins it.
 	for _, step := range steps {
-		if _, err := tx.ExecContext(ctx, step.statement, step.args...); err != nil {
+		if _, err := r.exec().ExecContext(ctx, step.statement, step.args...); err != nil {
 			return fmt.Errorf("rebuilding playback_progress for per-viewer progress: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("committing playback_progress rebuild: %w", err)
 	}
 	return nil
 }
@@ -363,6 +392,74 @@ func (r *Repository) backfillEntityIdentities(ctx context.Context) error {
 		if _, err := r.exec().ExecContext(ctx,
 			`UPDATE media_entities SET identity = ? WHERE id = ?`, identity, entity.ID); err != nil {
 			return fmt.Errorf("backfilling identity for entity %s: %w", entity.ID, err)
+		}
+	}
+	return nil
+}
+
+// disambiguateEntityIdentities makes every row's identity unique within the
+// scope the identity index covers, so the index can be created.
+//
+// Legacy rows collide because they have no library and no parent: two files
+// called Film.mkv under different directories are two different films that look
+// identical to the index. Merging them is not an option - one of the films would
+// be lost, along with whatever metadata and progress it had - so the rows after
+// the first are distinguished by the path of the file they describe, which is
+// the thing that actually differs between them.
+func (r *Repository) disambiguateEntityIdentities(ctx context.Context) error {
+	type duplicate struct {
+		LibraryID string  `db:"library_id"`
+		ParentID  *string `db:"parent_id"`
+		Type      string  `db:"type"`
+		Identity  string  `db:"identity"`
+	}
+	var duplicates []duplicate
+	if err := r.exec().SelectContext(ctx, &duplicates, `
+		SELECT library_id, parent_id, type, identity
+		FROM media_entities
+		GROUP BY library_id, COALESCE(parent_id, ''), type, identity
+		HAVING COUNT(*) > 1`); err != nil {
+		return fmt.Errorf("finding duplicate entity identities: %w", err)
+	}
+
+	for _, dup := range duplicates {
+		type row struct {
+			ID string `db:"id"`
+		}
+		var rows []row
+		if err := r.exec().SelectContext(ctx, &rows, `
+			SELECT id FROM media_entities
+			WHERE library_id = ? AND parent_id IS ? AND type = ? AND identity = ?
+			ORDER BY created_at, id`, dup.LibraryID, dup.ParentID, dup.Type, dup.Identity); err != nil {
+			return fmt.Errorf("listing entities sharing an identity: %w", err)
+		}
+
+		// The first keeps the identity it has; the rest are told apart by what
+		// they hold. A row with no file behind it still needs something unique,
+		// so its id is the last resort.
+		for i, entity := range rows {
+			if i == 0 {
+				continue
+			}
+			var filePath string
+			err := r.exec().GetContext(ctx, &filePath,
+				`SELECT file_path FROM media_objects WHERE media_entity_id = ? ORDER BY file_path LIMIT 1`,
+				entity.ID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("looking up the file for entity %s: %w", entity.ID, err)
+			}
+
+			identity := dup.Identity
+			if filePath != "" {
+				identity = fmt.Sprintf("%s [%s]", dup.Identity, filePath)
+			} else {
+				identity = fmt.Sprintf("%s [%s]", dup.Identity, entity.ID)
+			}
+
+			if _, err := r.exec().ExecContext(ctx,
+				`UPDATE media_entities SET identity = ? WHERE id = ?`, identity, entity.ID); err != nil {
+				return fmt.Errorf("disambiguating entity %s: %w", entity.ID, err)
+			}
 		}
 	}
 	return nil
