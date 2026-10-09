@@ -20,9 +20,11 @@ import (
 	"sync"
 )
 
-// DefaultBuckets are the histogram bucket bounds, in seconds. They span the
-// range a media server actually sees: a cached metadata lookup, a direct-play
-// file open, and the cold start of a transcode.
+// DefaultBuckets are the histogram bucket bounds, in seconds, for every metric
+// whose registry entry does not declare its own. They are spaced for the fast
+// end of the server — a cached metadata lookup, a direct-play file open — and
+// they are deliberately not the bounds a transcode is measured with: see
+// TranscodeBuckets in kpi.go for why one list cannot serve both.
 var DefaultBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
 
 // Metrics collects counters, gauges and histograms.
@@ -36,6 +38,12 @@ type Metrics struct {
 	gauges     map[string]*family
 	histograms map[string]*histogramFamily
 	buckets    []float64
+	// bucketOverrides holds the per-metric bounds the KPI registry declares,
+	// for the metrics the default list does not describe well. They are loaded
+	// at construction rather than by DeclareKPIs, so that a histogram created
+	// by its first observation carries the right bounds whether or not the
+	// registry has been declared yet.
+	bucketOverrides map[string][]float64
 }
 
 // sample is one labelled value within a family.
@@ -67,14 +75,32 @@ type histogramSeries struct {
 	total  uint64
 }
 
-// New creates an empty Metrics with the default bucket bounds.
+// New creates an empty Metrics with the default bucket bounds, plus whatever
+// bounds the KPI registry declares for individual metrics.
 func New() *Metrics {
-	return &Metrics{
-		counters:   make(map[string]*family),
-		gauges:     make(map[string]*family),
-		histograms: make(map[string]*histogramFamily),
-		buckets:    append([]float64(nil), DefaultBuckets...),
+	m := &Metrics{
+		counters:        make(map[string]*family),
+		gauges:          make(map[string]*family),
+		histograms:      make(map[string]*histogramFamily),
+		buckets:         append([]float64(nil), DefaultBuckets...),
+		bucketOverrides: make(map[string][]float64),
 	}
+	for _, definition := range KPIRegistry {
+		if len(definition.Buckets) > 0 {
+			m.bucketOverrides[definition.Name] = append([]float64(nil), definition.Buckets...)
+		}
+	}
+	return m
+}
+
+// bucketBoundsFor returns the bounds a histogram of this name should be created
+// with: its own when the registry declares them, the defaults otherwise.
+// Callers hold the write lock.
+func (m *Metrics) bucketBoundsFor(name string) []float64 {
+	if bounds, ok := m.bucketOverrides[name]; ok {
+		return append([]float64(nil), bounds...)
+	}
+	return append([]float64(nil), m.buckets...)
 }
 
 // IncCounter adds one to a counter series.
@@ -150,7 +176,7 @@ func (m *Metrics) ObserveHistogram(name, help string, value float64, labels map[
 		h = &histogramFamily{
 			name:    name,
 			help:    help,
-			buckets: append([]float64(nil), m.buckets...),
+			buckets: m.bucketBoundsFor(name),
 			series:  make(map[string]*histogramSeries),
 		}
 		m.histograms[name] = h

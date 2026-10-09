@@ -5,8 +5,9 @@ the harness to repeat it. 135 tracked files; `v0.17.0` and `v0.18.0` are
 released, so the in-tree version is `dev` and the next tag would be
 `v0.18.1`.** (`git log` names the commits. Round 14 added
 `scripts/load-verify/` and measured the API and the 1080p and 4K transcode paths
-on this host (§6), which turned up one real defect — transcode percentiles are
-interpolations rather than measurements (§7). Round 12 ran the release workflow
+on this host (§6), which turned up one real defect — transcode percentiles were
+interpolations rather than measurements, now fixed with per-metric bucket
+bounds. Round 12 ran the release workflow
 for real and started the systemd unit on a clean VM, finding two defects in the
 packaging and one in the release job, all since fixed (§6). Round 13 removed the
 point-in-time reviews from the
@@ -725,12 +726,21 @@ Intel box in §8 is worth measuring on.
 
 The server's own numbers agreed with the client's throughout (1.71 against
 1.74 s, 3.14 against 3.13 s, 6.11 against 6.10 s, 2.86 against 2.87 s), which is
-the cross-check the harness exists to make. One disagreement is real, and is the
-open item in §7: a percentile taken from `astraeus_transcode_startup_seconds`
-comes out high whenever every observation lands in one wide bucket — a p50 of
-**7.50 s** where the client measured **6.10 s** (4 streams, 4K), and **3.75 s**
-where the client measured **2.87 s** (8 streams, 1080p). The mean is right in
-both cases. Means can be trusted today; percentiles in that range cannot.
+the cross-check the harness exists to make — with one disagreement that turned
+out to be real. Every transcode startup was landing inside a single
+`DefaultBuckets` bin, so `astraeus_transcode_startup_seconds` reported
+interpolated percentiles rather than measured ones: a p50 of **7.50 s** where
+the client measured **6.10 s** (4 streams, 4K), and **3.75 s** against **2.87 s**
+(8 streams, 1080p). The mean was right both times, because it comes from `_sum`
+and `_count`.
+
+That is fixed. The registry can now declare per-metric bounds, and both
+transcode KPIs carry `TranscodeBuckets`, which is fine through the seconds a
+transcode actually runs for; the test that pins it failed first at exactly
+7.50 s. Re-running the eight-stream 1080p case moved the reported p50 from
+3.75 s to **2.67 s**, against the client's 2.95 s. The residual difference is
+real and explainable rather than arithmetic: the server measures from ffmpeg
+starting, the client measures the whole round trip.
 
 **A quality choice that caps a ladder** landed as of 0.16.0, which fixes a
 negotiation model that was thinner than its field name. Until now
@@ -1076,13 +1086,6 @@ left:
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
-5. **Finer histogram buckets for the transcode KPIs.** `DefaultBuckets` jumps
-   `2.5 → 5 → 10` seconds. That suits HTTP latency and does not suit
-   `transcode_startup_time`: every startup lands in one bucket, so a percentile
-   is an interpolation rather than a measurement — measured up to 23% high in
-   round 14 (§6). The registry declares a single bucket list for every histogram,
-   so this needs per-metric bounds. It is small, and it is what makes the
-   transcode KPIs fit to alert on.
 
 `TODO.md` carries the complete list with detail.
 

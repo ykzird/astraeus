@@ -340,9 +340,7 @@ Status as of the current build. Evidence for each claim is the test suite
   Beyond the four specified metrics, the registry holds counters and histograms
   for HTTP, scanning, streaming sessions, playback decisions, probe errors,
   transcoder fallbacks, the access gate, the rate limiter and dropped spans.
-- The histogram bucket bounds are one list for every histogram, and that list is
-  too coarse where transcodes land: with `2.5 → 5 → 10` seconds, every transcode
-  startup falls inside a single bucket, so the transcode p50 and p95 are
-  interpolations rather than measurements — up to 23% high against the client in
-  the round-14 load run. Means are unaffected, because they come from `_sum` and
-  `_count`. Finer per-metric bounds are the fix.
+  The transcode KPIs carry their own bucket bounds (`TranscodeBuckets`) rather
+  than the defaults, because the default list put every transcode startup inside
+  one bin and made its percentiles interpolations rather than measurements
+  (round 14).
