@@ -258,6 +258,9 @@ func runServe(args []string) error {
 		"upstream root for artwork images")
 	subtitleCache := fs.String("subtitle-cache", filepath.Join(os.TempDir(), "astraeus-subtitles"),
 		"directory caching subtitle tracks converted to WebVTT")
+	ocrTimeout := fs.Duration("ocr-timeout", 30*time.Minute,
+		"how long one image-subtitle recognition pass may take; it runs tesseract once per cue, "+
+			"so a feature-length track needs far more than a demux does")
 	tesseractBin := fs.String("tesseract-bin", "tesseract",
 		"OCR executable used to read image subtitles (PGS, VobSub) into text; a missing one leaves them burn-only")
 	ocrLanguage := fs.String("ocr-language", "",
@@ -541,6 +544,7 @@ func runServe(args []string) error {
 			TesseractBin: *tesseractBin,
 			OCRLanguage:  *ocrLanguage,
 			CacheDir:     *subtitleCache,
+			OCRTimeout:   *ocrTimeout,
 			Logger:       app.logger,
 		})
 		if err != nil {

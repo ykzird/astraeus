@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/ykzird/astraeus/internal/jobs"
 	"github.com/ykzird/astraeus/internal/streaming"
 	"github.com/ykzird/astraeus/internal/subtitles"
 )
@@ -573,5 +577,169 @@ func TestSystemCapabilitiesReportsSubtitles(t *testing.T) {
 	}
 	if capabilities.SubtitleOCREnabled {
 		t.Error("subtitle_ocr_enabled = true, want false without a converter")
+	}
+}
+
+// slowConverter counts conversions and blocks until it is released, so a test
+// can look at what happens while a recognition pass is in flight.
+type slowConverter struct {
+	fakeConverter
+	mu      sync.Mutex
+	runs    int
+	release chan struct{}
+	started chan struct{}
+}
+
+func (c *slowConverter) ConvertImage(ctx context.Context, mediaPath string, trackIndex int) (string, error) {
+	c.mu.Lock()
+	c.runs++
+	c.mu.Unlock()
+
+	if c.started != nil {
+		select {
+		case c.started <- struct{}{}:
+		default:
+		}
+	}
+	if c.release != nil {
+		<-c.release
+	}
+	return writeCannedVTT()
+}
+
+func (c *slowConverter) runCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.runs
+}
+
+// TestSubtitleEndpoint_OneOCRPassePerTrack is the regression test for the
+// duplicate-work half of L-13.
+//
+// Every request for the same image track started its own recognition pass. The
+// cache only helps after the first one has finished writing, so three viewers
+// opening the same subtitle track ran three tesseract passes over the same
+// bitmaps at once.
+func TestSubtitleEndpoint_OneOCRPassePerTrack(t *testing.T) {
+	t.Parallel()
+
+	runner := jobs.New(context.Background(), jobs.Config{Workers: 2}, nil)
+	t.Cleanup(runner.Close)
+
+	converter := &slowConverter{
+		fakeConverter: fakeConverter{ocrReady: true},
+		started:       make(chan struct{}, 4),
+		release:       make(chan struct{}),
+	}
+	env := newTestEnv(t,
+		withProber(stubProber{info: subtitledInfo()}),
+		withStreams(&fakeStreams{}),
+		withSubtitles(converter),
+		withJobs(runner))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "bytes")
+	objects, err := env.repo.GetObjectsByEntity(context.Background(), entity.ID)
+	if err != nil {
+		t.Fatalf("getting objects: %v", err)
+	}
+	url := "/api/objects/" + objects[0].ID + "/subtitles/3.vtt"
+
+	// Three viewers ask at once.
+	var wg sync.WaitGroup
+	codes := make([]int, 3)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			codes[index] = env.do(t, http.MethodGet, url, "").Code
+		}(i)
+	}
+
+	// Let the first pass start, then let everything finish.
+	select {
+	case <-converter.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the recognition pass never started")
+	}
+	// A moment for the other two requests to arrive and join it.
+	time.Sleep(50 * time.Millisecond)
+	close(converter.release)
+	wg.Wait()
+
+	if got := converter.runCount(); got != 1 {
+		t.Errorf("three viewers on one track ran %d recognition passes, want 1", got)
+	}
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Errorf("viewer %d got status %d, want 200: a joined pass still has to be served",
+				i, code)
+		}
+	}
+}
+
+// TestSubtitleEndpoint_OCRPassOutlivesItsRequest is the regression test for the
+// cancellation half of L-13.
+//
+// The conversion ran on r.Context(), so a client that gave up - the browser
+// abandoning a slow response, or a viewer navigating away - cancelled an OCR pass
+// that had already done most of its work. The pass runs on the runner's context,
+// so it finishes and caches its result for whoever asks next.
+func TestSubtitleEndpoint_OCRPassOutlivesItsRequest(t *testing.T) {
+	t.Parallel()
+
+	runner := jobs.New(context.Background(), jobs.Config{Workers: 1}, nil)
+	t.Cleanup(runner.Close)
+
+	converter := &slowConverter{
+		fakeConverter: fakeConverter{ocrReady: true},
+		started:       make(chan struct{}, 1),
+		release:       make(chan struct{}),
+	}
+	env := newTestEnv(t,
+		withProber(stubProber{info: subtitledInfo()}),
+		withStreams(&fakeStreams{}),
+		withSubtitles(converter),
+		withJobs(runner))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "bytes")
+	objects, err := env.repo.GetObjectsByEntity(context.Background(), entity.ID)
+	if err != nil {
+		t.Fatalf("getting objects: %v", err)
+	}
+
+	// A request whose client goes away while the pass is running.
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/objects/"+objects[0].ID+"/subtitles/3.vtt", nil).WithContext(ctx)
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		env.server.Handler().ServeHTTP(httptest.NewRecorder(), request)
+	}()
+
+	select {
+	case <-converter.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the recognition pass never started")
+	}
+
+	// The client gives up.
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the handler did not return after its client went away")
+	}
+
+	// The pass is still running, and finishing it is what caches the result.
+	close(converter.release)
+	waitFor(t, "the recognition pass to finish", func() bool {
+		return converter.runCount() == 1
+	})
+
+	// A second request is served from the result the abandoned pass produced,
+	// which is the point: the work was not thrown away.
+	if got := env.do(t, http.MethodGet,
+		"/api/objects/"+objects[0].ID+"/subtitles/3.vtt", "").Code; got != http.StatusOK {
+		t.Errorf("the follow-up request = %d, want 200", got)
 	}
 }

@@ -109,6 +109,22 @@ func (j *Job) Wait() Result {
 	return j.result
 }
 
+// WaitContext waits for the job to end, or for ctx to be done.
+//
+// It reports which happened, so a caller can tell a finished job from one it
+// stopped waiting for. The job itself is unaffected: nothing a caller does
+// cancels work on the runner.
+func (j *Job) WaitContext(ctx context.Context) (Result, bool) {
+	select {
+	case <-j.done:
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		return j.result, true
+	case <-ctx.Done():
+		return Result{}, false
+	}
+}
+
 // Runner executes jobs. The zero value is not usable; call New.
 type Runner struct {
 	mu       sync.Mutex

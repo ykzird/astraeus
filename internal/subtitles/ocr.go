@@ -104,7 +104,9 @@ type ocrCue struct {
 // ocrExtract demuxes the image subtitle stream, decodes it and recognises every
 // cue, then commits the WebVTT atomically.
 func (s *Service) ocrExtract(ctx context.Context, mediaPath string, trackIndex int, target string) error {
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	// The recognition budget, not the extraction one: this runs tesseract once
+	// per cue (L-13).
+	ctx, cancel := context.WithTimeout(ctx, s.ocrTimeout)
 	defer cancel()
 
 	codec, ordinal, err := s.imageSubtitleCodec(ctx, mediaPath, trackIndex)

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ykzird/astraeus/internal/jobs"
 	"github.com/ykzird/astraeus/internal/library"
 	"github.com/ykzird/astraeus/internal/streaming"
 )
@@ -85,6 +87,48 @@ func (f *fakeStreams) ServeFile(w http.ResponseWriter, _ *http.Request, sessionI
 
 // seedPlayableEntity creates a library, a movie entity and a media object on
 // disk, returning the entity and the real file path.
+// waitForScan scans a library and waits for the scan to finish, whether the
+// server ran it inline or accepted it as a job.
+//
+// A test server built with a runner answers 202 with a job, and the scan is not
+// finished when the response arrives - so a helper that just posted and then
+// listed entities would find none. Handling both here keeps every test that
+// seeds a library working with or without a runner.
+func waitForScan(t *testing.T, env *testEnv, libraryID string) {
+	t.Helper()
+
+	recorder := env.do(t, http.MethodPost, "/api/libraries/"+libraryID+"/scan", "")
+	switch recorder.Code {
+	case http.StatusOK:
+		return
+	case http.StatusAccepted:
+	default:
+		t.Fatalf("scanning library %s = %d: %s", libraryID, recorder.Code, recorder.Body.String())
+	}
+
+	var accepted jobResource
+	if err := json.Unmarshal(recorder.Body.Bytes(), &accepted); err != nil {
+		t.Fatalf("decoding the accepted scan: %v", err)
+	}
+	waitFor(t, "the scan job to finish", func() bool {
+		poll := env.do(t, http.MethodGet, "/api/jobs/"+accepted.JobID, "")
+		if poll.Code != http.StatusOK {
+			return false
+		}
+		var status jobStatus
+		if err := json.Unmarshal(poll.Body.Bytes(), &status); err != nil {
+			return false
+		}
+		if status.State != jobs.StateDone {
+			return false
+		}
+		if status.Error != "" {
+			t.Fatalf("the scan failed: %s", status.Error)
+		}
+		return true
+	})
+}
+
 func seedPlayableEntity(t *testing.T, env *testEnv, fileName, content string) (library.MediaEntity, string) {
 	t.Helper()
 
@@ -93,7 +137,7 @@ func seedPlayableEntity(t *testing.T, env *testEnv, fileName, content string) (l
 	writeMediaFile(t, filePath, content)
 
 	lib := createLibrary(t, env, "Movies", root, "movies")
-	env.do(t, http.MethodPost, "/api/libraries/"+lib.ID+"/scan", "")
+	waitForScan(t, env, lib.ID)
 
 	recorder := env.do(t, http.MethodGet, "/api/libraries/"+lib.ID+"/entities", "")
 	entities := decodeBody[[]library.MediaEntity](t, recorder)

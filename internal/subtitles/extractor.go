@@ -42,9 +42,15 @@ type Config struct {
 	OCRLanguage string
 	// CacheDir stores the extracted WebVTT files.
 	CacheDir string
-	// Timeout bounds a single extraction.
+	// Timeout bounds a single text extraction, which is a demux.
 	Timeout time.Duration
-	Logger  *slog.Logger
+	// OCRTimeout bounds a single recognition pass, which is not a demux: it runs
+	// tesseract once per cue, and a feature-length track has two thousand of
+	// them. Sharing Timeout meant a real track was given two minutes for work
+	// measured at about 60 ms per cue, so it could not finish (L-13 of the
+	// 2026-10-09 review).
+	OCRTimeout time.Duration
+	Logger     *slog.Logger
 }
 
 // Service extracts and caches WebVTT subtitles.
@@ -55,6 +61,7 @@ type Service struct {
 	ocrLanguage  string
 	cacheDir     string
 	timeout      time.Duration
+	ocrTimeout   time.Duration
 	logger       *slog.Logger
 }
 
@@ -71,6 +78,13 @@ func New(cfg Config) (*Service, error) {
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 2 * time.Minute
+	}
+	if cfg.OCRTimeout <= 0 {
+		// Half an hour for a recognition pass. At the measured 60 ms a cue that
+		// is far more than a feature-length track needs on the hardware the
+		// measurement came from, and it is a safety net rather than a budget:
+		// a pass that hits it is one that has gone wrong, not one that is slow.
+		cfg.OCRTimeout = 30 * time.Minute
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -89,6 +103,7 @@ func New(cfg Config) (*Service, error) {
 		ocrLanguage:  cfg.OCRLanguage,
 		cacheDir:     cfg.CacheDir,
 		timeout:      cfg.Timeout,
+		ocrTimeout:   cfg.OCRTimeout,
 		logger:       cfg.Logger,
 	}, nil
 }

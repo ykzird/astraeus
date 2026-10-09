@@ -55,6 +55,7 @@ rather than here:
 | `--segment-seconds` | 6 | HLS target segment duration |
 | `--max-sessions` | 8 | Concurrent segmented streams |
 | `--image-cache`, `--subtitle-cache` | temp | Artwork and WebVTT caches |
+| `--ocr-timeout` | `30m` | How long one image-subtitle recognition pass may take. It runs tesseract once per cue, so a feature-length track needs far more than a demux does |
 | `--tesseract-bin`, `--ocr-language` | `tesseract`, tesseract's own | OCR of image subtitles (PGS, VobSub); a missing binary leaves them burn-only |
 | `--tmdb-image-base` | TMDB's own root | Upstream artwork root |
 | `--enrich-interval`, `--scan-interval` | `6h` | Background passes; `0` disables |

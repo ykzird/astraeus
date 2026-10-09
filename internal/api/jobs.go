@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -67,6 +68,59 @@ func (s *Server) startJob(w http.ResponseWriter, r *http.Request, key string, wo
 		URL:   location,
 	})
 	return true
+}
+
+// Exclusive runs OCR work, or joins the work already running for the same key.
+//
+// It is the shape internal/jobs.Runner satisfies, declared here so this package
+// does not depend on the runner for the tests that do not need one.
+type Exclusive interface {
+	RunOnce(key string, work func() (any, error)) (any, error)
+}
+
+// runExclusive runs work under a key and returns what it produced, or waits for
+// the pass that got there first.
+//
+// Two things come from routing through the runner rather than calling the
+// converter directly (L-13 of the 2026-10-09 review). The work runs on the
+// runner's context, so a client that gives up on the response no longer cancels
+// an OCR pass partway through. And one key has one pass, so N players asking for
+// the same image track start one tesseract run rather than N - the difference
+// between a household server staying responsive and being buried by its own
+// subtitle requests.
+//
+// The caller gives up when its own context does; the work does not. The result
+// is cached, so the next request finds it rather than paying for it again.
+// Without a runner configured this is the direct call it always was.
+func (s *Server) runExclusive(ctx context.Context, key string, work func(context.Context) (string, error)) (string, error) {
+	if s.jobs == nil {
+		return work(ctx)
+	}
+
+	job, _, err := s.jobs.Submit(key, func(jobCtx context.Context) (any, error) {
+		return work(jobCtx)
+	})
+	if err != nil {
+		return "", err
+	}
+
+	// A caller that joined an existing pass has no result of its own, so it
+	// waits for that pass to finish and then reads the cached file, which is
+	// what a cache hit does anyway.
+	result, finished := job.WaitContext(ctx)
+	if !finished {
+		return "", ctx.Err()
+	}
+	if result.Err != nil {
+		return "", result.Err
+	}
+	path, ok := result.Value.(string)
+	if !ok {
+		// The work returned the file path; anything else is a programming error
+		// this package should not paper over.
+		return "", fmt.Errorf("jobs: exclusive work returned %T, want the file path", result.Value)
+	}
+	return path, nil
 }
 
 // jobStatus is what a client polling a job is told.

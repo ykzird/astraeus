@@ -1337,8 +1337,17 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 
 	var path string
 	if imageBased {
-		path, err = s.subtitles.ConvertImage(r.Context(), object.FilePath, trackIndex)
+		// OCR runs through the runner: one pass per (file, track) however many
+		// players ask for it, and a client that gives up does not cancel it
+		// partway through (L-13).
+		path, err = s.runExclusive(r.Context(),
+			fmt.Sprintf("ocr:%s:%d", object.FilePath, trackIndex),
+			func(ctx context.Context) (string, error) {
+				return s.subtitles.ConvertImage(ctx, object.FilePath, trackIndex)
+			})
 	} else {
+		// A text track is a demux, not a recognition pass: it is cheap enough to
+		// do inline, and there is no second caller to share it with.
 		path, err = s.subtitles.Convert(r.Context(), object.FilePath, trackIndex)
 	}
 	if err != nil {

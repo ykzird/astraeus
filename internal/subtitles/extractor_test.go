@@ -225,3 +225,47 @@ func TestConvert_HeaderOnlyOutputIsNoCues(t *testing.T) {
 		t.Fatalf("error = %v, want ErrNoCues", err)
 	}
 }
+
+// TestConfig_OCRHasItsOwnBudget is the regression test for the time-budget half
+// of L-13.
+//
+// One timeout covered both a text extraction, which is a demux, and a
+// recognition pass, which runs tesseract once per cue. The default was two
+// minutes; a feature-length track has around two thousand cues at a measured
+// 60 ms each, so a real image track could not finish inside the budget it was
+// given, and every request paid for the attempt again.
+func TestConfig_OCRHasItsOwnBudget(t *testing.T) {
+	t.Parallel()
+
+	service, err := New(Config{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// The extraction budget is unchanged: a demux is fast.
+	if got := service.timeout; got != 2*time.Minute {
+		t.Errorf("extraction timeout = %v, want 2m", got)
+	}
+
+	// The recognition budget is large enough for a real track and is not the
+	// extraction one.
+	if got := service.ocrTimeout; got <= service.timeout {
+		t.Errorf("recognition timeout = %v, want more than the extraction budget (%v): "+
+			"a pass that runs tesseract per cue is not a demux", got, service.timeout)
+	}
+	const featureLengthCues = 2000
+	measuredPerCue := 60 * time.Millisecond
+	if want := time.Duration(featureLengthCues) * measuredPerCue; service.ocrTimeout < want {
+		t.Errorf("recognition timeout = %v, want at least %v: a 2000-cue track at the "+
+			"measured 60ms per cue needs that", service.ocrTimeout, want)
+	}
+
+	// And an explicit value wins, so an operator can tune it.
+	custom, err := New(Config{CacheDir: t.TempDir(), OCRTimeout: time.Hour})
+	if err != nil {
+		t.Fatalf("New with an explicit budget: %v", err)
+	}
+	if custom.ocrTimeout != time.Hour {
+		t.Errorf("explicit recognition timeout = %v, want 1h", custom.ocrTimeout)
+	}
+}
