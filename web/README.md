@@ -35,12 +35,17 @@ works whether it is mounted at `/` or under a sub-path. There is no
 client-side router path to configure: navigation state lives in the URL
 fragment (`#/library/{id}`, `#/entity/{id}`), which never reaches the server.
 
-No absolute or third-party URLs are requested. The only external reference the
-app will ever emit is an `<img>` whose `src` came back from the API as an
-absolute `http(s)` `backdrop_path`/`poster_path`; when the provider returns a
-bare TMDB-style path (the normal case, since no image CDN is configured) the
-app renders a deterministic CSS gradient placeholder instead, and an `<img>`
-that fails to load removes itself and falls back to that placeholder.
+No absolute or third-party URLs are requested, and the app cannot emit one even
+by accident. Artwork is loaded only from this server's own image proxy:
+`poster_url` and `backdrop_url` are server-local `/api/images/...` paths, and the
+metadata's own absolute provider URL is deliberately ignored - fetching
+`image.tmdb.org` from the browser would hand a third party the viewer's address.
+The policy the server sends (`img-src 'self'`) refuses such a request at the
+browser anyway, so the proxy is enforced twice.
+
+With no proxy configured there is no artwork URL at all, and the app renders a
+deterministic CSS gradient derived from the entity id, which leaks nothing. An
+`<img>` that fails to load removes itself and falls back to that gradient.
 
 ## Running it locally
 

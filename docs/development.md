@@ -49,9 +49,12 @@ registry can be held against each other, and a metric that disagrees with the
 client is visible as a disagreement rather than a number nobody checks. The same
 directory holds `metrics-watch.mjs`, which records a live session as a timeline,
 and `analyse.mjs`, which diffs two scrapes. Read its README before quoting a
-number from it: the histogram buckets are coarse exactly where transcodes land,
-and a 4K transcode saturates the development host, so those runs measure
-contention as much as they measure the server.
+number from it: the default histogram buckets are coarse exactly where a
+transcode lands, so a percentile that falls between two of them is interpolated
+rather than measured - the metrics that time a transcode *starting* have their own
+finer bounds and do not have this problem - and a 4K transcode saturates the
+development host, so those runs measure contention as much as they measure the
+server.
 
 ## Layout
 

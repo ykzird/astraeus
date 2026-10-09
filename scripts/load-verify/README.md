@@ -109,10 +109,15 @@ ceiling and the CPU figure as the point.
 
 ## Reading the numbers honestly
 
-- **The histogram buckets are coarse where transcodes land.** The registry's
-  bounds jump `2.5 → 5 → 10` seconds, so a `p50` for transcode startup in that
-  range is interpolation between two bounds, not a measurement. Treat those
-  percentiles as ±a second. Client-side timings do not have this problem.
+- **Transcode-startup percentiles are measurements now, and the rest are not.**
+  The metrics that measure a transcode starting use their own bounds
+  (`TranscodeBuckets`), which are fine-grained through the seconds a transcode
+  actually takes; before round 14 they used `DefaultBuckets`, whose `2.5 → 5 →
+  10` jump made a `p50` in that range an interpolation rather than a measurement
+  (it read 7.50s where the client measured 6.10s). Everything still on
+  `DefaultBuckets` - scans, requests, provider calls - is interpolated across
+  those same wide bins, so treat a percentile there that lands between two
+  bounds accordingly. Client-side timings do not have this problem.
 - **Every HTTP request is logged at INFO**, so request logging is inside the
   measured path. That is the real configuration and worth measuring, but it
   means the API phase numbers include the log write.

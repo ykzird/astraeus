@@ -137,9 +137,10 @@ sudo install -d -o astraeus -g astraeus /var/cache/astraeus/images /var/cache/as
 
 # 2. The binary and the web UI it serves, and the documentation the README
 #    links to. The archive carries the user-facing pages and not the project's
-#    working documents, so the README's link to docs/handoff.md resolves in a
-#    checkout and not in this installed tree; the trailing chmod is because this
-#    repository's own files are not world-readable.
+#    working documents; the README links to docs/handoff.md by absolute URL, so
+#    that link reaches GitHub from an installed tree rather than resolving
+#    locally. The trailing chmod is because this repository's own files are not
+#    world-readable.
 sudo install -m 0755 astraeus-server /usr/local/bin/astraeus-server
 sudo install -d /usr/local/share/astraeus
 sudo cp -r web /usr/local/share/astraeus/web
@@ -243,15 +244,26 @@ artifact and the image and publishes nothing, which is how to check a change to
 it without spending a tag.
 
 **What a release contains.** One `astraeus-server_<version>_<os>_<arch>.tar.gz`
-per platform — `linux/amd64` and `linux/arm64` by default — each holding the
-binary, the `web` directory it serves (a server without a UI is half a server),
-the `deploy` directory with the systemd unit, the user-facing pages of `docs/`
-(`index.md`, `playback.md`, `configuration.md`, `api.md` and `development.md`),
-`LICENSE` and `THIRD_PARTY_NOTICES.md`, plus a `checksums.txt` covering them.
+per platform — `linux/amd64` and `linux/arm64` by default — each holding:
+
+- the `astraeus-server` binary;
+- the `web` directory it serves (a server without a UI is half a server) and the
+  `assets` directory holding the README's header image, which is a relative path
+  and would otherwise be broken in the first document a new user opens;
+- the `deploy` directory with the systemd unit;
+- the user-facing pages of `docs/`: `index.md`, `playback.md`,
+  `configuration.md`, `api.md` and `development.md`;
+- the top-level documents a reader of the installed tree needs: `README.md`,
+  `SPECIFICATION.md`, `TODO.md`, `CONTEXT.md`, `CONTRIBUTING.md` and
+  `SECURITY.md`;
+- `LICENSE`, `THIRD_PARTY_NOTICES.md` and a `checksums.txt` covering them all.
 The archive is self-sufficient: the systemd runbook above is meant to be followed
 from an extracted one, and every path it names is in there. It deliberately does
 **not** carry the repository's working documents — `docs/handoff.md` and the
-reviews — which are about building the server rather than using it:
+review reports it links to — which are about building the server rather than
+using it. `scripts/build-release.sh` asserts every path the runbook names is
+present, so a document that stops being shipped fails the build rather than
+failing on a user's machine:
 
 ```sh
 sha256sum -c checksums.txt          # from inside the extracted release dir

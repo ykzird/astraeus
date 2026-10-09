@@ -617,9 +617,14 @@ func (c *slowConverter) runCount() int {
 // duplicate-work half of L-13.
 //
 // Every request for the same image track started its own recognition pass. The
-// cache only helps after the first one has finished writing, so three viewers
-// opening the same subtitle track ran three tesseract passes over the same
+// cache only helps after the first one has finished writing, so several viewers
+// opening the same subtitle track ran several tesseract passes over the same
 // bitmaps at once.
+//
+// The first request is held inside the conversion, and the other two are fired
+// while it is held. That ordering is what makes the test measure deduplication
+// rather than the scheduler: with the first pass blocked, a second pass can only
+// start if the key was released, which is exactly the bug.
 func TestSubtitleEndpoint_OneOCRPassePerTrack(t *testing.T) {
 	t.Parallel()
 
@@ -628,7 +633,7 @@ func TestSubtitleEndpoint_OneOCRPassePerTrack(t *testing.T) {
 
 	converter := &slowConverter{
 		fakeConverter: fakeConverter{ocrReady: true},
-		started:       make(chan struct{}, 4),
+		started:       make(chan struct{}, 1),
 		release:       make(chan struct{}),
 	}
 	env := newTestEnv(t,
@@ -643,30 +648,49 @@ func TestSubtitleEndpoint_OneOCRPassePerTrack(t *testing.T) {
 	}
 	url := "/api/objects/" + objects[0].ID + "/subtitles/3.vtt"
 
-	// Three viewers ask at once.
-	var wg sync.WaitGroup
-	codes := make([]int, 3)
+	// Three viewers ask at once. None of them returns until the pass is released,
+	// so the requests are all in flight while the assertions below run.
+	var (
+		mu    sync.Mutex
+		codes []int
+		wg    sync.WaitGroup
+	)
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
-		go func(index int) {
+		go func() {
 			defer wg.Done()
-			codes[index] = env.do(t, http.MethodGet, url, "").Code
-		}(i)
+			code := env.do(t, http.MethodGet, url, "").Code
+			mu.Lock()
+			codes = append(codes, code)
+			mu.Unlock()
+		}()
 	}
 
-	// Let the first pass start, then let everything finish.
 	select {
 	case <-converter.started:
 	case <-time.After(3 * time.Second):
 		t.Fatal("the recognition pass never started")
 	}
-	// A moment for the other two requests to arrive and join it.
-	time.Sleep(50 * time.Millisecond)
+
+	// The pass is held. If the other two requests started their own conversions
+	// they would be inside ConvertImage now - the count is what says so, and the
+	// window is long enough for them to get there.
+	time.Sleep(200 * time.Millisecond)
+	if got := converter.runCount(); got != 1 {
+		t.Errorf("while one pass was held, %d recognition passes were running, want 1", got)
+	}
+
 	close(converter.release)
 	wg.Wait()
 
+	// And it stayed one pass for all three.
 	if got := converter.runCount(); got != 1 {
 		t.Errorf("three viewers on one track ran %d recognition passes, want 1", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(codes) != 3 {
+		t.Fatalf("got %d responses, want 3", len(codes))
 	}
 	for i, code := range codes {
 		if code != http.StatusOK {

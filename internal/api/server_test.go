@@ -27,6 +27,7 @@ import (
 type testEnv struct {
 	server *Server
 	repo   library.Repository
+
 	// gate is nil by default. A test that needs to tell viewers apart installs
 	// the same middleware the binary uses, because identity lives in the gate
 	// and not in the API server.

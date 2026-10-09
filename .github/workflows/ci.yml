@@ -109,6 +109,13 @@ jobs:
       - name: Check the end-to-end walk-through
         run: node --test scripts/ui-verify/check-e2e-flows.test.mjs
 
+      # The runbook's list of what a release contains is prose, and prose about a
+      # build drifts silently: the build keeps shipping the right files while the
+      # list describes a different archive (DD-14 of the 2026-10-09 review). This
+      # holds the list against the paths build-release.sh asserts.
+      - name: Check the release contents list
+        run: node --test scripts/build-release/check-release-contents.test.mjs
+
       # deploy/README.md's systemd runbook is followed from an extracted release
       # archive: it copies the documents into /usr/local/share/doc and installs
       # the unit out of deploy/. That makes the archive's layout part of the
