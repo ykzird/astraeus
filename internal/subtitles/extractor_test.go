@@ -149,8 +149,36 @@ func TestCacheKey_IsStable(t *testing.T) {
 		t.Fatalf("stat: %v", err)
 	}
 
-	if service.cacheKey(media, info, 2) != service.cacheKey(media, info, 2) {
-		t.Error("the cache key is not stable for the same input")
+	// A cache key has to be three things, and comparing one expression with itself
+	// tests only the first of them - which is how this test could not fail (L-19 of
+	// the 2026-10-09 review).
+	base := service.cacheKey(media, info, 2)
+
+	// Stable: the same input gives the same key, or a second request re-converts a
+	// subtitle the cache already holds.
+	if again := service.cacheKey(media, info, 2); again != base {
+		t.Errorf("the same input gave two keys: %q and %q", base, again)
+	}
+
+	// Distinguishing: a track number that changed must not reuse another track's
+	// conversion.
+	if other := service.cacheKey(media, info, 3); other == base {
+		t.Errorf("tracks 2 and 3 share the key %q, so one track's subtitles would be "+
+			"served for the other", base)
+	}
+
+	// And touched by content, not just by name: a file replaced in place at the
+	// same path must not keep the cached conversion of what used to be there.
+	if err := os.WriteFile(media, []byte("bbbbbbbb"), 0o644); err != nil {
+		t.Fatalf("rewriting media file: %v", err)
+	}
+	after, err := os.Stat(media)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if changed := service.cacheKey(media, after, 2); changed == base {
+		t.Errorf("a file modified in place kept the key %q, so edited media would serve "+
+			"the subtitles extracted from its previous contents", base)
 	}
 }
 

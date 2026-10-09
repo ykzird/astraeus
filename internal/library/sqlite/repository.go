@@ -218,7 +218,10 @@ func (r *Repository) migrate(ctx context.Context) error {
 	// entity is Complete only once it has metadata. Reset those so the
 	// metadata worker will pick them up.
 	if _, err := r.exec().ExecContext(ctx,
-		`UPDATE media_entities SET status = ? WHERE status = ? AND metadata IS NULL`,
+		// An empty string counts as absent too: rows written before this stored ''
+		// for an entity with no metadata, and those are exactly the rows this
+		// repair is for.
+		`UPDATE media_entities SET status = ? WHERE status = ? AND (metadata IS NULL OR metadata = '')`,
 		string(library.StatusIncomplete), string(library.StatusComplete),
 	); err != nil {
 		return fmt.Errorf("repairing entity statuses: %w", err)
@@ -782,7 +785,12 @@ type entityWriteParams struct {
 	Status    library.EntityStatus `db:"status"`
 	CreatedAt string               `db:"created_at"`
 	UpdatedAt string               `db:"updated_at"`
-	Metadata  string               `db:"metadata"`
+	// Nullable, so an entity with no metadata stores NULL rather than an empty
+	// string. The migration that repairs old rows looks for "no metadata" and can
+	// only see NULL; storing '' made every new row invisible to it, so the repair
+	// matched legacy rows only and the condition it exists for was never met again
+	// (L-19 of the 2026-10-09 review).
+	Metadata sql.NullString `db:"metadata"`
 }
 
 // identityOrName is the identity to store for an entity, defaulting to its name.
@@ -1186,15 +1194,18 @@ func (row progressRow) toProgress() (*library.PlaybackProgress, error) {
 
 // ---- helpers ---------------------------------------------------------------
 
-func marshalMetadata(meta *library.MetadataSet) (string, error) {
+// marshalMetadata renders a MetadataSet for storage, or an invalid NullString
+// when there is none. The invalid value is what becomes SQL NULL: the column is
+// nullable and "has no metadata" is what the status repair asks about.
+func marshalMetadata(meta *library.MetadataSet) (sql.NullString, error) {
 	if meta == nil {
-		return "", nil
+		return sql.NullString{}, nil
 	}
 	raw, err := json.Marshal(meta)
 	if err != nil {
-		return "", fmt.Errorf("marshalling metadata: %w", err)
+		return sql.NullString{}, fmt.Errorf("marshalling metadata: %w", err)
 	}
-	return string(raw), nil
+	return sql.NullString{String: string(raw), Valid: true}, nil
 }
 
 // timeLayouts are tried in order when reading timestamps back. The last two
@@ -1206,8 +1217,19 @@ var timeLayouts = []string{
 	"2006-01-02 15:04:05",
 }
 
+// formatTime renders a timestamp for storage.
+//
+// Fixed width to the microsecond, because these columns are ordered as *text* -
+// "ORDER BY p.updated_at DESC" - and RFC3339Nano trims trailing zeros, so the
+// strings are not the same length and do not sort by time within a second:
+// ".5" is greater than ".05" as text and less than it as a time, so two progress
+// updates inside one second could come back in the wrong order (L-19 of the
+// 2026-10-09 review).
+//
+// Microseconds rather than nanoseconds because that is the precision Go's own JSON
+// time encoding uses, so a value round-tripped through the API keeps its text form.
 func formatTime(t time.Time) string {
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Format("2006-01-02T15:04:05.000000Z07:00")
 }
 
 func parseTime(s string) (time.Time, error) {

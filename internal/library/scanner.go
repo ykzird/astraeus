@@ -375,7 +375,7 @@ func PlacementFor(lib *Library, relPath, absPath string) (containers []entitySpe
 		leaf, ok = moviePlacement(relPath, absPath)
 		return nil, leaf, ok
 	case ShowsLibrary:
-		return showPlacement(relPath, absPath)
+		return showPlacement(relPath)
 	default:
 		return nil, entitySpec{}, false
 	}
@@ -414,7 +414,7 @@ func moviePlacement(relPath, absPath string) (entitySpec, bool) {
 	return spec, true
 }
 
-func showPlacement(relPath, absPath string) ([]entitySpec, entitySpec, bool) {
+func showPlacement(relPath string) ([]entitySpec, entitySpec, bool) {
 	info, ok := naming.ParseEpisodePath(relPath)
 	if !ok || info.Series == "" {
 		return nil, entitySpec{}, false
