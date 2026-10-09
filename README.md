@@ -81,7 +81,9 @@ docker exec astraeus astraeus-server scan --db /data/astraeus.db \
 
 The image includes ffmpeg and tesseract. Releases are tagged (`:0.18.0`) and
 published on the [releases page](https://github.com/ykzird/astraeus/releases);
-`:latest` follows them. Building the image yourself, running it as a service and
+`:latest` follows them. The package is private by default, so an anonymous pull
+needs it made public first — see [deployment](deploy/README.md) if the pull above
+is refused. Building the image yourself, running it as a service and
 putting TLS in front of it are all in [deployment](deploy/README.md).
 
 ## Documentation
