@@ -38,8 +38,12 @@ from datetime import datetime, timezone
 class Bundle:
     """Read-only view of a bundle, whether it is a tarball or a directory."""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, origin: str | None = None):
         self.root = root
+        # What the reader called this bundle. A tarball is extracted to a
+        # temporary directory, so `root` is meaningless in a report; `origin` is
+        # the path or filename they will recognise.
+        self.origin = origin or root
         self._listing: list[str] = []
         for dirpath, _dirnames, filenames in os.walk(root):
             for name in filenames:
@@ -99,7 +103,7 @@ def open_bundle(path: str) -> tuple[Bundle, tempfile.TemporaryDirectory | None]:
             if target != root_real and not target.startswith(root_real + os.sep):
                 sys.exit(f"error: refusing archive member outside the bundle: {member.name}")
         archive.extractall(tmp.name, filter="data")
-    return Bundle(tmp.name), tmp
+    return Bundle(tmp.name, origin=os.path.basename(os.path.abspath(path))), tmp
 
 
 # ---------------------------------------------------------------------------
@@ -312,30 +316,62 @@ def analyze(bundle: Bundle) -> Report:
     report = Report(bundle)
     meta = parse_kv(bundle.read("meta/collector.txt"))
     state = parse_kv(bundle.read("container/state.txt"))
+    process = parse_kv(bundle.read("process/state.txt"))
     ffmpeg_version_lines = [
         ln for ln in bundle.lines("inside/ffmpeg-version.txt") if ln.startswith("ffmpeg version")]
     ffmpeg_version = ffmpeg_version_lines[0] if ffmpeg_version_lines else "not captured"
     host = parse_kv(bundle.read("host/host.txt"))
 
+    # A bundle comes from one of two deployments, and they share almost nothing:
+    # a container is read through `docker inspect`, a plain binary through
+    # /proc. The report says which one it is reading rather than printing empty
+    # container fields over a process bundle.
+    deployment = meta.get("mode") or ("process" if process else "container")
+    is_process = deployment == "process"
+
     # ---- header ----------------------------------------------------------
     report.line("# Astraeus diagnostics report")
     report.line()
-    report.line(f"- Bundle: `{os.path.basename(bundle.root.rstrip('/')) or 'bundle'}`")
+    report.line(f"- Bundle: `{bundle.origin}`")
     report.line(f"- Collected: {meta.get('collected_at_utc', 'unknown')}")
-    report.line(f"- Container: `{meta.get('container_name', '?')}` on `{meta.get('collector_host', '?')}`")
-    report.line(f"- Image: `{meta.get('container_image', '?')}`"
-                f" (version label: `{state.get('image_version_label', '?')}`)")
-    report.line(f"- Server started: {meta.get('container_started_at', state.get('started_at', '?'))}")
+    if is_process:
+        report.line(f"- Deployment: a plain binary (not a container)")
+        report.line(f"- Process: pid `{meta.get('process_pid', process.get('pid', '?'))}` on "
+                    f"`{meta.get('collector_host', '?')}`")
+        report.line(f"- Binary: `{meta.get('process_binary', process.get('binary', '?'))}`")
+        report.line(f"- Working directory: `{meta.get('process_cwd', process.get('cwd', '?'))}`")
+        report.line(f"- Command line: `{meta.get('process_argv', process.get('argv', '?')).strip()}`")
+        report.line(f"- Uptime: {process.get('uptime_seconds', meta.get('process_uptime_seconds', '?'))}s")
+    else:
+        report.line(f"- Deployment: a container")
+        report.line(f"- Container: `{meta.get('container_name', '?')}` on "
+                    f"`{meta.get('collector_host', '?')}`")
+        report.line(f"- Image: `{meta.get('container_image', '?')}`"
+                    f" (version label: `{state.get('image_version_label', '?')}`)")
+        report.line(f"- Server started: {meta.get('container_started_at', state.get('started_at', '?'))}")
     report.line(f"- Kernel: {host.get('kernel', meta.get('kernel', '?'))}")
-    report.line(f"- ffmpeg in the image: {ffmpeg_version}")
+    report.line(f"- ffmpeg: {ffmpeg_version}")
     report.line()
 
     log_path = "logs/container-stdout-stderr.log"
     log_lines = bundle.lines(log_path)
     if not log_lines:
-        report.caveat("the container log is empty or missing; most of the analysis below needs it")
-        report.line("> **No container log was captured.** Check `logs/` in the bundle; the "
-                    "container may use a logging driver that `docker logs` cannot read.")
+        report.caveat("no server log was captured, so nothing below can cite a log line; "
+                      "the metrics and the API responses still stand")
+        if is_process:
+            source = (bundle.read("logs/process-output.txt") or "").strip()
+            report.line("> **No server log was captured.** A binary started from a terminal "
+                        "writes to a pty, which keeps no history, so there was nothing to read.")
+            if source:
+                first = [ln for ln in source.splitlines() if ln.startswith("stderr=")]
+                if first:
+                    report.line(f"> Its stderr went to `{first[0].split('=', 1)[1]}`. To make "
+                                "logs collectable next time, redirect the process to a file "
+                                "(`> astraeus.log 2>&1`) or run it under systemd and let "
+                                "`journalctl` hold them.")
+        else:
+            report.line("> **No container log was captured.** Check `logs/` in the bundle; the "
+                        "container may use a logging driver that `docker logs` cannot read.")
         report.line()
 
     # ---- hardware verdict ------------------------------------------------
@@ -475,11 +511,22 @@ def hardware_verdict(bundle: Bundle, report: Report, log_lines: list[str]) -> di
         report.line()
         report.line("| field | value |")
         report.line("| --- | --- |")
-        for key in ("ffmpeg", "ffprobe", "image_subtitles", "subtitle_ocr_enabled",
-                    "render_node", "hardware_acceleration"):
+        # The key names differ between builds (`ffmpeg` and `ffmpeg_available`
+        # both appear), so print whichever form is present rather than a blank.
+        for key in ("ffmpeg", "ffmpeg_available", "ffprobe", "ffprobe_available",
+                    "image_subtitles", "subtitle_ocr_enabled", "render_node",
+                    "hardware_acceleration"):
             if key in capabilities:
                 report.line(f"| `{key}` | `{capabilities[key]}` |")
         report.line(f"| `video_encoders` | {', '.join(f'`{e}`' for e in encoders) or '(none)'} |")
+        # HDR encoders are a list of objects; render them as the pairs they are
+        # rather than letting a Python repr into the report.
+        hdr = capabilities.get("hdr_video_encoders") or []
+        if hdr:
+            pairs = ", ".join(
+                f"`{h.get('encoder', '?')}`/{h.get('pixel_format', '?')}"
+                if isinstance(h, dict) else f"`{h}`" for h in hdr)
+            report.line(f"| `hdr_video_encoders` | {pairs} |")
         report.line()
     else:
         report.caveat("`/api/system/capabilities` did not answer, so the encoder set is "
@@ -634,6 +681,10 @@ def gpu_visibility(bundle: Bundle, report: Report, log_lines: list[str], hw: dic
     runtime = host_values.get("container runtime", "")
     devices_raw = host_values.get("container devices (HostConfig.Devices)", "null")
     requests_raw = host_values.get("container device requests (HostConfig.DeviceRequests)", "null")
+    # A binary deployment has no container in the path, so there is no
+    # visibility question. Treat the devices as visible rather than absent:
+    # reporting "the container cannot see /dev/dri" here would be nonsense.
+    is_process_bundle = host_values.get("deployment", "") == "process"
 
     def has_json_value(raw: str) -> bool:
         """True when an inspect field holds something other than empty/null."""
@@ -675,6 +726,14 @@ def gpu_visibility(bundle: Bundle, report: Report, log_lines: list[str], hw: dic
     gpu_explicitly_requested = (has_json_value(requests_raw)
                                 or "nvidia" in runtime.lower())
     dri_explicitly_requested = has_json_value(devices_raw) or has_json_value(requests_raw)
+    if is_process_bundle:
+        # Nothing sits between the process and the devices, so both are in reach.
+        dri_explicitly_requested = True
+        gpu_explicitly_requested = True
+        if not dri_in_container:
+            dri_in_container = bool(host_nodes)
+        if not nvidia_in_container:
+            nvidia_in_container = bool(host_nvidia)
     gpu_accepted = (any("nvenc" in e for e in hw.get("accepted", []))
                     or any(e.lower().endswith("_nvenc") for e in hw.get("encoders", [])))
 
@@ -754,6 +813,7 @@ def gpu_visibility(bundle: Bundle, report: Report, log_lines: list[str], hw: dic
                       "is what shows the ceiling holding and the arguments the real session "
                       "got (S-1, S-15)")
 
+    report.line()
     report.line("### Userspace drivers inside the container")
     report.line()
     driver_inventory(bundle, report)
@@ -1035,12 +1095,17 @@ def main(argv: list[str]) -> int:
         description="Turn an Astraeus diagnostics bundle into a Markdown report.")
     parser.add_argument("bundle", help="tarball or unpacked directory")
     parser.add_argument("--out", help="write the report here instead of stdout")
+    parser.add_argument("--label",
+                        help="name to print as the bundle in the report, when the path is "
+                             "not the name the reader will recognise (default: the path given)")
     args = parser.parse_args(argv)
 
     if not os.path.exists(args.bundle):
         sys.exit(f"error: {args.bundle} does not exist")
 
     bundle, tmp = open_bundle(args.bundle)
+    if args.label:
+        bundle.origin = args.label
     try:
         report = analyze(bundle)
         text = report.render()

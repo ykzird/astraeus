@@ -5,26 +5,56 @@ form that can be read and acted on.
 
 | Script | Runs where | What it does |
 | --- | --- | --- |
-| `collect-astraeus-diagnostics.sh` | the Docker **host** | gathers logs, metrics, API responses, container and host state into one `.tar.gz` |
+| `collect-astraeus-diagnostics.sh` | the host running Astraeus | gathers logs, metrics, API responses, process or container state into one `.tar.gz` |
 | `analyze-astraeus-bundle.py` | anywhere | turns that tarball into a Markdown report with a verdict and the findings it bears on |
 
 The collector is read-only with respect to the running instance. It never
-restarts, reconfigures or stops anything, and the only file it writes inside the
-container is a temporary copy of the database under `/tmp`, which it removes.
+restarts, reconfigures or stops anything.
+
+## Two deployments, one collector
+
+The script detects which shape it is looking at:
+
+| Shape | Detected by | Read through |
+| --- | --- | --- |
+| **container** | a running container whose entrypoint is `astraeus-server` | `docker inspect`, `docker logs`, `docker exec` |
+| **process** | a running `astraeus-server` process | `/proc`, direct execution |
+
+Nothing about the analysis changes: the same file names are produced either way,
+so the report reads the same and the GPU comparison still works.
 
 ## Collect
 
 ```sh
-# from the repository, with the container already running
+# from the repository, with the server already running - detects the shape
 scripts/collect-astraeus-diagnostics.sh
 
-# name the container explicitly, sample for two minutes
-ASTRAEUS_CONTAINER=astraeus ASTRAEUS_SAMPLE_SECONDS=120 \
-  scripts/collect-astraeus-diagnostics.sh
+# name a container, or a process
+ASTRAEUS_CONTAINER=astraeus scripts/collect-astraeus-diagnostics.sh
+ASTRAEUS_PROCESS=12345      scripts/collect-astraeus-diagnostics.sh
+ASTRAEUS_PROCESS=astraeus-server scripts/collect-astraeus-diagnostics.sh
+
+# sample for two minutes instead of 30 seconds
+ASTRAEUS_SAMPLE_SECONDS=120 scripts/collect-astraeus-diagnostics.sh
 ```
 
 It writes `astraeus-diag-<host>-<timestamp>.tar.gz` to the current directory and
 prints its size and SHA-256.
+
+### Logs are the one thing that can be missing
+
+A container's logs come from `docker logs`. A **binary started from a terminal
+writes to a pty, which keeps no history**, so there is nothing to collect: the
+collector warns, and the report says the log is missing and names the terminal
+it went to. If you want runtime errors in a bundle, start the server with its
+output redirected:
+
+```sh
+./astraeus-server serve ... > astraeus.log 2>&1
+```
+
+…or run it under systemd, where the collector will pick the unit out of
+`systemctl` and read `journalctl -u <unit>` itself.
 
 ### Collecting while a stream is live
 
@@ -40,7 +70,8 @@ ASTRAEUS_SAMPLE_SECONDS=60 scripts/collect-astraeus-diagnostics.sh
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ASTRAEUS_CONTAINER` | auto-detected | container name or id; auto-detection matches a running container whose entrypoint is `astraeus-server` |
+| `ASTRAEUS_CONTAINER` | auto-detected | container name or id |
+| `ASTRAEUS_PROCESS` | auto-detected | process id, or a name/pattern to match |
 | `ASTRAEUS_OUT_DIR` | `$PWD` | where the tarball is written |
 | `ASTRAEUS_SAMPLE_SECONDS` | `30` | how long to sample `docker stats` |
 | `ASTRAEUS_SAMPLE_INTERVAL` | `5` | seconds between samples |
@@ -53,16 +84,18 @@ ASTRAEUS_SAMPLE_SECONDS=60 scripts/collect-astraeus-diagnostics.sh
 ## What is in the bundle
 
 ```
-meta/            collector and container provenance, base URL
+meta/            collector provenance (including which shape), base URL
 logs/            the full log, plus filtered error/hardware/HTTP views
 api/             /api/health, /api/system/capabilities, /api/libraries
 metrics/         the Prometheus scrape
-samples/         docker stats over the sampling window, and a second scrape
+samples/         resource stats over the sampling window, and a second scrape
+                 (docker stats for a container, /proc ticks for a process)
 inside/          ffmpeg version/encoders/device nodes, running ffmpeg command
-                 lines, /data listing, OCR engine, cgroup limits
+                 lines, working directory, OCR engine, cgroup limits
 container/       docker inspect: env, cmd, mounts, devices, runtime, health
-host/            GPUs and drivers on the host, side by side with the container
-database/        a consistent copy of astraeus.db (plus -wal and -shm)
+process/         /proc state: pid, binary, argv, cwd, rss, fds, environ, cgroup
+host/            GPUs and drivers, next to what the deployment can reach
+database/        a consistent copy of the SQLite database (plus -wal and -shm)
 state/           one-shot process list, stream-root listing
 ```
 
@@ -78,7 +111,14 @@ reproduce a bug, and say so when you send it.
 ## Analyze
 
 ```sh
-scripts/analyze-astraeus-bundle.py astraeus-diag-host-20261009T203257Z.tar.gz > report.md
+# write the report to a file
+scripts/analyze-astraeus-bundle.py astraeus-diag-host-20261009T203257Z.tar.gz --out report.md
+
+# or to stdout
+scripts/analyze-astraeus-bundle.py astraeus-diag-host-20261009T203257Z.tar.gz
+
+# name the bundle in the report, when the path is not the name you will use
+scripts/analyze-astraeus-bundle.py ./incoming.bundle --label astraeus-diag-viewer-1.tar.gz --out report.md
 ```
 
 The report contains:
@@ -92,6 +132,10 @@ The report contains:
   findings are about;
 - a list of review findings whose symptoms appear in the captured logs, with the
   matching lines.
+
+Two example reports are kept in [`examples/`](examples/): one from a real AMD
+host with a live transcode, and one synthetic bundle shaped like an Intel +
+NVIDIA host. See [`examples/README.md`](examples/README.md) for which is which.
 
 It works on an unpacked directory as well as a tarball.
 

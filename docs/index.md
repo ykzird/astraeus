@@ -11,6 +11,7 @@ running, or are about to.
 | [Configuration and operations](configuration.md) | Scanning libraries, every flag, the security headers, the access gate, rate limiting and tracing |
 | [HTTP API](api.md) | Every endpoint, the playback request and response, resume state and metrics |
 | [Troubleshooting](troubleshooting.md) | What to read when something refuses: `untrusted_source` and the IPv6 trap, unreadable subtitles, a stalled player, and why hardware transcoding is not being used |
+| [Diagnostics](https://github.com/ykzird/astraeus/blob/main/scripts/README-diagnostics.md) | Collecting a bundle from a running instance — a container or a binary — and reading the report it turns into. Repository only, since the collector ships with the source rather than with the server |
 | [Deployment](../deploy/README.md) | The container and the systemd unit, backups and upgrades, and what the unit hardens |
 | [TLS in front of it](../deploy/tls/README.md) | Terminating TLS, the identity the access gate believes, client certificates, and the trust boundary that makes any of it worth something |
 

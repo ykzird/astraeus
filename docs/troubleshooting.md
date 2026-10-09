@@ -130,3 +130,29 @@ Five families are probed — VAAPI, QuickSync, NVENC, AMF and VideoToolbox — a
 none of them has been run on real hardware in this project's own testing, so the
 probe is the first real evidence either way. `deploy/README.md` covers the
 container and unit settings that could stop an encoder that would otherwise work.
+
+## Nothing here matches, or you need help
+
+The sections above cover the failures the server names. When a problem does not
+appear in them, or when the answer is "it is slow" rather than "it refused", the
+useful next step is a bundle rather than a paragraph of description.
+
+`scripts/collect-astraeus-diagnostics.sh` gathers the logs, metrics, API
+responses and host or container state into one `.tar.gz`, and
+`scripts/analyze-astraeus-bundle.py` turns that into a Markdown report with a
+verdict and the specific findings it bears on:
+
+```sh
+# with the server already running; it detects whether that is a container or a binary
+scripts/collect-astraeus-diagnostics.sh
+
+# then, anywhere
+python3 scripts/analyze-astraeus-bundle.py astraeus-diagnostics-*.tar.gz
+```
+
+The collector is read-only with respect to the running instance: it never
+restarts, reconfigures or stops anything. Both scripts work against a binary
+deployment and a container one, and the report reads the same either way.
+[`scripts/README-diagnostics.md`](https://github.com/ykzird/astraeus/blob/main/scripts/README-diagnostics.md)
+covers the environment variables, what each part of the bundle is for, and how to
+read the report.

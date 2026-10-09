@@ -1,8 +1,17 @@
 # Handoff
 
-**As of the round-19 work of 2026-10-09 — a DVB fixture, a manual end-to-end
-walk-through, and the last subtitle blocker gone. 158 tracked files; `v0.17.0` and `v0.18.0` are released, so the
-in-tree version is `dev` and the next tag would be `v0.18.1`.** (`git log` names
+**As of the adversarial-review sweep — 88 findings from the 2026-10-09 review
+addressed: 78 fixed, 10 partial. That sweep ran six phases in the review's own
+order (security defaults, the media path on real hardware, subtitle decoders
+against ffmpeg as an oracle, library data integrity, the job runner, and
+documentation), took the findings whose fix exposed a second bug in the fix
+itself, and deliberately left ten partial rather than claiming them closed. Every partial names what it still owes and why in
+its own entry, so "partial" is a claim you can check rather than a shrug. The
+review's own documents are in `docs/review/`, which is deliberately untracked: they
+are a working record, not part of the product, and `scripts/build-release.sh` fails
+the build if any of them reach a release archive.** The review's commits are on
+`main`; `v0.17.0` and `v0.18.0` are released, so the in-tree version is `dev` and
+the next tag would be `v0.18.1`. (`git log` names
 the commits. Round 17 disproved the note that had been blocking the VobSub
 reader for two rounds: ffmpeg cannot *mux* VobSub, but it can *encode* it, so
 the project's PGS fixture re-encodes into a real sample that ffmpeg decodes and
@@ -1224,7 +1233,48 @@ cover.
 
 ## 7. Open work
 
-Priority order, with the reasoning. Take it top-down.
+Priority order, with the reasoning. Take it top-down. `TODO.md` carries the
+complete list; this section is the reasoning behind the top of it.
+
+### What the review left partial
+
+The 2026-10-09 review's ten partial findings are the largest single block of known
+work, because each one is a place where a fix landed and something behind it did
+not. They live in `docs/review/` — untracked, so read them in a working tree rather
+than a clone — and every entry says what it still owes. In rough value order:
+
+1. **A-8 — the image cache is unbounded.** No negative caching, no eviction, no
+   singleflight, and any viewer can fill it with up to 8 MiB × 11 sizes per
+   filename. The forgery and the mislabelled-cache half is fixed; this half is the
+   one with a resource ceiling, and it is the largest remaining item that is not
+   blocked on anything.
+2. **L-18 — enrichment has no backoff, and a wrong answer is permanent.** A
+   permanent miss is retried every pass forever, and an entity completed from
+   derived data while the provider was down is invisible to later passes, because
+   the pass only looks at `StatusIncomplete`. When TMDB comes back, those Seasons
+   and Episodes are never revisited.
+3. **L-12 — VobSub framing and timing.** Blocked, not deferred: records are still
+   cut at the control offset and every packet still lands at time zero, and neither
+   can be verified end to end until a fixture exists whose *container* carries a
+   palette. Do not start this without that fixture.
+4. **A-6 — the limiter sits inside the gate.** A refused request is not counted, so
+   a token-guessing client is not throttled. Moving it needs the middleware order
+   changed, which is why it was not smuggled into the token-length fix. Token mode
+   also keys every client as one `token` identity, which is deliberate and
+   conservative.
+5. **L-17 — series years and absolute numbering.** `Show (2005)` keeps the year in
+   the series name and sends no `first_air_date_year`; absolute numbering and
+   date-based names are unsupported. The movie half, the episode forms and both
+   ignore rules are done.
+6. **L-3 — the PGS memory bound is unverified.** The allocation is fixed; the
+   review's claim that peak memory is bounded was **not** reproduced, and no memory
+   improvement is claimed. Measuring it needs a controlled benchmark, not the
+   sampling that gave contradictory readings.
+7. **A-10, A-5, L-19, W-10** — the smaller remainders: `/metrics` admin scoping, a
+   non-zero `DSN(":memory:")` pragma gap, and the WebVTT `end < start` and
+   cache-temp-file cases. Each entry names its own.
+
+### The rest
 
 The claims that used to head this list — the release run, the systemd unit and
 the TLS example — are done, and observed rather than reasoned about. §6 records
