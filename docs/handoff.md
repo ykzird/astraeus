@@ -1,11 +1,15 @@
 # Handoff
 
-**As of the round-13 work of 2026-10-09 — the documentation sweep, released as
-`v0.18.0`. 128 tracked files; `v0.17.0` and `v0.18.0` are released, so the
-in-tree version is `dev` and the next tag would be `v0.18.1`.** (`git log` names
-the commits. Round 12 ran the release workflow for real and started the systemd
-unit on a clean VM, finding two defects in the packaging and one in the release
-job, all since fixed (§6). Round 13 removed the point-in-time reviews from the
+**As of the round-14 work of 2026-10-09 — measuring what the server costs, and
+the harness to repeat it. 135 tracked files; `v0.17.0` and `v0.18.0` are
+released, so the in-tree version is `dev` and the next tag would be
+`v0.18.1`.** (`git log` names the commits. Round 14 added
+`scripts/load-verify/` and measured the API and the 1080p and 4K transcode paths
+on this host (§6), which turned up one real defect — transcode percentiles are
+interpolations rather than measurements (§7). Round 12 ran the release workflow
+for real and started the systemd unit on a clean VM, finding two defects in the
+packaging and one in the release job, all since fixed (§6). Round 13 removed the
+point-in-time reviews from the
 tree, narrowed the release archive to the pages a user actually needs, and made
 every relative link inside that archive resolve — `docs/development.md` and
 `web/vendor/icons.md` now point at `scripts/` on GitHub, because the archive
@@ -326,6 +330,29 @@ docker buildx imagetools inspect ghcr.io/ykzird/astraeus:0.18.0
 # The version is baked in at build time, so this reads it back from the image.
 docker run --rm --entrypoint astraeus-server ghcr.io/ykzird/astraeus:0.18.0 version
 ```
+
+Performance is measured rather than argued about. The harness in
+`scripts/load-verify/` drives the API and concurrent HLS streams and reads
+`/metrics` before and after every phase, so the client's timings and the KPI
+registry can be held against each other:
+
+```sh
+cp demo.db .tmp/load-verify/load.db          # a COPY; never point this at real.db
+node scripts/load-verify/load-verify.mjs all --spawn \
+  --db .tmp/load-verify/load.db --entity <entityId> --streams 1,2,4 --hold 20
+
+# A live session someone drives by hand, recorded as a timeline, then read back.
+node scripts/load-verify/metrics-watch.mjs --out live.jsonl --interval 2
+node scripts/load-verify/metrics-watch.mjs --report live.jsonl
+
+# Or diff two scrapes taken around a session that was driven by hand.
+node scripts/load-verify/analyse.mjs before.prom after.prom
+```
+
+`--spawn` is what makes the CPU numbers possible: on Linux a process is visible
+in `/proc` only inside the PID namespace it was started in, so a sampler in a
+different shell than the server sees nothing at all. The same namespace split
+means `pkill`/`pgrep` cannot reach a server another shell started.
 
 ---
 
@@ -653,6 +680,57 @@ proved from CI that every relative link inside it resolves. The image is a
 multi-arch index over `linux/amd64` and `linux/arm64` with an SBOM and a
 provenance attestation per platform, and its labels carry `version=0.18.0` and
 `revision=4603d07`.
+
+**The server was measured, not just tested** (round 14). A harness in
+`scripts/load-verify/` drives the JSON API and concurrent HLS streams and reads
+the server's own `/metrics` before and after each phase, so the KPI registry and
+the client can be held against one another. On this host — a Ryzen 7 9700X, 8
+cores and 16 threads, no GPU — three workloads were measured.
+
+*The JSON API* served **4,895 requests/second** across 8 concurrent clients at
+1.6 ms mean and 3.6 ms p99, using 1.5 cores, with no failed request. The API is
+not a constraint at any concurrency this host can reach.
+
+*1080p H.264, direct play* — what a 1080p library mostly does, because a browser
+decodes it as delivered — costs about **0.1 cores per stream** and never starts
+ffmpeg: 1 stream took 0.15 cores and 8 took 0.78, with negotiation at 2 ms once
+the probe cache was warm (28 ms for the first, cold, request). Aggregate
+throughput flattened at about **2 GB/s**, which is this loopback and HTTP path
+rather than the server, so the ceiling for direct-play viewers is bandwidth and
+not CPU. A note for the beta: the first request against a file pays for a probe
+and the rest do not.
+
+*A 1080p HEVC source* — an x265 library, which a browser cannot decode and so
+must be transcoded — ran at about **20× realtime in total**, and as with 4K that
+total barely moved with concurrency: 19.4×, 21.6×, 20.9× and 18.4× for 1, 2, 4
+and 8 streams. Each stream still had 2.3× realtime in hand at eight, so the host
+serves roughly **20 simultaneous realtime 1080p transcodes**. CPU was 10.0 cores
+for the first stream and 14.6 from four onward — 0.52 cores per realtime stream,
+which is what `-preset veryfast -crf 21` costs rather than a misconfiguration.
+
+*A 17 GB 4K DV/HDR10+ film* tone-mapped to 1080p ran at about **4.5× realtime in
+total**, again nearly invariant with concurrency (0.73, 0.77 and 0.75 segments
+per second at 6 s for 1, 2 and 4 streams), so roughly **four realtime viewers**
+of that workload, with about 12% of headroom at four. Negotiation scaled with
+concurrency — 1.74 s, 3.13 s, 6.10 s — because one stream already uses 11.5 of
+16 threads, so each extra stream waits rather than finding idle capacity. The
+host reached **99.5% busy with 15.9 cores working**, and every phase of every
+run reported zero stream errors and zero probe errors.
+
+The shape is the same in all three cases, and it is the useful result: **total
+output is set by the host, not by the request.** More concurrent streams do not
+produce more video; they divide the same capacity and each waits longer to
+start. Hardware encoding is what would move that ceiling, which is why the
+Intel box in §8 is worth measuring on.
+
+The server's own numbers agreed with the client's throughout (1.71 against
+1.74 s, 3.14 against 3.13 s, 6.11 against 6.10 s, 2.86 against 2.87 s), which is
+the cross-check the harness exists to make. One disagreement is real, and is the
+open item in §7: a percentile taken from `astraeus_transcode_startup_seconds`
+comes out high whenever every observation lands in one wide bucket — a p50 of
+**7.50 s** where the client measured **6.10 s** (4 streams, 4K), and **3.75 s**
+where the client measured **2.87 s** (8 streams, 1080p). The mean is right in
+both cases. Means can be trusted today; percentiles in that range cannot.
 
 **A quality choice that caps a ladder** landed as of 0.16.0, which fixes a
 negotiation model that was thinner than its field name. Until now
@@ -998,6 +1076,13 @@ left:
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
+5. **Finer histogram buckets for the transcode KPIs.** `DefaultBuckets` jumps
+   `2.5 → 5 → 10` seconds. That suits HTTP latency and does not suit
+   `transcode_startup_time`: every startup lands in one bucket, so a percentile
+   is an interpolation rather than a measurement — measured up to 23% high in
+   round 14 (§6). The registry declares a single bucket list for every histogram,
+   so this needs per-metric bounds. It is small, and it is what makes the
+   transcode KPIs fit to alert on.
 
 `TODO.md` carries the complete list with detail.
 

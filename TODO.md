@@ -200,6 +200,15 @@ Status as of the current build. Evidence for each claim is the test suite
 
 ## Known gaps
 
+- Capacity on the development host is measured rather than assumed (round 14,
+  `scripts/load-verify/`): the JSON API serves ~4,900 requests/second; 1080p
+  H.264 direct play costs ~0.1 CPU cores per stream and is limited by bandwidth
+  rather than by the server; a 1080p HEVC source transcodes at ~20× realtime in
+  total, so roughly 20 simultaneous realtime viewers; and a 17 GB 4K HDR film
+  transcodes at ~4.5×, so roughly four. Total output is set by the host and not
+  by the request, so more concurrent streams divide the same capacity and each
+  waits longer to start. Hardware encoding is the lever that would move this
+  ceiling, and no GPU is reachable here.
 - A ladder multiplies the work: each rung is a separate encode of the same source,
   so three rungs cost roughly three times one. There is no per-host cap on how many
   rungs to offer, and no use of the client's bandwidth estimate to skip rungs it
@@ -331,3 +340,9 @@ Status as of the current build. Evidence for each claim is the test suite
   Beyond the four specified metrics, the registry holds counters and histograms
   for HTTP, scanning, streaming sessions, playback decisions, probe errors,
   transcoder fallbacks, the access gate, the rate limiter and dropped spans.
+- The histogram bucket bounds are one list for every histogram, and that list is
+  too coarse where transcodes land: with `2.5 → 5 → 10` seconds, every transcode
+  startup falls inside a single bucket, so the transcode p50 and p95 are
+  interpolations rather than measurements — up to 23% high against the client in
+  the round-14 load run. Means are unaffected, because they come from `_sum` and
+  `_count`. Finer per-metric bounds are the fix.

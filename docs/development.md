@@ -41,6 +41,18 @@ the server and the pages you are reading but none of the development tooling.
 Both the repackaged (`remux`) and re-encoded (`transcode`) HLS paths have been
 observed playing in Chromium through those harnesses.
 
+What the server *costs* rather than whether it works is measured by
+[`scripts/load-verify/`](https://github.com/ykzird/astraeus/tree/main/scripts/load-verify),
+which drives the JSON API and concurrent HLS streams and reads the server's own
+`/metrics` before and after every phase — so the client's timings and the KPI
+registry can be held against each other, and a metric that disagrees with the
+client is visible as a disagreement rather than a number nobody checks. The same
+directory holds `metrics-watch.mjs`, which records a live session as a timeline,
+and `analyse.mjs`, which diffs two scrapes. Read its README before quoting a
+number from it: the histogram buckets are coarse exactly where transcodes land,
+and a 4K transcode saturates the development host, so those runs measure
+contention as much as they measure the server.
+
 ## Layout
 
 ```
@@ -60,6 +72,7 @@ web/                    the Spatial Web UI, including vendored hls.js
                         and the generated BoxIcons registry (web/icons.js);
                         web/core.js is the unit-tested pure timeline maths
 scripts/ui-verify/      browser harnesses for playback and subtitles
+scripts/load-verify/    load, latency and CPU measurement harnesses
 scripts/pgsgen/         writes a PGS (.sup) fixture for those harnesses
 scripts/make-demo-media.sh  generates a throwaway demo library
 deploy/                 the systemd unit and the deployment runbook

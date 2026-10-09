@@ -83,6 +83,16 @@ jobs:
           node --check web/app.js
           node --check web/core.js
 
+      # The load harness is developer tooling rather than shipped code, but a
+      # syntax error in it is still a broken tool. Nothing here needs an npm
+      # install, and the harness needs a running server, so a parse check is the
+      # whole of what CI can say about it.
+      - name: Parse the load harness
+        run: |
+          for file in scripts/load-verify/*.mjs; do
+            node --check "$file"
+          done
+
       # The pure timeline core is unit-tested with Node's own runner, so this
       # needs no npm install and no lockfile.
       #
