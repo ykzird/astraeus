@@ -269,3 +269,100 @@ func TestConfig_OCRHasItsOwnBudget(t *testing.T) {
 		t.Errorf("explicit recognition timeout = %v, want 1h", custom.ocrTimeout)
 	}
 }
+
+// TestCacheKey_LanguageIsPartOfAnOCRPass is the regression test for D-16.
+//
+// The recognition cache key was the file, its size, its mtime, the track index and
+// the mode - none of which a --ocr-language flag changes. So changing the flag
+// kept serving the previous language's text, and nothing documented that. The
+// language is part of the answer, so it has to be part of the key.
+//
+// It is keyed that way for OCR only. A text extraction is a demux that never
+// reads the flag, so keying it that way would discard a good cache entry on every
+// change for no reason.
+func TestCacheKey_LanguageIsPartOfAnOCRPass(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	mediaPath := filepath.Join(dir, "film.mkv")
+	if err := os.WriteFile(mediaPath, []byte("media bytes"), 0o644); err != nil {
+		t.Fatalf("writing the media file: %v", err)
+	}
+	info, err := os.Stat(mediaPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	english, err := New(Config{CacheDir: t.TempDir(), OCRLanguage: "eng"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	german, err := New(Config{CacheDir: t.TempDir(), OCRLanguage: "deu"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	unset, err := New(Config{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	engKey := english.cacheKeyFor(mediaPath, info, 3, ocrCacheMode)
+	deuKey := german.cacheKeyFor(mediaPath, info, 3, ocrCacheMode)
+	unsetKey := unset.cacheKeyFor(mediaPath, info, 3, ocrCacheMode)
+
+	if engKey == deuKey {
+		t.Error("two languages produced one cache key, so a language change keeps serving " +
+			"the text it read before")
+	}
+	if engKey == unsetKey {
+		t.Error("a language and no language produced one cache key, so setting " +
+			"--ocr-language reuses the text read without it")
+	}
+	if deuKey == unsetKey {
+		t.Error("two different languages produced one cache key")
+	}
+
+	// The other inputs still distinguish entries, so the fix did not replace one
+	// collision with a coarser key.
+	if engKey == english.cacheKeyFor(mediaPath, info, 4, ocrCacheMode) {
+		t.Error("two track indices produced one cache key")
+	}
+
+	// A text extraction is keyed the same whatever the language is, because the
+	// language has nothing to do with it.
+	if a, b := english.cacheKeyFor(mediaPath, info, 3, "text"),
+		german.cacheKeyFor(mediaPath, info, 3, "text"); a != b {
+		t.Error("a text extraction's cache key depends on --ocr-language, so changing " +
+			"the flag throws away a demux that would have been identical")
+	}
+}
+
+// TestCacheKey_SeparatesItsComponents guards the delimiter. Concatenating the
+// inputs would let a path ending in one digit and a size beginning with another
+// collide with a different pair - a cache hit that returns another file's text.
+func TestCacheKey_SeparatesItsComponents(t *testing.T) {
+	t.Parallel()
+
+	service, err := New(Config{CacheDir: t.TempDir(), OCRLanguage: "eng"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	dir := t.TempDir()
+	first := filepath.Join(dir, "a1")
+	second := filepath.Join(dir, "a")
+	for _, path := range []string{first, second} {
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("writing %s: %v", path, err)
+		}
+	}
+	firstInfo, _ := os.Stat(first)
+	secondInfo, _ := os.Stat(second)
+
+	// Same content length, names that differ only by a trailing digit: with a
+	// bare concatenation these are the strings "…/a1" + "1" and "…/a" + "11".
+	if a, b := service.cacheKeyFor(first, firstInfo, 1, "text"),
+		service.cacheKeyFor(second, secondInfo, 11, "text"); a == b {
+		t.Error("two different files and track indices produced one cache key")
+	}
+}

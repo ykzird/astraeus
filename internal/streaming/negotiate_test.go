@@ -2379,3 +2379,202 @@ func TestBuildFFmpegArgs_HardwareLadderCarriesTheForcedIDRSpellingPerRendition(t
 		t.Errorf("the forced-IDR flag was emitted without a specifier on a ladder:\n%s", joined)
 	}
 }
+
+// TestNegotiate_WhichRequestsGetALadder is the regression test for D-5.
+//
+// playback.md contradicted itself and the code. It said an omitted body means
+// "the built-in browser profile", and the profile it described caps at 1920x1080;
+// it also said a request naming neither height adapts into a ladder. But
+// BrowserCapability sets MaxHeight and leaves PreferredHeight unset, and that
+// combination is a *pin* by the page's own rule - "max_height alone gives me
+// exactly this" - so a body-less request never gets a ladder. The UI, which omits
+// the height fields entirely, does.
+//
+// The behaviour is right and is what a body-less caller should want: a stable,
+// cheap answer that adapts to the viewer's quality menu rather than a ladder
+// chosen without knowing the source. The documentation was wrong, and this pins
+// the four cases so the two cannot disagree again.
+func TestNegotiate_WhichRequestsGetALadder(t *testing.T) {
+	t.Parallel()
+
+	// 4K H.264 the browser profile can decode but must downscale to its ceiling,
+	// which is a transcode and therefore a case where a ladder is possible.
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 3840, Height: 2160, BitDepth: 8, DurationSeconds: 600,
+	}
+
+	tests := []struct {
+		name        string
+		capability  ClientCapability
+		wantLadder  bool
+		wantTopRung int
+		description string
+	}{
+		{
+			name:       "the built-in profile pins one rendition",
+			capability: BrowserCapability(),
+			wantLadder: false,
+			description: "a body-less request. max_height alone is a pin, so the answer is " +
+				"one encode at the profile's ceiling rather than a ladder",
+		},
+		{
+			// The source has to need encoding for a ladder to be possible at all: a
+			// source the client can take as-is is direct play or a remux, and a
+			// remux copies the video rather than building rungs. The UI's request
+			// is this shape - no heights, and a source needing work.
+			name: "no heights at all is a ladder",
+			capability: ClientCapability{
+				Containers: []string{"hls"}, VideoCodecs: []string{"h264"},
+				AudioCodecs: []string{"aac"}, SupportsHLS: true,
+			},
+			wantLadder: true,
+			description: "the UI's request: it sends no height, so it adapts as far as the " +
+				"source allows",
+		},
+		{
+			name: "a preferred height is a ladder topped there",
+			capability: ClientCapability{
+				Containers: []string{"hls"}, VideoCodecs: []string{"h264"},
+				AudioCodecs: []string{"aac"}, SupportsHLS: true,
+				MaxHeight: 1080, PreferredHeight: 720,
+			},
+			wantLadder:  true,
+			wantTopRung: 720,
+			description: "what the quality menu sends when a viewer picks a setting",
+		},
+		{
+			name: "a max height alone is a pin",
+			capability: ClientCapability{
+				Containers: []string{"hls"}, VideoCodecs: []string{"h264"},
+				AudioCodecs: []string{"aac"}, SupportsHLS: true,
+				MaxHeight: 720,
+			},
+			wantLadder:  false,
+			wantTopRung: 720,
+			description: "the deterministic request",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// The source is chosen per case: a client that can take the video as-is
+			// is direct play or a remux, and neither builds rungs. HEVC is the codec
+			// the browser profile cannot decode, so it forces the encode that a
+			// ladder needs.
+			info := info
+			if tt.wantLadder && len(tt.capability.VideoCodecs) == 1 &&
+				tt.capability.VideoCodecs[0] == "h264" && tt.capability.MaxHeight == 0 {
+				info = &MediaInfo{
+					Container: "matroska", VideoCodec: "hevc", AudioCodec: "aac",
+					Width: 3840, Height: 2160, BitDepth: 8, DurationSeconds: 600,
+				}
+			}
+
+			decision := Negotiate(info, tt.capability.Normalise())
+			if decision.VideoAction != ActionTranscode {
+				t.Fatalf("video action = %q, want a transcode: %s", decision.VideoAction, tt.description)
+			}
+
+			gotLadder := len(decision.Renditions) > 1
+			if gotLadder != tt.wantLadder {
+				t.Errorf("got %d renditions, want %s: %s",
+					len(decision.Renditions), map[bool]string{true: "a ladder", false: "one"}[tt.wantLadder],
+					tt.description)
+			}
+			if tt.wantTopRung > 0 && decision.TargetHeight != tt.wantTopRung {
+				t.Errorf("target height = %d, want %d", decision.TargetHeight, tt.wantTopRung)
+			}
+		})
+	}
+}
+
+// TestNegotiate_BurnInIsCodecAgnostic is the regression test for D-15.
+//
+// The burn decision takes the default branch for any non-text track, so DVB
+// subtitles are burned like PGS and VobSub — but the 400 message for a *text*
+// track said "only image subtitles (PGS, VobSub) are burned in", and README.md
+// said DVB is "burn-in only" as though that had been shown. Both are claims the
+// project had not verified: the burn integration test uses a PGS fixture, and
+// nothing exercised DVB through this path.
+//
+// What can be verified without a DVB burn fixture is the decision itself, and
+// that is what this pins: the rule is "not text", not a list. A codec the project
+// has no decoder for is still a bitmap that cannot go into copied bits.
+func TestNegotiate_BurnInIsCodecAgnostic(t *testing.T) {
+	t.Parallel()
+
+	for _, codec := range []string{
+		"hdmv_pgs_subtitle",
+		"dvd_subtitle", // VobSub
+		"dvb_subtitle",
+		"xsub", // a codec with no support anywhere in this project
+	} {
+		t.Run(codec, func(t *testing.T) {
+			t.Parallel()
+
+			info := &MediaInfo{
+				Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+				Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+				AudioTracks: []AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+				Subtitles: []SubtitleTrack{
+					{Index: 3, Codec: codec, Text: false, Language: "fr"},
+				},
+			}
+			capability := ClientCapability{
+				Containers: []string{"matroska"}, VideoCodecs: []string{"h264"},
+				AudioCodecs: []string{"aac"}, SupportsHLS: true,
+				BurnSubtitleIndex: 3,
+			}
+
+			decision := Negotiate(info, capability)
+			if decision.BurnedSubtitleIndex != 3 {
+				t.Errorf("burned index = %d, want 3: the burn rule is \"not text\", not a "+
+					"list of codecs", decision.BurnedSubtitleIndex)
+			}
+			if decision.Mode != ModeTranscode {
+				t.Errorf("mode = %q, want a transcode: a bitmap cannot be composited into "+
+					"copied bits", decision.Mode)
+			}
+			// The reason names the codec it is about, so a log reader can tell why.
+			reasons := strings.Join(decision.Reasons, "; ")
+			if !strings.Contains(reasons, codec) {
+				t.Errorf("the reasons do not name %s: %s", codec, reasons)
+			}
+		})
+	}
+}
+
+// TestNegotiate_TextTrackRefusalNamesTheWholeRule pins the message D-15 found to
+// be narrower than the code. It is what a client sees when it asks for a text
+// track to be burned, so it has to describe the actual rule.
+func TestNegotiate_TextTrackRefusalNamesTheWholeRule(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+		Subtitles:   []SubtitleTrack{{Index: 2, Codec: "subrip", Text: true, Language: "en"}},
+	}
+	capability := ClientCapability{
+		Containers: []string{"matroska"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true,
+		BurnSubtitleIndex: 2,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.BurnedSubtitleIndex != 0 {
+		t.Fatalf("burned index = %d, want 0: a text track is delivered, not burned",
+			decision.BurnedSubtitleIndex)
+	}
+	reasons := strings.Join(decision.Reasons, "; ")
+	// The old message claimed PGS and VobSub were the burnable set, which is not
+	// the rule the default branch implements.
+	if strings.Contains(reasons, "only image subtitles") {
+		t.Errorf("the refusal claims a fixed list of burnable codecs; the rule is that a "+
+			"text track is delivered and a bitmap is burned: %s", reasons)
+	}
+}

@@ -82,7 +82,7 @@ func (s *Service) ConvertImage(ctx context.Context, mediaPath string, trackIndex
 		return "", fmt.Errorf("%s is a directory", mediaPath)
 	}
 
-	target := filepath.Join(s.cacheDir, s.cacheKeyFor(mediaPath, info, trackIndex, "ocr")+".vtt")
+	target := filepath.Join(s.cacheDir, s.cacheKeyFor(mediaPath, info, trackIndex, ocrCacheMode)+".vtt")
 	if cached, err := os.Stat(target); err == nil && cached.Size() > 0 {
 		s.logger.DebugContext(ctx, "serving cached OCR subtitles", "track", trackIndex)
 		return target, nil

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -202,12 +203,37 @@ func (s *Service) cacheKey(mediaPath string, info os.FileInfo, trackIndex int) s
 
 // cacheKeyFor folds the conversion mode into the key as well, so an OCR result
 // can never be served for a text extraction of the same track or the reverse.
+// ocrCacheMode names the cache namespace a recognition pass writes into.
+const ocrCacheMode = "ocr"
+
 func (s *Service) cacheKeyFor(mediaPath string, info os.FileInfo, trackIndex int, mode string) string {
 	abs, err := filepath.Abs(mediaPath)
 	if err != nil {
 		abs = mediaPath
 	}
-	sum := sha256.Sum256(fmt.Appendf(nil, "%s\x00%d\x00%d\x00%d\x00%s",
-		abs, info.Size(), info.ModTime().UnixNano(), trackIndex, mode))
+	// The language is part of the key for a recognition pass, because it is part
+	// of the answer: "Astraeus" read as English and read as German are different
+	// text, and the file, its size, its mtime and the track index are all
+	// unchanged by a --ocr-language flag. Without this the cache served the old
+	// language's text until the cache directory was cleared by hand, and nothing
+	// said so (D-16 of the 2026-10-09 review).
+	//
+	// It is included for OCR mode only. A text extraction is a demux and does not
+	// read the language, so keying it that way would throw away a good cache
+	// entry every time the flag changed.
+	components := []string{
+		abs,
+		fmt.Sprint(info.Size()),
+		fmt.Sprint(info.ModTime().UnixNano()),
+		fmt.Sprint(trackIndex),
+		mode,
+	}
+	if mode == ocrCacheMode {
+		components = append(components, s.ocrLanguage)
+	}
+
+	// Joined with NUL rather than concatenated, so that a path ending in "1" and
+	// a size of "23" cannot collide with a path ending in "12" and a size of "3".
+	sum := sha256.Sum256([]byte(strings.Join(components, "\x00")))
 	return hex.EncodeToString(sum[:16])
 }

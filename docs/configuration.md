@@ -56,7 +56,7 @@ rather than here:
 | `--max-sessions` | 8 | Concurrent segmented streams |
 | `--image-cache`, `--subtitle-cache` | temp | Artwork and WebVTT caches |
 | `--ocr-timeout` | `30m` | How long one image-subtitle recognition pass may take. It runs tesseract once per cue, so a feature-length track needs far more than a demux does |
-| `--tesseract-bin`, `--ocr-language` | `tesseract`, tesseract's own | OCR of image subtitles (PGS, VobSub); a missing binary leaves them burn-only |
+| `--tesseract-bin`, `--ocr-language` | `tesseract`, tesseract's own | OCR of image subtitles (PGS, VobSub); a missing binary leaves them burn-only. Changing the language re-reads every track: it is part of the recognition cache key, so the old text is not served |
 | `--tmdb-image-base` | TMDB's own root | Upstream artwork root |
 | `--enrich-interval`, `--scan-interval` | `6h` | Background passes; `0` disables |
 | `--auth-mode`, `--auth-header`, `--auth-provider`, `--trusted-proxy`, `--auth-token`, `--auth-exempt` | see [Access gate](#access-gate) | Gate configuration |

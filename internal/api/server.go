@@ -835,7 +835,7 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 			return
 		case track.Text:
 			writeError(w, http.StatusBadRequest, "subtitle_not_image",
-				fmt.Sprintf("subtitle track %d is text-based (%s) and is delivered as a selectable track; only image subtitles (PGS, VobSub) are burned in",
+				fmt.Sprintf("subtitle track %d is text-based (%s) and is delivered as a selectable track; a bitmap subtitle is the kind that gets burned in",
 					track.Index, track.Codec))
 			return
 		}

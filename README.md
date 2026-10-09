@@ -23,8 +23,10 @@ No database server, no front-end build step, three Go dependencies.
   clients that cannot show them; hardware encoders verified by running them on
   the machine that starts the server; an adaptive bitrate ladder.
 - **Subtitles.** Text tracks served as WebVTT, and PGS or VobSub image tracks
-  read into text with OCR when `tesseract` is installed — burn-in otherwise. DVB
-  subtitles are burn-in only.
+  read into text with OCR when `tesseract` is installed — burn-in for any bitmap
+  track otherwise. Burn-in is decided by whether the track is text, so it is not
+  limited to a list of codecs; PGS is the one it has been exercised with end to
+  end, and DVB burn-in is unverified (see `docs/handoff.md`).
 - **Remembers where you were**, per viewer, with a continue-watching list.
 - **An access gate, rate limiting and tracing** for when it is not just you.
   [More](docs/configuration.md)

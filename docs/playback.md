@@ -60,7 +60,12 @@ can keep a continuous timeline across a seek or a quality change. A negative
 value, or one at or past the end of the media, is rejected with `400`.
 
 Omit the body to use the built-in browser profile, which caps at **1920x1080,
-8-bit, stereo**. Those three limits are not arbitrary: they are the ones a
+8-bit, stereo**. That cap is a `max_height`, so a body-less request is **one
+rendition, not a ladder** — see [Adaptive bitrate](#adaptive-bitrate), where
+`max_height` alone means "give me exactly this". It is a deliberate difference
+from what the UI sends: the UI's body omits the height fields as well, so its
+request adapts up to 1080p while a body-less one is pinned at it. If you want a
+ladder from a script, send `preferred_height`. Those three limits are not arbitrary: they are the ones a
 browser cannot be relied on to exceed. A 4K source would otherwise be
 re-encoded at 4K (about four times the CPU) for a client that usually cannot
 decode it; 10-bit H.264 ("High 10") and 5.1 AAC are refused outright by
@@ -269,6 +274,13 @@ therefore offer the choice without probing anything itself.
 
 ## Image subtitles
 
+Reading an image track is cached, keyed on the file, its size, its modification
+time, the track index and **the OCR language**. The language belongs in that key
+because it is part of the answer: the same bitmap read as English and as German is
+different text, and none of the other inputs changes when the language does. So
+changing `--ocr-language` re-reads the track rather than serving what the previous
+language produced.
+
 Text tracks are served to the browser as WebVTT. Image-based tracks (PGS, VobSub)
 carry pictures rather than text, so no browser can render one as a subtitle
 track. There are two ways to show one, and the server chooses the better one it
@@ -357,7 +369,10 @@ fields, three meanings:
   is the deterministic request, and on a small host it is also the cheap one: a
   ladder is up to three encodes, a pin is one.
 - **neither** — "adapt as far as my box allows." A ladder topped at the client's
-  own ceiling or the source.
+  own ceiling or the source. Note that a **request with no body is not this
+  case**: the built-in profile it applies sets `max_height: 1080`, so a body-less
+  request is the pin above. This is the case for a body that is present and names
+  no height.
 
 `max_height` alongside `preferred_height` is the hard ceiling that ladder stays
 under, so a manifest can say "my screen is 1080" and "I chose 720" at once. A
