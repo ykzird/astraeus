@@ -564,3 +564,143 @@ func TestManager_FailedStartReleasesItsSlot(t *testing.T) {
 		}
 	}
 }
+
+// sessionLimitStub writes a playlist and a segment and then exits, which is the
+// shape that gets a session published and the error counter incremented.
+const sessionLimitStub = `#!/bin/sh
+out=""
+for arg in "$@"; do out="$arg"; done
+mkdir -p "$(dirname "$out")"
+printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000000,\nseg00000.ts\n' > "$out"
+printf 'segment' > "$(dirname "$out")/seg00000.ts"
+exit 0
+`
+
+func writeStubEncoder(t *testing.T, dir, script string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, "ffmpeg-stub")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing the stub encoder: %v", err)
+	}
+	return path
+}
+
+// TestManager_CapacityRefusalIsNotAHardwareFailure is the regression test for
+// S-11.
+//
+// The hardware-to-software retry fired on any error, so a request refused
+// because the session limit was reached logged "hardware transcode failed" and
+// incremented the fallback counter - and then started a second ffmpeg process
+// to be refused again. A capacity refusal says nothing about the encoder.
+func TestManager_CapacityRefusalIsNotAHardwareFailure(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub encoder is a shell script")
+	}
+
+	dir := t.TempDir()
+	metrics := observability.New()
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		FFmpegBin:   writeStubEncoder(t, dir, sessionLimitStub),
+		RootDir:     filepath.Join(dir, "sessions"),
+		MaxSessions: 1,
+		// A hardware encoder, so wouldUseHardware is true and the fallback path
+		// is reachable at all.
+		Server: ServerCapability{
+			VideoEncoders:        []string{"h264_vaapi", "libx264"},
+			HardwareAcceleration: []string{"vaapi"},
+		},
+		Metrics: metrics,
+		Logger:  newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	decision := Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+	}
+
+	first, err := manager.Start(context.Background(), "entity-1", "/media/a.mkv", decision)
+	if err != nil {
+		t.Fatalf("the first session should be allowed: %v", err)
+	}
+	t.Cleanup(func() { manager.Stop(first.ID) })
+
+	if _, err := manager.Start(context.Background(), "entity-2", "/media/b.mkv", decision); !errors.Is(err, ErrTooManySessions) {
+		t.Fatalf("second session error = %v, want ErrTooManySessions", err)
+	}
+
+	rendered := metrics.Render()
+	if strings.Contains(rendered, "astraeus_transcode_fallbacks_total") {
+		t.Errorf("a capacity refusal was counted as a hardware failure:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `astraeus_stream_errors_total{mode="transcode"} 0`) &&
+		strings.Contains(rendered, "astraeus_stream_errors_total") {
+		t.Errorf("a capacity refusal counted as a stream error:\n%s", rendered)
+	}
+}
+
+// TestManager_FailedSessionIsCountedOnce is the regression test for S-12.
+//
+// A failed start was counted by the wait goroutine and again by the startup
+// failure branch, so astraeus_stream_errors_total was inflated and the same
+// failure appeared in two places in the log.
+func TestManager_FailedSessionIsCountedOnce(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub encoder is a shell script")
+	}
+
+	dir := t.TempDir()
+	metrics := observability.New()
+	// ffmpeg dies without ever writing a playlist. That is the shape that was
+	// counted twice: the wait goroutine records the unexpected exit, and then
+	// the branch waiting for the playlist records the same failure again.
+	failing := `#!/bin/sh
+exit 1
+`
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		FFmpegBin:      writeStubEncoder(t, dir, failing),
+		RootDir:        filepath.Join(dir, "sessions"),
+		SegmentSeconds: 1,
+		Server:         ServerCapability{VideoEncoders: []string{"libx264"}},
+		Metrics:        metrics,
+		Logger:         newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	decision := Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+	}
+
+	if _, err := manager.Start(context.Background(), "entity-1", "/media/a.mkv", decision); err == nil {
+		t.Fatal("a start whose ffmpeg never produces a playlist should fail")
+	}
+
+	// The wait goroutine that records the count is not the one that closed
+	// Done, so poll briefly rather than reading a metric that may be a moment
+	// behind. Reading the exact value is the point: the bug was a count of two.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rendered := metrics.Render()
+		if strings.Contains(rendered, `astraeus_stream_errors_total{mode="transcode"} 1`) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("one failed session should count exactly once; metrics were:\n%s", rendered)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

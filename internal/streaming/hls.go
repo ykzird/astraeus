@@ -35,8 +35,25 @@ const (
 	stderrLimit = 8 << 10
 )
 
+// recordStreamFailure counts one failed session, in the one place that does it.
+func recordStreamFailure(metrics *observability.Metrics, metric string, mode PlaybackMode) {
+	metrics.IncCounter(metric,
+		"Segmented streaming failures: sessions that never produced a playlist, plus ffmpeg exiting unexpectedly.",
+		map[string]string{"mode": string(mode)})
+}
+
 // ErrTooManySessions is returned when the concurrent stream limit is reached.
 var ErrTooManySessions = errors.New("streaming: too many concurrent sessions")
+
+// errFFmpegFailed marks a failure that came from ffmpeg itself, as opposed to
+// one the request hit before ffmpeg was any part of the problem.
+//
+// The distinction decides whether the hardware-to-software retry is worth
+// attempting (S-11 of the 2026-10-09 review). Falling back on a capacity refusal
+// logged "hardware transcode failed" and started a second ffmpeg for a request
+// the software encoder would refuse just as fast, and falling back on a client
+// disconnect spawned a process nobody was waiting for.
+var errFFmpegFailed = errors.New("streaming: ffmpeg failed")
 
 // sessionMarkerFile marks a directory as ours. The reaper removes only
 // directories carrying it.
@@ -362,7 +379,10 @@ func (m *Manager) StartAt(ctx context.Context, entityID, objectPath string, deci
 
 	cfg := m.cfg
 	session, err := m.startOnce(ctx, entityID, objectPath, decision, cfg, startSeconds)
-	if err == nil || !wouldUseHardware(decision, cfg) {
+	// A software retry only makes sense when ffmpeg is what failed. A capacity
+	// refusal would be refused again just as fast, and a client that has gone
+	// away is not waiting for either attempt (S-11).
+	if err == nil || !wouldUseHardware(decision, cfg) || !errors.Is(err, errFFmpegFailed) {
 		if err != nil {
 			span.RecordError(err)
 		} else {
@@ -513,7 +533,7 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 	if err := cmd.Start(); err != nil {
 		cancel()
 		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("starting ffmpeg: %w", err)
+		return nil, fmt.Errorf("starting ffmpeg: %w: %w", err, errFFmpegFailed)
 	}
 	cfg.Logger.InfoContext(ctx, "streaming session started",
 		"session_id", sessionID, "entity_id", entityID, "mode", decision.Mode)
@@ -526,10 +546,11 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 			session.runErr = waitErr
 		}
 		session.mu.Unlock()
+		// One failure, one count. The wait goroutine is the only recorder, so a
+		// failure observed here and again by the startup branch below is no
+		// longer counted twice (S-12).
 		if waitErr != nil && runCtx.Err() == nil {
-			cfg.Metrics.IncCounter("astraeus_stream_errors_total",
-				"Segmented streaming failures: sessions that never produced a playlist, plus ffmpeg exiting unexpectedly.",
-				map[string]string{"mode": string(decision.Mode)})
+			recordStreamFailure(cfg.Metrics, observability.MetricStreamErrors, decision.Mode)
 			cfg.Logger.Error("ffmpeg exited unexpectedly",
 				"session_id", sessionID, "error", waitErr, "stderr", session.Diagnostics())
 		}
@@ -547,11 +568,13 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 		cfg.Metrics.IncCounter("astraeus_stream_sessions_total",
 			"Segmented streaming sessions, by mode and outcome.",
 			map[string]string{"mode": string(decision.Mode), "outcome": "failed"})
-		cfg.Metrics.IncCounter("astraeus_stream_errors_total",
-			"Segmented streaming failures: sessions that never produced a playlist, plus ffmpeg exiting unexpectedly.",
-			map[string]string{"mode": string(decision.Mode)})
+		// The error count belongs to the wait goroutine, which records it when
+		// ffmpeg exits unexpectedly - that is the only place that knows whether
+		// the failure was ffmpeg's or this context's. Counting again here
+		// inflated the metric (S-12), and the count is asynchronous, so there is
+		// no way to tell from here whether it has happened yet.
 		m.Stop(sessionID)
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", err, errFFmpegFailed)
 	}
 
 	cfg.Metrics.ObserveHistogram("astraeus_transcode_startup_seconds",
