@@ -164,3 +164,81 @@ func countOpaque(img *image.RGBA) int {
 	}
 	return count
 }
+
+// TestDecodePGSRLE_MatchesTheSpecification is the regression test for L-1.
+//
+// The decoder read a non-zero byte as "run length, then colour" instead of "one
+// pixel of that colour". The fixture encoder made the same misreading, so the
+// suite passed while real Blu-ray subtitles - whose anti-aliased edges are full
+// of single-pixel runs - decoded as garbage, and the swallowed byte misframed
+// every run after it.
+//
+// The reference is ffmpeg's pgssubdec.c, which reads a non-zero byte as the
+// colour with a run of one. The row used here is the one the review used:
+// 02 03 02 03 00 00, four single-pixel colours then an end of line. Read
+// correctly the pixels are 2,3,2,3; read as "count then colour" they are 1,1,1,1
+// or worse, which is exactly the difference that was invisible before.
+func TestDecodePGSRLE_MatchesTheSpecification(t *testing.T) {
+	t.Parallel()
+
+	const width, height = 4, 2
+
+	tests := []struct {
+		name string
+		// data is the object's RLE byte stream.
+		data []byte
+		want []byte
+	}{
+		{
+			// Four single-pixel colours, then a clear run of four to fill the
+			// 4x2 plane. This is the row shape the review used, and the reason
+			// the bug was invisible: read wrongly, the 02 is a run length and
+			// the 03 becomes its colour.
+			name: "a non-zero byte is one pixel of that colour",
+			data: []byte{0x02, 0x03, 0x02, 0x03, 0x00, 0x04},
+			want: []byte{2, 3, 2, 3, 0, 0, 0, 0},
+		},
+		{
+			name: "the escape forms still work",
+			// 0x00 0x83 0x05 is a short coloured run of three pixels of 5,
+			// 0x00 0x05 a short clear run of five.
+			data: []byte{0x00, 0x83, 0x05, 0x00, 0x05},
+			want: []byte{5, 5, 5, 0, 0, 0, 0, 0},
+		},
+		{
+			name: "a long coloured run",
+			// 0x00 0xC0 0x04 0x07 is a long run of four pixels of 7,
+			// 0x00 0x84 a short clear run of four.
+			data: []byte{0x00, 0xC0, 0x04, 0x07, 0x00, 0x04},
+			want: []byte{7, 7, 7, 7, 0, 0, 0, 0},
+		},
+		{
+			// The single-pixel form is what anti-aliased edges are made of, and
+			// it is the form whose neighbouring byte used to be eaten: read as a
+			// count, the 0x09 consumed the 0x00 that opens the next escape.
+			name: "a single pixel does not swallow the next escape",
+			data: []byte{0x09, 0x00, 0x83, 0x04, 0x00, 0x04},
+			want: []byte{9, 4, 4, 4, 0, 0, 0, 0},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := decodePGSRLE(tt.data, width, height)
+			if err != nil {
+				t.Fatalf("decodePGSRLE: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("decoded %d pixels, want %d: %v", len(got), len(tt.want), got)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("pixel %d = %d, want %d\n got %v\nwant %v",
+						i, got[i], tt.want[i], got, tt.want)
+				}
+			}
+		})
+	}
+}

@@ -17,14 +17,22 @@ import (
 // ScanResult summarises what a scan actually did. It is returned to callers
 // (CLI and API) so a scan can be reported without guessing.
 type ScanResult struct {
-	FilesSeen       int      `json:"files_seen"`
-	EntitiesCreated int      `json:"entities_created"`
-	EntitiesReused  int      `json:"entities_reused"`
-	ObjectsCreated  int      `json:"objects_created"`
-	ObjectsUpdated  int      `json:"objects_updated"`
-	ObjectsPruned   int      `json:"objects_pruned"`
-	EntitiesPruned  int      `json:"entities_pruned"`
-	Warnings        []string `json:"warnings,omitempty"`
+	FilesSeen       int `json:"files_seen"`
+	EntitiesCreated int `json:"entities_created"`
+	EntitiesReused  int `json:"entities_reused"`
+	ObjectsCreated  int `json:"objects_created"`
+	ObjectsUpdated  int `json:"objects_updated"`
+	ObjectsPruned   int `json:"objects_pruned"`
+	EntitiesPruned  int `json:"entities_pruned"`
+	// Warnings are paths the scan could not read. They mean its view of the disk
+	// may be incomplete, so a prune is refused while any remain.
+	Warnings []string `json:"warnings,omitempty"`
+	// Notices are files the scan read but could not place in the library
+	// hierarchy - a multi-episode name, an unrecognised pattern, a sample file.
+	// The file is visible and simply not catalogued, so a notice does not mean
+	// the disk view is incomplete and does not block a prune (L-7 of the
+	// 2026-10-09 review).
+	Notices []string `json:"notices,omitempty"`
 }
 
 // Scanner walks a library directory and persists what it finds. It is
@@ -47,7 +55,26 @@ func NewScanner(repo Repository, logger *slog.Logger) *Scanner {
 type entitySpec struct {
 	Type EntityType
 	Name string
-	Meta *MetadataSet
+	// Identity is what makes this the same entity across scans. It is set from
+	// structured data - a movie's title and year, an episode's season and
+	// number - and is deliberately independent of the display name, so a
+	// renamed file keeps its entity and a remake keeps its own.
+	Identity string
+	Meta     *MetadataSet
+}
+
+// identityFor returns the identity to key an entity on.
+//
+// A spec that sets one uses it. Otherwise the display name is the best
+// available answer - it is what the entity's own kind is keyed on, and a
+// container's name comes from its directory rather than from a file name that
+// changes. Being explicit about that fallback keeps the rule in one place
+// instead of leaving it implied at every call site.
+func identityFor(spec entitySpec) string {
+	if spec.Identity != "" {
+		return spec.Identity
+	}
+	return spec.Name
 }
 
 // ScanLibrary walks lib.Path and reconciles the database with the files found.
@@ -58,10 +85,35 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 	if err != nil {
 		return result, fmt.Errorf("resolving library path %q: %w", lib.Path, err)
 	}
+
+	// The root is resolved to a real path before anything walks it.
+	//
+	// os.Stat follows a symbolic link but filepath.WalkDir does not: it lstats
+	// the root, sees something that is not a directory, and stops. So a library
+	// registered as a symlink - the ordinary shape in a Docker or NAS setup,
+	// where /media is a link to the real volume - reported zero files and said
+	// nothing about why (L-5 of the 2026-10-09 review).
+	resolved, resolveErr := filepath.EvalSymlinks(root)
+	if resolveErr != nil {
+		// An unresolvable root is a real error, not a link to be ignored: the
+		// path exists for Stat but cannot be followed.
+		return result, fmt.Errorf("resolving library path %q: %w", lib.Path, resolveErr)
+	}
+	root = resolved
+
 	if info, statErr := os.Stat(root); statErr != nil {
 		return result, fmt.Errorf("library path %q: %w", lib.Path, statErr)
 	} else if !info.IsDir() {
 		return result, fmt.Errorf("library path %q is not a directory", lib.Path)
+	}
+
+	// If the root is still a link, EvalSymlinks left it alone and the walk is
+	// about to see a non-directory and stop. Saying so beats reporting an empty
+	// library with no explanation.
+	if info, lstatErr := os.Lstat(root); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		result.Warnings = append(result.Warnings,
+			fmt.Sprintf("%s is a symbolic link that could not be resolved, so it was not walked", lib.Path))
+		s.logger.WarnContext(ctx, "library root is an unresolved symbolic link", "path", lib.Path)
 	}
 
 	// tally accumulates the distinct entities this pass touches.
@@ -89,7 +141,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 			}
 			return nil
 		}
-		if naming.IsIgnored(entry.Name()) || !naming.IsVideoFile(path) {
+		if naming.IsIgnoredFile(entry.Name()) || !naming.IsVideoFile(path) {
 			return nil
 		}
 
@@ -121,7 +173,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 		"entities_created", result.EntitiesCreated,
 		"entities_reused", result.EntitiesReused,
 		"objects_created", result.ObjectsCreated,
-		"warnings", len(result.Warnings))
+		"warnings", len(result.Warnings), "notices", len(result.Notices))
 	return result, nil
 }
 
@@ -169,6 +221,12 @@ func (s *Scanner) pruneMissing(ctx context.Context, lib *Library, seenPaths map[
 			"library", lib.Name, "warnings", len(result.Warnings))
 		return PruneResult{}, nil
 	}
+	if len(result.Notices) > 0 {
+		// A notice is not a reason to refuse. It is logged so an operator can
+		// see what was not catalogued.
+		s.logger.InfoContext(ctx, "pruning despite files that could not be classified",
+			"library", lib.Name, "notices", len(result.Notices))
+	}
 
 	if result.FilesSeen == 0 {
 		existing, err := s.repo.ListEntitiesByLibrary(ctx, lib.ID)
@@ -201,8 +259,14 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 
 	containers, leaf, ok := PlacementFor(lib, rel, absPath)
 	if !ok {
+		// A notice rather than a warning: the file was read, and it is on disk
+		// where the scan can see it. Failing to classify it says nothing about
+		// whether the scan's view of the library is complete, and treating it as
+		// though it did meant one unplaceable file - a multi-episode name, say -
+		// disabled pruning for its whole library forever. Deleting an episode
+		// then left its entity in place for good (L-7).
 		msg := fmt.Sprintf("%s: could not be placed in the library hierarchy; skipped", rel)
-		result.Warnings = append(result.Warnings, msg)
+		result.Notices = append(result.Notices, msg)
 		s.logger.WarnContext(ctx, "skipping unplaceable file", "file", rel, "library_kind", lib.Kind)
 		return nil
 	}
@@ -211,7 +275,7 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 		var parentID *string
 
 		for _, spec := range containers {
-			entity, err := tx.FindEntity(ctx, lib.ID, parentID, spec.Type, spec.Name)
+			entity, err := tx.FindEntity(ctx, lib.ID, parentID, spec.Type, identityFor(spec))
 			if err != nil {
 				if !errors.Is(err, ErrNotFound) {
 					return err
@@ -227,7 +291,7 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 			parentID = &entity.ID
 		}
 
-		leafEntity, err := tx.FindEntity(ctx, lib.ID, parentID, leaf.Type, leaf.Name)
+		leafEntity, err := tx.FindEntity(ctx, lib.ID, parentID, leaf.Type, identityFor(leaf))
 		if err != nil {
 			if !errors.Is(err, ErrNotFound) {
 				return err
@@ -239,6 +303,18 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 			tally.markCreated(leafEntity.ID)
 		} else {
 			tally.markReused(leafEntity.ID)
+			// The entity is the same one, but what it is called can have
+			// changed: renaming "Show S01E01.mkv" to "Show S01E01 - Pilot.mkv"
+			// makes the display name follow the file. The identity is what makes
+			// it the same entity, so the name is now free to move - and leaving
+			// it stale would show a viewer the old title after a rename (L-8).
+			if leaf.Name != "" && leafEntity.Name != leaf.Name {
+				leafEntity.Name = leaf.Name
+				leafEntity.UpdatedAt = s.now()
+				if err := tx.UpdateEntity(ctx, leafEntity); err != nil {
+					return err
+				}
+			}
 		}
 
 		existing, err := tx.GetObjectByPath(ctx, absPath)
@@ -281,6 +357,7 @@ func (s *Scanner) newEntity(libraryID string, parentID *string, spec entitySpec)
 		ParentID:  parentID,
 		Type:      spec.Type,
 		Name:      spec.Name,
+		Identity:  identityFor(spec),
 		Status:    StatusIncomplete,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -298,7 +375,7 @@ func PlacementFor(lib *Library, relPath, absPath string) (containers []entitySpe
 		leaf, ok = moviePlacement(relPath, absPath)
 		return nil, leaf, ok
 	case ShowsLibrary:
-		return showPlacement(relPath, absPath)
+		return showPlacement(relPath)
 	default:
 		return nil, entitySpec{}, false
 	}
@@ -329,11 +406,15 @@ func moviePlacement(relPath, absPath string) (entitySpec, bool) {
 	spec := entitySpec{Type: MovieEntity, Name: title}
 	if year != 0 {
 		spec.Meta = &MetadataSet{Extra: map[string]string{"year": fmt.Sprint(year)}}
+		// Two films can share a title - Dune (1984) and Dune (2021) - and
+		// without the year in the identity they became one entity with two
+		// files, enriched as whichever year happened to arrive first (L-6).
+		spec.Identity = fmt.Sprintf("%s (%d)", title, year)
 	}
 	return spec, true
 }
 
-func showPlacement(relPath, absPath string) ([]entitySpec, entitySpec, bool) {
+func showPlacement(relPath string) ([]entitySpec, entitySpec, bool) {
 	info, ok := naming.ParseEpisodePath(relPath)
 	if !ok || info.Series == "" {
 		return nil, entitySpec{}, false
@@ -353,5 +434,14 @@ func showPlacement(relPath, absPath string) ([]entitySpec, entitySpec, bool) {
 		"season":  fmt.Sprint(info.Season),
 		"episode": fmt.Sprint(info.Episode),
 	}}
-	return containers, entitySpec{Type: EpisodeEntity, Name: name, Meta: meta}, true
+	// The identity is the episode number alone, scoped by its season above it.
+	// The name carries the release's own title, which changes when a file is
+	// renamed - and with the name as the identity, a rename deleted the entity
+	// and took the viewer's progress with it (L-8).
+	return containers, entitySpec{
+		Type:     EpisodeEntity,
+		Name:     name,
+		Identity: fmt.Sprintf("S%02dE%02d", info.Season, info.Episode),
+		Meta:     meta,
+	}, true
 }

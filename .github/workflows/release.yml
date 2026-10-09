@@ -35,8 +35,16 @@ jobs:
   gate:
     name: Gate on the unit tests
     runs-on: ubuntu-latest
+    # The gate runs every test and all dependency code, so it does not need the
+    # write tokens the publish and image jobs do. Those jobs declare their own.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Without this the workflow-level token is left in the checkout and
+          # every later step in the job inherits it.
+          persist-credentials: false
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -49,6 +57,12 @@ jobs:
         run: |
           go vet ./...
           go test -count=1 ./...
+      # A release publishes a binary built by the pinned toolchain, so the scan
+      # that decides whether that toolchain is fit to ship belongs in the gate
+      # and not only in CI, where it does not run on a tag.
+      - uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
+        with:
+          go-package: ./...
 
   version:
     name: Resolve the version
@@ -97,6 +111,8 @@ jobs:
     needs: [version, binaries]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the Release
     steps:
       # gh has to know which repository it is releasing into, and it infers that
       # from the git remote. Without a checkout this job has no repository and
@@ -121,6 +137,9 @@ jobs:
     name: Build and push the container image
     needs: [gate, version]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to GHCR
     steps:
       - uses: actions/checkout@v7
       # GHCR requires a lower-case repository path.

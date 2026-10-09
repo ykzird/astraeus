@@ -21,12 +21,15 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ykzird/astraeus/internal/ffmpegprocess"
 )
 
 // ocrPageSegmentation tells tesseract to treat the image as one uniform block
@@ -40,13 +43,13 @@ const ocrPageSegmentation = "6"
 const ocrMergeWindow = 40 * time.Millisecond
 
 // OCRSupportsCodec reports whether this OCR path can read a given image
-// subtitle codec. Only HDMV PGS is implemented: it is the format the parser
-// decodes and the one this project can build a fixture for. VobSub
-// (dvd_subtitle) is also a bitmap format, but it lives in a different
-// container with a different palette, so it stays burn-only rather than being
-// advertised and then failing when the extractor rejects it.
+// subtitle codec. Two are implemented: HDMV PGS, the format the PGS parser
+// decodes, and VobSub (dvd_subtitle), whose picture stream and container
+// palette the VobSub parser decodes. DVB subtitles are still burn-only: their
+// palette and composition live in the stream itself, and no decoder for them
+// has been written, so advertising one would fail inside the extractor.
 func OCRSupportsCodec(codec string) bool {
-	return strings.EqualFold(codec, "hdmv_pgs_subtitle")
+	return strings.EqualFold(codec, "hdmv_pgs_subtitle") || strings.EqualFold(codec, "dvd_subtitle")
 }
 
 // OCRReady reports whether the OCR engine is present. A caller uses it to
@@ -81,7 +84,7 @@ func (s *Service) ConvertImage(ctx context.Context, mediaPath string, trackIndex
 		return "", fmt.Errorf("%s is a directory", mediaPath)
 	}
 
-	target := filepath.Join(s.cacheDir, s.cacheKeyFor(mediaPath, info, trackIndex, "ocr")+".vtt")
+	target := filepath.Join(s.cacheDir, s.cacheKeyFor(mediaPath, info, trackIndex, ocrCacheMode)+".vtt")
 	if cached, err := os.Stat(target); err == nil && cached.Size() > 0 {
 		s.logger.DebugContext(ctx, "serving cached OCR subtitles", "track", trackIndex)
 		return target, nil
@@ -103,42 +106,80 @@ type ocrCue struct {
 // ocrExtract demuxes the image subtitle stream, decodes it and recognises every
 // cue, then commits the WebVTT atomically.
 func (s *Service) ocrExtract(ctx context.Context, mediaPath string, trackIndex int, target string) error {
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	// The recognition budget, not the extraction one: this runs tesseract once
+	// per cue (L-13).
+	ctx, cancel := context.WithTimeout(ctx, s.ocrTimeout)
 	defer cancel()
 
-	supPath, cleanup, err := s.extractPGSStream(ctx, mediaPath, trackIndex)
+	codec, ordinal, err := s.imageSubtitleCodec(ctx, mediaPath, trackIndex)
 	if err != nil {
 		return err
 	}
+
+	// Two formats, two extractions and two decoders. Each extraction knows
+	// where its format keeps the palette: PGS carries it in the stream, so the
+	// stream alone is enough, while VobSub keeps it in the container, so the
+	// extraction has to keep a container that has one and hand the palette on.
+	var (
+		path    string
+		palette string
+		// stream hands each cue to the caller as it is decoded, so the images
+		// are recognised and dropped one at a time.
+		stream  func(io.Reader, func(ImageCue) error) error = StreamPGS
+		cleanup func()
+	)
+	if strings.EqualFold(codec, "dvd_subtitle") {
+		extracted, err := s.extractVobSubStream(ctx, mediaPath, ordinal)
+		if err != nil {
+			return err
+		}
+		path, palette, cleanup = extracted.path, extracted.palette, extracted.cleanup
+		stream = func(r io.Reader, emit func(ImageCue) error) error {
+			return StreamVobSub(r, palette, emit)
+		}
+	} else {
+		supPath, remove, err := s.extractPGSStream(ctx, mediaPath, trackIndex)
+		if err != nil {
+			return err
+		}
+		path, cleanup = supPath, remove
+	}
 	defer cleanup()
 
-	file, err := os.Open(supPath)
+	// The cues are consumed one at a time rather than collected first. A
+	// decoded bitmap is an RGBA image - a 4K one is tens of megabytes - and a
+	// feature-length track has thousands of them, so collecting the whole track
+	// before recognising any of it holds every image in memory at once. What is
+	// kept is the text, which is what the caller actually needs (L-3 of the
+	// 2026-10-09 review).
+	var recognised []ocrCue
+
+	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening the extracted image subtitle stream: %w", err)
 	}
-	cues, parseErr := ParsePGS(file)
-	closeErr := file.Close()
-	if parseErr != nil {
-		return fmt.Errorf("decoding image subtitle track %d of %s: %w", trackIndex, mediaPath, parseErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("closing the extracted image subtitle stream: %w", closeErr)
-	}
-
-	recognised := make([]ocrCue, 0, len(cues))
-	for _, cue := range cues {
+	streamErr := stream(file, func(cue ImageCue) error {
 		if cue.Image == nil {
-			continue
+			return nil
 		}
 		text, err := s.recognise(ctx, cue.Image)
 		if err != nil {
 			return err
 		}
 		if text == "" {
-			continue
+			return nil
 		}
 		recognised = mergeOCRCue(recognised, ocrCue{start: cue.Start, end: cue.End, text: text})
+		return nil
+	})
+	closeErr := file.Close()
+	if streamErr != nil {
+		return fmt.Errorf("decoding image subtitle track %d of %s: %w", trackIndex, mediaPath, streamErr)
 	}
+	if closeErr != nil {
+		return fmt.Errorf("closing the extracted image subtitle stream: %w", closeErr)
+	}
+
 	if len(recognised) == 0 {
 		return fmt.Errorf("%w (OCR found no text in track %d)", ErrNoCues, trackIndex)
 	}
@@ -166,6 +207,44 @@ func (s *Service) ocrExtract(ctx context.Context, mediaPath string, trackIndex i
 	return nil
 }
 
+// imageSubtitleCodec reports the codec of the subtitle track the caller asked
+// about, so the extraction knows which container handling it needs.
+//
+// The caller names the track by its global stream index, which is what ffprobe
+// reports as `index` and what an ffmpeg `-map 0:N` takes. ffprobe's own `s:N`
+// selector counts only subtitle streams, so that ordinal is returned too: a
+// file with video and audio numbers its subtitle streams from zero and the two
+// numbers differ immediately.
+func (s *Service) imageSubtitleCodec(ctx context.Context, mediaPath string, trackIndex int) (string, int, error) {
+	cmd := exec.CommandContext(ctx, s.ffprobeBin,
+		"-v", "error",
+		"-select_streams", "s",
+		"-show_entries", "stream=index,codec_name",
+		"-of", "csv=p=0",
+		mediaPath,
+	)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", 0, fmt.Errorf("identifying subtitle track %d of %s: %w", trackIndex, mediaPath, err)
+	}
+	ordinal := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Split(strings.TrimSpace(line), ",")
+		if len(fields) < 2 {
+			continue
+		}
+		index, convErr := strconv.Atoi(fields[0])
+		if convErr != nil {
+			continue
+		}
+		if index == trackIndex {
+			return fields[1], ordinal, nil
+		}
+		ordinal++
+	}
+	return "", 0, fmt.Errorf("%w: %s has no subtitle track %d", ErrNoCues, mediaPath, trackIndex)
+}
+
 // extractPGSStream copies the chosen subtitle stream out of the media file into
 // a raw .sup, which is what the decoder reads. ffmpeg demuxes but does not
 // decode, so the bitmap that arrives is the one the file holds.
@@ -181,16 +260,17 @@ func (s *Service) extractPGSStream(ctx context.Context, mediaPath string, trackI
 		return "", func() {}, fmt.Errorf("closing the temporary image subtitle stream: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, s.ffmpegBin,
-		"-hide_banner",
-		"-loglevel", "error",
-		"-y",
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	// A library file is a path, but ffmpeg reads an input as a URL (S-17).
+	args = append(args, ffmpegprocess.Args()...)
+	args = append(args,
 		"-i", mediaPath,
 		"-map", "0:"+strconv.Itoa(trackIndex),
 		"-c:s", "copy",
 		"-f", "sup",
 		name,
 	)
+	cmd := exec.CommandContext(ctx, s.ffmpegBin, args...)
 	output, runErr := cmd.CombinedOutput()
 	if runErr != nil {
 		cleanup()

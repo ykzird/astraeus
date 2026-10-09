@@ -23,8 +23,21 @@
      (web/core.test.js). Aliasing them here keeps every call site below reading
      exactly as it did when they were local. */
   const {
-    formatClock, mediaTime, pad2, producedWindow, sourceTime,
+    FINISHED_FRACTION, RESUME_MIN_SECONDS,
+    formatClock, mediaTime, pad2, producedWindow, progressAction, sourceTime,
     subtitleDeliverable, subtitleNeedsBurn,
+  } = window.AstraeusCore;
+  /* Aliased because the local wrapper below keeps the name call sites use. */
+  const { resumeOffsetFor: resumeOffsetFromProgress } = window.AstraeusCore;
+  const { awaitJob: awaitJobOutcome, JOB_WAIT_MS: awaitJobWaitMs } = window.AstraeusCore;
+  const {
+    ENGINE_NATIVE: ENGINE_NATIVE, ENGINE_NATIVE_HLS: ENGINE_NATIVE_HLS,
+    ENGINE_HLS_JS: ENGINE_HLS_JS, engineLabel: engineLabelFor,
+    subtitleSelectable: subtitleSelectable, orphanedSessionId: orphanedSessionId,
+    shouldRenegotiateAfterFailure: shouldRenegotiateAfterFailure,
+    fetchFailure: fetchFailure, rollbackSubtitleSelection: rollbackSubtitleSelection,
+    unloadTeardownIsPending: unloadTeardownIsPending, bfcacheRestore: bfcacheRestore,
+    prunedSummary: prunedSummary, shouldCheckHealth: shouldCheckHealth,
   } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */
@@ -221,26 +234,34 @@
       });
     } catch (error) {
       clearTimeout(timer);
-      if (error && error.name === "AbortError") {
-        throw new ApiError(
-          "The request to the Astraeus API timed out after " +
-            Math.round(REQUEST_TIMEOUT_MS / 1000) +
-            " seconds.",
-          { path: path, code: "timeout" }
-        );
+      const failure = fetchFailure("send", error, REQUEST_TIMEOUT_MS);
+      if (failure.kind === "timeout") {
+        throw new ApiError(failure.message, { path: path, code: "timeout" });
       }
       throw new ApiError(
         "Could not reach the Astraeus API (" + API_BASE + path + "). Is the server running?",
         { path: path, code: "network" }
       );
     }
-    clearTimeout(timer);
 
+    /* The timer stays armed while the body is read. Clearing it here cleared it
+       once the headers had arrived, so a server that sent a Content-Length and
+       then stalled mid-body hung the request forever - and the module header's
+       claim that every fetch has a timeout was false for exactly that case
+       (W-9 of the 2026-10-09 review). */
     let text = "";
     try {
       text = await response.text();
     } catch (error) {
+      const failure = fetchFailure("body", error, REQUEST_TIMEOUT_MS);
+      if (failure.kind === "timeout") {
+        throw new ApiError(failure.message, { path: path, code: "timeout" });
+      }
+      /* A body that failed to arrive for another reason is treated as empty, so
+         the status still decides what the caller is told. */
       text = "";
+    } finally {
+      clearTimeout(timer);
     }
 
     if (!response.ok) {
@@ -307,6 +328,13 @@
     },
     enrich: function () {
       return apiFetch("metadata/enrich", { method: "POST" });
+    },
+    /* A job's state and, once it has finished, its result. Scanning and
+       enriching answer 202 with one of these to poll rather than holding the
+       request open, because the request used to be cancelled by the client's own
+       timeout partway through a large library (W-2). */
+    job: function (id) {
+      return apiFetch("jobs/" + encodeURIComponent(id));
     },
     /* Negotiates delivery for one entity. The body is a client capability
        manifest plus where in the source to begin; see playbackRequestBody().
@@ -537,7 +565,9 @@
       currentTime: 0,
       seeking: false,
       started: false,
-      /* "native" for a direct file or native HLS, "hls.js" for MSE. */
+      /* One of ENGINE_NATIVE, ENGINE_NATIVE_HLS or ENGINE_HLS_JS; core.js owns
+         the names and the wording, so a comparison cannot drift from what the
+         player sets. */
       engine: null,
       /* True whenever delivery is segmented, i.e. generated while playing. */
       segmented: false,
@@ -1603,19 +1633,31 @@
     for (const sub of list) {
       const key = subtitleKey(sub);
       /* An image track with no URL has no way to reach a <track>, so the only
-         way it can be shown is burned into the picture. Offer it anyway and say
-         so in the label: the choice is real, it just costs a server-side
-         re-encode rather than an instant toggle. An image track the server has
-         read into text carries a URL and is offered like any other. */
-      const label = subtitleNeedsBurn(sub)
-        ? subtitleLabel(sub) + " (burned in)"
-        : subtitleLabel(sub);
+         way it can be shown is burned into the picture. Offer it and say so in
+         the label: the choice is real, it just costs a server-side re-encode
+         rather than an instant toggle. An image track the server has read into
+         text carries a URL and is offered like any other.
+
+         A track that can be neither delivered nor burned is listed as disabled
+         and says why. Offering it as a working control meant choosing it
+         repainted the radio and then did nothing, which reads as a broken
+         player (W-6 of the 2026-10-09 review). */
+      const selectable = subtitleSelectable(sub);
+      let label = subtitleLabel(sub);
+      if (!selectable) {
+        label += " (unavailable)";
+      } else if (subtitleNeedsBurn(sub)) {
+        label += " (burned in)";
+      }
       options.push(
         subtitleOptionNode({
           key: key,
           label: label,
-          checked: pb.subtitleSelection === key,
-          disabled: !live,
+          /* A track that cannot be chosen is not shown as chosen, even if the
+             stored preference names it - a checked radio that does nothing is
+             the bug. */
+          checked: selectable && pb.subtitleSelection === key,
+          disabled: !live || !selectable,
         })
       );
     }
@@ -1761,7 +1803,7 @@
       if (pb.mode === "direct_play") {
         return "Direct play: the server is sending the original file over HTTP range requests, so seeking is exact.";
       }
-      const engine = pb.engine === "native" ? "the browser's native HLS support" : "the bundled hls.js player over MSE";
+      const engine = engineLabelFor(pb.engine);
       return (
         "Segmented delivery via " +
         engine +
@@ -1919,6 +1961,11 @@
       formatCount(info.objects_created) + " objects added",
       formatCount(info.objects_updated) + " objects updated",
     ];
+    /* Pruning, when there was any: the one number that says the scan removed
+       something (W-10). */
+    for (const pruned of prunedSummary(info)) {
+      parts.push(formatCount(pruned.count) + " " + pruned.label);
+    }
     const warnings = Array.isArray(info.warnings) ? info.warnings : [];
     return (
       "Scan complete — " +
@@ -1944,6 +1991,49 @@
 
   /* ── 9. Actions ──────────────────────────────────────────────────────── */
 
+
+  /** How often a job's state is polled while it runs. */
+  const JOB_POLL_MS = 1000;
+
+  /**
+   * Wait for a job the server accepted and return its result, or throw.
+   *
+   * The decision - how long to wait, what a finished job with an error means,
+   * what an inline answer means - is `core.js`'s awaitJob, which is unit-tested.
+   * This only supplies the browser's clock and the API call.
+   */
+  async function awaitJob(accepted, onProgress) {
+    const outcome = await awaitJobOutcome(accepted, {
+      intervalMs: JOB_POLL_MS,
+      sleep: function (ms) {
+        return new Promise(function (resolve) {
+          setTimeout(resolve, ms);
+        });
+      },
+      status: function (id) {
+        return api.job(id);
+      },
+      onProgress: onProgress,
+    });
+
+    if (outcome.outcome === "timeout") {
+      throw new ApiError(
+        "The server is still working on this after " +
+          Math.round(awaitJobWaitMinutes()) +
+          " minutes. It has not been cancelled; reload the page to see the result.",
+        { code: "job_timeout" }
+      );
+    }
+    if (outcome.outcome === "failed") {
+      throw new ApiError(outcome.error, { code: "job_failed" });
+    }
+    return outcome.value;
+  }
+
+  function awaitJobWaitMinutes() {
+    return awaitJobWaitMs / 60000;
+  }
+
   async function doScan(libraryId) {
     if (state.busyAction) return;
     const library = state.libraries.find(function (item) {
@@ -1954,7 +2044,18 @@
     clearError();
     render();
     try {
-      const result = await api.scan(libraryId);
+      /* The scan is accepted rather than performed, so the caller waits for it
+         and refreshes the list as it goes: on a large library that is the
+         difference between a spinner and watching the titles appear. */
+      const accepted = await api.scan(libraryId);
+      const result = await awaitJob(accepted, function () {
+        if (state.libraryId === libraryId) {
+          refreshEntities(libraryId).catch(function () {
+            /* A refresh that fails mid-scan is not the scan failing; the
+               completed pass below refreshes again. */
+          });
+        }
+      });
       if (state.libraryId === libraryId) {
         await refreshEntities(libraryId);
       }
@@ -1986,7 +2087,12 @@
     clearError();
     render();
     try {
-      const result = await api.enrich();
+      const accepted = await api.enrich();
+      const result = await awaitJob(accepted, function (status) {
+        /* Enrichment is per entity, so the count is the useful progress. */
+        if (typeof status.result !== "undefined") return;
+        setActionStatus("Enriching…", "ok");
+      });
       if (state.libraryId) await refreshEntities(state.libraryId);
       if (state.detail) await loadEntity(state.detail.entity.id, currentToken());
       const summary = enrichSummary(result);
@@ -2263,11 +2369,12 @@
      The server has its own rule for the other end — a report in the closing
      minutes is treated as finished and clears the row instead. */
 
-  const RESUME_MIN_SECONDS = 5;
+  /* RESUME_MIN_SECONDS and FINISHED_FRACTION come from core.js with
+     progressAction, so the decision and the numbers it uses cannot drift. */
   /* The server's own rule for the other end: a position in the last 5% is
      "watched through" and is cleared rather than stored. Mirrored locally so a
      remembered position can never offer a resume the server has refused. */
-  const FINISHED_FRACTION = 0.95;
+
   /* A report on every timeupdate would be several PUTs a second for a number
      that barely moved; ten seconds of playback is the most that can be lost
      to a crash or a hard close. */
@@ -2289,18 +2396,11 @@
   function resumeOffsetFor(entity) {
     const detail = state.detail;
     if (!detail || !detail.entity || detail.entity.id !== entity.id) return 0;
-    if (!isLeafType(entity.type)) return 0;
-    const progress = detail.progress;
-    if (!progress || typeof progress !== "object") return 0;
-    if (progress.finished === true) return 0;
-    const position = Number(progress.position_seconds);
-    if (!isFinite(position) || position < RESUME_MIN_SECONDS) return 0;
-    /* A stored position can outlive the file it was measured against — a
-       different release of the same film, say — and the server rejects a start
-       at or past the end outright. Refusing to resume is the honest answer. */
-    const duration = Number(progress.duration_seconds);
-    if (isFinite(duration) && duration > 0 && position >= duration - 0.5) return 0;
-    return position;
+    /* The decision itself is pure and lives in core.js, next to the report
+       path's, because the two used to disagree: a position in the last half
+       second was "too near the end to resume" here while the report path called
+       anything in the last 5% finished. One rule now decides both. */
+    return resumeOffsetFromProgress(detail.progress, isLeafType(entity.type));
   }
 
   /**
@@ -2330,9 +2430,31 @@
 
     const duration = sourceDurationOf(pb);
     const position = currentSourceTime(pb);
-    rememberProgress(pb.entityId, position, duration);
+
+    /* What to do with this report is a pure decision, in core.js, because the
+       case that lost data was a disagreement between two callers: the request
+       and the local copy each applied their own rule, and both of them read a
+       position of 0 as "the viewer is at the beginning".
+       `pb.started` is the flag the play handler sets, so a report from before
+       playback began says nothing about where the viewer is. StartVideo sets
+       status "ready" synchronously, before a byte of media has loaded, and
+       stopping or navigating away inside that window used to send 0 - which the
+       old code answered with a DELETE. The bookmark was gone (W-1 of the
+       2026-10-09 review). */
+    const action = progressAction({
+      started: pb.started === true,
+      position: position,
+      duration: duration,
+    });
+    if (action === "skip") return;
+
+    /* The local copy takes the same decision as the request, so the detail can
+       never claim a position the server was not told about, or keep offering a
+       resume the server has cleared. */
+    rememberProgress(pb.entityId, action === "save" ? position : null, duration);
+
     const attempt =
-      position >= RESUME_MIN_SECONDS
+      action === "save"
         ? api.saveProgress(pb.entityId, { position_seconds: position, duration_seconds: duration }, opts)
         : api.clearProgress(pb.entityId, opts);
     attempt.then(
@@ -2383,7 +2505,11 @@
   function rememberProgress(entityId, position, duration) {
     const detail = state.detail;
     if (!detail || !detail.entity || detail.entity.id !== entityId) return;
-    if (position < RESUME_MIN_SECONDS || (duration > 0 && position >= duration * FINISHED_FRACTION)) {
+    /* `position` is the decision's answer: a number to remember, or null to
+       forget. It does not re-decide, because that re-decision is what cleared
+       the bookmark - a passive report of 0 was read here as "at the beginning"
+       even when the request path had already decided to say nothing. */
+    if (position === null || position === undefined) {
       detail.progress = null;
       return;
     }
@@ -2446,6 +2572,27 @@
       } catch (error) {
         /* fall through to the failure path */
       }
+    }
+
+    /* Both recoveries have been tried. Before reporting a failure, ask the server
+       for a new session at where the viewer is: a session it has reaped answers
+       404, and `startLoad()` above cannot bring it back, but a new session can.
+       This happens once - a second failure is real (S-10 of the 2026-10-09
+       review). */
+    const position = currentSourceTime(pb);
+    if (shouldRenegotiateAfterFailure({
+      sessionCurrent: state.playback === pb,
+      alreadyRenegotiated: recovery.renegotiated === true,
+      position: position,
+    })) {
+      recovery.renegotiated = true;
+      toast("The stream expired; resuming…", "info");
+      resumeSession({
+        startSeconds: position,
+        preferredHeight: pb.preferredHeight,
+        audioTrackIndex: pb.audioTrackIndex,
+      });
+      return;
     }
 
     failSegmentedPlayback(
@@ -2872,19 +3019,25 @@
       /* Asking for the burn already running would only re-buffer for nothing. */
       if (index === burnedSubtitleIndex(pb)) return;
       /* Set the choice before re-negotiating: the preference carries it across
-         the switch, exactly as it does for a text track. */
+         the switch, exactly as it does for a text track. The previous choice is
+         passed along because this line has already overwritten it, and a failed
+         switch has to roll back to what was showing rather than to the choice
+         that never took effect (W-3 of the 2026-10-09 review). */
+      const previous = pb.subtitleSelection;
       pb.subtitleSelection = next;
       resumeSession({
         startSeconds: currentSourceTime(pb),
         preferredHeight: pb.preferredHeight,
         audioTrackIndex: pb.audioTrackIndex,
         burnSubtitleIndex: index,
+        previousSubtitleSelection: previous,
       });
       return;
     }
 
     if (burnedSubtitleIndex(pb) > 0) {
       if (!pb.url || pb.qualityBusy) return;
+      const previous = pb.subtitleSelection;
       pb.subtitleSelection = next;
       resumeSession({
         startSeconds: currentSourceTime(pb),
@@ -2892,6 +3045,7 @@
         audioTrackIndex: pb.audioTrackIndex,
         /* 0 is the contract's "no burn", which stops the re-encode. */
         burnSubtitleIndex: 0,
+        previousSubtitleSelection: previous,
       });
       return;
     }
@@ -3550,7 +3704,7 @@
     const pb = state.playback;
     pb.status = "ready";
     pb.url = url;
-    pb.engine = "native";
+    pb.engine = ENGINE_NATIVE;
     pb.segmented = false;
     pb.controlsVisible = true;
     dom.playerLayer.hidden = false;
@@ -3640,7 +3794,7 @@
     instance.on(HlsCtor.Events.LEVEL_UPDATED, syncTransport);
     instance.on(HlsCtor.Events.LEVEL_LOADED, syncTransport);
 
-    pb.engine = "hls.js";
+    pb.engine = ENGINE_HLS_JS;
     pb.status = "ready";
     instance.attachMedia(playerVideo);
     instance.loadSource(url);
@@ -3708,8 +3862,14 @@
       /* Auto quality. The body still carries the full capability manifest,
          because a body replaces the server's browser defaults. */
       const result = await api.playback(entity.id, playbackRequestBody(resumeSeconds, null));
-      /* Navigation or Stop may have replaced the session during the request. */
-      if (state.playback !== session) return;
+      /* Navigation or Stop may have replaced the session during the request. The
+         server has already started ffmpeg for this one, so its id is released
+         rather than dropped: the reaper would otherwise be the only thing that
+         stopped it, and clicking through titles stacked transcodes (W-4). */
+      if (state.playback !== session) {
+        releaseStreamSession(orphanedSessionId(result, state.playback, session), true);
+        return;
+      }
       applyPlaybackResult(session, result, entity, { startSeconds: resumeSeconds, preferredHeight: null });
       startSessionMedia(session, entity, true);
       /* Direct play applies the offset client-side, so its sessionStart is 0
@@ -3961,7 +4121,7 @@
          a native HLS playlist still grows as ffmpeg produces it. */
       startVideo(pb.url, entity, resumePlaying !== false);
       pb.segmented = true;
-      pb.engine = "native-hls";
+      pb.engine = ENGINE_NATIVE_HLS;
       return;
     }
     startSegmented(pb.url, entity, resumePlaying !== false);
@@ -3999,7 +4159,11 @@
     const wasPlaying = !playerVideo.paused && !playerVideo.ended;
     const previousPreferredHeight = pb.preferredHeight;
     const previousAudioTrackIndex = pb.audioTrackIndex;
-    const previousSubtitleSelection = pb.subtitleSelection;
+    /* The caller's value when it has one: a caller that changed the selection
+       before asking for a re-negotiation is the only one that knows what was
+       showing, and pb.subtitleSelection already holds the new choice. */
+    const previousSubtitleSelection =
+      rollbackSubtitleSelection(opts.previousSubtitleSelection, pb.subtitleSelection);
     const previousSessionId = pb.sessionId;
     /* The tracks are about to be rebuilt from the new response, which carries
        the server's own `default` disposition again; carry the viewer's actual
@@ -4025,8 +4189,12 @@
         entity.id,
         playbackRequestBody(startSeconds, preferredHeight, audioTrackIndex, burnSubtitleIndex)
       );
-      /* Navigation or Stop may have replaced the session meanwhile. */
-      if (state.playback !== pb) return;
+      /* Navigation or Stop may have replaced the session meanwhile. Its
+         transcode is released rather than left to the reaper (W-4). */
+      if (state.playback !== pb) {
+        releaseStreamSession(orphanedSessionId(result, state.playback, pb), true);
+        return;
+      }
       applyPlaybackResult(pb, result, entity, {
         startSeconds: startSeconds,
         preferredHeight: preferredHeight,
@@ -4041,12 +4209,16 @@
       );
     } catch (error) {
       if (state.playback !== pb) return;
-      /* A failed switch is not fatal: say so and keep the session selectable. */
+      /* A failed switch is not fatal, but it is not recoverable in place either:
+         resumeSession tore the media down and released the old session before it
+         sent this request, so there is no old stream to keep playing and the
+         comments that claimed otherwise were false. What the rollback does keep
+         is the *choice* - the menu must not go on claiming one that never took
+         effect, and restoring it is what makes the next attempt start from where
+         the viewer was rather than from the failure. */
       pb.qualityBusy = false;
       pb.preferredHeight = previousPreferredHeight;
       pb.audioTrackIndex = previousAudioTrackIndex;
-      /* A failed burn switch left the old stream playing, so the menu must not
-         keep claiming the choice that never took effect. */
       pb.subtitleSelection = previousSubtitleSelection;
       pb.status = "error";
       pb.error = playbackErrorMessage(entity, error);
@@ -4111,14 +4283,27 @@
     loadContinueWatching();
   }
 
-  async function refreshEntities(libraryId) {
+  /**
+   * Load a library's entities into the shared state.
+   *
+   * `token` is the route token the caller was given. The list is not written
+   * unless it is still the current one: a slow library's answer arriving after
+   * the viewer moved on used to be written and only then discarded, which meant
+   * it had already overwritten the list on screen (W-7).
+   *
+   * Callers that do not care about staleness - the ones that are the only
+   * writer in their flow - pass the current token and get the old behaviour.
+   */
+  async function refreshEntities(libraryId, token) {
     const raw = await api.libraryEntities(libraryId);
     if (!Array.isArray(raw)) {
       throw new ApiError("The API did not return a list of entities.", { code: "unexpected_shape" });
     }
+    if (!entityListIsCurrent(token, state.loadToken)) return false;
     state.entities = raw;
     state.entitiesLibraryId = libraryId;
     for (const entity of raw) rememberEntity(entity);
+    return true;
   }
 
   async function loadEntity(entityId, token) {
@@ -4260,7 +4445,11 @@
       });
       if (!library) {
         state.libraryId = null;
-        state.entities = [];
+        /* Both fields, not just the list: a leftover id made the next view
+           render this library as an empty one (W-8). */
+        const cleared = clearedEntityList();
+        state.entities = cleared.entities;
+        state.entitiesLibraryId = cleared.entitiesLibraryId;
         state.loading = false;
         render();
         applyFocusTarget();
@@ -4278,8 +4467,8 @@
       setAmbient(library);
       render();
       try {
-        await refreshEntities(library.id);
-        if (token !== state.loadToken) return;
+        const current = await refreshEntities(library.id, token);
+        if (!current) return;
         state.entitiesFailed = false;
         clearError();
       } catch (error) {
@@ -4393,6 +4582,12 @@
     render();
   }
 
+  /* The pill is checked once at startup and then periodically. A single check told
+     the truth for as long as the tab stayed open: the server could stop, or come
+     back, and the pill went on saying whatever it said when the page loaded
+     (W-10). */
+  const HEALTH_INTERVAL_MS = 30000;
+
   async function checkHealth() {
     try {
       const health = await api.health();
@@ -4404,6 +4599,31 @@
       dom.healthPill.dataset.state = "down";
     }
   }
+
+  function startHealthChecks() {
+    checkHealth();
+    /* The listener is registered once, outside the timer guard below: inside it, a
+       second call would add a second listener and check twice per visibility change,
+       which is the same class of mistake as the double teardown this round is
+       fixing. */
+    if (!healthListenerRegistered) {
+      healthListenerRegistered = true;
+      /* A phone that was in the background comes back to a pill that has not been
+         checked in however long it was away, so becoming visible is its own check. */
+      document.addEventListener("visibilitychange", function () {
+        if (!shouldCheckHealth({ hidden: document.hidden })) return;
+        checkHealth();
+      });
+    }
+    if (healthTimer !== null) return;
+    healthTimer = setInterval(function () {
+      if (!shouldCheckHealth({ hidden: document.hidden })) return;
+      checkHealth();
+    }, HEALTH_INTERVAL_MS);
+  }
+
+  let healthTimer = null;
+  let healthListenerRegistered = false;
 
   /* ── 12. Events ──────────────────────────────────────────────────────── */
 
@@ -4517,9 +4737,24 @@
   /* Last chance to stop a transcoder: the tab is going away, so the request
      has to outlive the document. A beacon cannot issue DELETE, so this is a
      keepalive fetch instead. */
+  /* The session the leaving page already tore down, and where the viewer was. Both
+     are module state rather than part of state.playback, because the playback
+     object is rebuilt when the page comes back. */
+  let unloadReleasedSessionId = null;
+  let unloadResumePosition = 0;
+
   function releaseSessionOnUnload() {
     const pb = state.playback;
     if (!pb || !pb.url) return;
+    /* Both pagehide and beforeunload call this, so it does its work once. The
+       second DELETE asks for a session that is already gone (W-10). */
+    if (!unloadTeardownIsPending({ releasedSessionId: unloadReleasedSessionId, sessionId: pb.sessionId })) {
+      return;
+    }
+    unloadReleasedSessionId = pb.sessionId;
+    /* Remember where the viewer was, because the session is about to be gone and
+       a restored page has nothing else to resume from. */
+    unloadResumePosition = currentSourceTime(pb);
     /* The last position rides along with the stream teardown: keepalive is
        what lets both requests outlive the document. */
     reportProgress(pb, { final: true, keepalive: true });
@@ -4528,6 +4763,28 @@
 
   window.addEventListener("pagehide", releaseSessionOnUnload);
   window.addEventListener("beforeunload", releaseSessionOnUnload);
+
+  /* A page restored from the back/forward cache is the same document, but its
+     session was released as it was hidden - so the player has no url and cannot
+     resume by itself. Without this it sat dead, and the only way back was to
+     navigate in again. */
+  window.addEventListener("pageshow", function (event) {
+    const pb = state.playback;
+    const decision = bfcacheRestore({
+      persisted: event.persisted === true,
+      hasUrl: !!(pb && pb.url),
+      position: unloadResumePosition,
+    });
+    if (decision.action !== "renegotiate") return;
+
+    /* The document is alive again, so the next teardown is a new one. */
+    unloadReleasedSessionId = null;
+    resumeSession({
+      startSeconds: decision.position,
+      preferredHeight: pb.preferredHeight,
+      audioTrackIndex: pb.audioTrackIndex,
+    });
+  });
 
   /* ── Player overlay: interaction, auto-hide, fullscreen, shortcuts ───── */
 
@@ -4617,7 +4874,7 @@
     render();
     /* Prime the element with the remembered volume before anything plays. */
     applyAudioPreference();
-    checkHealth();
+    startHealthChecks();
     boot();
   }
 

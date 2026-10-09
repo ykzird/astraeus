@@ -35,6 +35,40 @@ func writePGSFixture(t *testing.T, dir string) string {
 	return path
 }
 
+// burnFixture builds the dark 640x360 clip with one white PGS cue and returns
+// the source path and the subtitle track the real prober found.
+func burnFixture(t *testing.T, dir string) (string, SubtitleTrack) {
+	t.Helper()
+
+	sup := writePGSFixture(t, dir)
+
+	// A flat, dark picture makes the white subtitle unambiguous: any bright
+	// pixel in the produced frame is the subtitle and nothing else.
+	base := filepath.Join(dir, "base.mp4")
+	runFFmpeg(t, "-f", "lavfi", "-i", "color=c=0x202020:s=640x360:r=15",
+		"-t", "6", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", base)
+
+	source := filepath.Join(dir, "source.mkv")
+	runFFmpeg(t, "-i", base, "-i", sup,
+		"-map", "0:v", "-map", "1:s", "-c:v", "copy", "-c:s", "copy", source)
+
+	prober := &FFProbe{binary: "ffprobe", timeout: 30 * time.Second}
+	info, err := prober.Probe(context.Background(), source)
+	if err != nil {
+		t.Fatalf("probing the fixture: %v", err)
+	}
+	for _, candidate := range info.Subtitles {
+		if candidate.Codec == "hdmv_pgs_subtitle" {
+			if candidate.Text {
+				t.Fatalf("the PGS track was classified as text: %+v", candidate)
+			}
+			return source, candidate
+		}
+	}
+	t.Fatalf("the fixture has no PGS subtitle track: %+v", info.Subtitles)
+	return "", SubtitleTrack{}
+}
+
 func runFFmpeg(t *testing.T, args ...string) {
 	t.Helper()
 
@@ -182,4 +216,67 @@ func padSegment(n int) string {
 		n /= 10
 	}
 	return string(digits)
+}
+
+// TestBurnIn_WorksOnAHardwareEncoder is the regression test for S-5.
+//
+// The burn graph used to apply the whole filter chain before compositing, and
+// for a hardware encoder that chain ends in hwupload. scale2ref and overlay are
+// software filters, so they were handed hardware frames and ffmpeg refused:
+// "Impossible to convert between the formats supported by the filter
+// 'Parsed_scale2ref_3' and the filter 'auto_scale_2'". Every burn on a VAAPI
+// host failed once and was retried in software, which cost a second ffmpeg
+// start and logged a misleading hardware failure.
+//
+// The test is skipped when this host has no usable hardware encoder, because
+// there is nothing to assert there; on a host that has one it composites the
+// subtitle through the hardware path and looks at the pixels.
+func TestBurnIn_WorksOnAHardwareEncoder(t *testing.T) {
+	requireFFmpeg(t)
+
+	server := DetectServerCapability(context.Background(), "ffmpeg", "ffprobe", "")
+	encoder := EncoderFor("h264", server)
+	if !isHardwareEncoder(encoder) {
+		t.Skipf("no usable hardware h264 encoder on this host (selected %q); "+
+			"this test is about the hardware burn path", encoder)
+	}
+	if server.RenderNode == "" {
+		t.Skip("a hardware encoder was selected with no render node to prove it ran on")
+	}
+
+	dir := t.TempDir()
+	source, track := burnFixture(t, dir)
+
+	prober := &FFProbe{binary: "ffprobe", timeout: 30 * time.Second}
+	info, err := prober.Probe(context.Background(), source)
+	if err != nil {
+		t.Fatalf("probing the fixture: %v", err)
+	}
+
+	capability := ClientCapability{
+		Containers: []string{"matroska", "hls"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true, Subtitles: true,
+		MaxWidth: 1920, MaxHeight: 1080, MaxBitDepth: 8, MaxAudioChannels: 2,
+		BurnSubtitleIndex: track.Index,
+	}
+
+	decision := NegotiateForServer(info, capability, server)
+	if decision.BurnedSubtitleIndex != track.Index {
+		t.Fatalf("negotiation did not burn track %d: %+v", track.Index, decision)
+	}
+
+	burnedDir := filepath.Join(dir, "burned-hardware")
+	if err := os.MkdirAll(burnedDir, 0o755); err != nil {
+		t.Fatalf("creating %s: %v", burnedDir, err)
+	}
+	args, err := BuildFFmpegArgs(burnedDir, source, decision, ManagerConfig{SegmentSeconds: 2, Server: server})
+	if err != nil {
+		t.Fatalf("building the hardware burn command: %v", err)
+	}
+	runFFmpeg(t, args...)
+
+	if bright := brightPixels(t, burnedDir, 1); bright < 10_000 {
+		t.Errorf("the hardware-burned segment has only %d bright pixels; the subtitle is missing", bright)
+	}
+	t.Logf("burned in through %s (render node %s)", encoder, server.RenderNode)
 }

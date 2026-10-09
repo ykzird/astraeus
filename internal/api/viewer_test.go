@@ -25,6 +25,7 @@ func newProxyGate(t *testing.T) *access.Gate {
 
 	gate, err := access.New(access.Config{
 		Mode:           access.ModeProxy,
+		IdentityHeader: access.HeaderTailscaleLogin,
 		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")},
 		Metrics:        observability.New(),
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),

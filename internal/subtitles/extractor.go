@@ -14,7 +14,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/ykzird/astraeus/internal/ffmpegprocess"
 )
 
 // ErrUnsupportedFormat is returned for image-based subtitle formats (PGS,
@@ -29,6 +32,10 @@ var ErrNoCues = errors.New("subtitle track contained no cues")
 type Config struct {
 	// FFmpegBin is the ffmpeg executable.
 	FFmpegBin string
+	// FFprobeBin is the ffprobe executable, which the image-subtitle path uses
+	// to identify a track's codec and to read the codec private data that
+	// carries a VobSub palette. It defaults to "ffprobe".
+	FFprobeBin string
 	// TesseractBin is the OCR executable used for image-based subtitle tracks.
 	// It is optional: when it is missing the service still converts text
 	// tracks, and an image track keeps its refusal instead of failing.
@@ -38,18 +45,26 @@ type Config struct {
 	OCRLanguage string
 	// CacheDir stores the extracted WebVTT files.
 	CacheDir string
-	// Timeout bounds a single extraction.
+	// Timeout bounds a single text extraction, which is a demux.
 	Timeout time.Duration
-	Logger  *slog.Logger
+	// OCRTimeout bounds a single recognition pass, which is not a demux: it runs
+	// tesseract once per cue, and a feature-length track has two thousand of
+	// them. Sharing Timeout meant a real track was given two minutes for work
+	// measured at about 60 ms per cue, so it could not finish (L-13 of the
+	// 2026-10-09 review).
+	OCRTimeout time.Duration
+	Logger     *slog.Logger
 }
 
 // Service extracts and caches WebVTT subtitles.
 type Service struct {
 	ffmpegBin    string
+	ffprobeBin   string
 	tesseractBin string
 	ocrLanguage  string
 	cacheDir     string
 	timeout      time.Duration
+	ocrTimeout   time.Duration
 	logger       *slog.Logger
 }
 
@@ -58,11 +73,21 @@ func New(cfg Config) (*Service, error) {
 	if cfg.FFmpegBin == "" {
 		cfg.FFmpegBin = "ffmpeg"
 	}
+	if cfg.FFprobeBin == "" {
+		cfg.FFprobeBin = "ffprobe"
+	}
 	if cfg.TesseractBin == "" {
 		cfg.TesseractBin = "tesseract"
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 2 * time.Minute
+	}
+	if cfg.OCRTimeout <= 0 {
+		// Half an hour for a recognition pass. At the measured 60 ms a cue that
+		// is far more than a feature-length track needs on the hardware the
+		// measurement came from, and it is a safety net rather than a budget:
+		// a pass that hits it is one that has gone wrong, not one that is slow.
+		cfg.OCRTimeout = 30 * time.Minute
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -76,10 +101,12 @@ func New(cfg Config) (*Service, error) {
 
 	return &Service{
 		ffmpegBin:    cfg.FFmpegBin,
+		ffprobeBin:   cfg.FFprobeBin,
 		tesseractBin: cfg.TesseractBin,
 		ocrLanguage:  cfg.OCRLanguage,
 		cacheDir:     cfg.CacheDir,
 		timeout:      cfg.Timeout,
+		ocrTimeout:   cfg.OCRTimeout,
 		logger:       cfg.Logger,
 	}, nil
 }
@@ -131,15 +158,17 @@ func (s *Service) extract(ctx context.Context, mediaPath string, trackIndex int,
 	}
 	defer func() { _ = os.Remove(tmpName) }()
 
-	cmd := exec.CommandContext(ctx, s.ffmpegBin,
-		"-hide_banner",
-		"-loglevel", "error",
-		"-y",
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	// A library file is a path, but ffmpeg reads an input as a URL: a file shaped
+	// like a playlist would be fetched from wherever it points (S-17).
+	args = append(args, ffmpegprocess.Args()...)
+	args = append(args,
 		"-i", mediaPath,
 		"-map", "0:"+strconv.Itoa(trackIndex),
 		"-f", "webvtt",
 		tmpName,
 	)
+	cmd := exec.CommandContext(ctx, s.ffmpegBin, args...)
 	output, runErr := cmd.CombinedOutput()
 	if runErr != nil {
 		if ctx.Err() != nil {
@@ -178,12 +207,37 @@ func (s *Service) cacheKey(mediaPath string, info os.FileInfo, trackIndex int) s
 
 // cacheKeyFor folds the conversion mode into the key as well, so an OCR result
 // can never be served for a text extraction of the same track or the reverse.
+// ocrCacheMode names the cache namespace a recognition pass writes into.
+const ocrCacheMode = "ocr"
+
 func (s *Service) cacheKeyFor(mediaPath string, info os.FileInfo, trackIndex int, mode string) string {
 	abs, err := filepath.Abs(mediaPath)
 	if err != nil {
 		abs = mediaPath
 	}
-	sum := sha256.Sum256(fmt.Appendf(nil, "%s\x00%d\x00%d\x00%d\x00%s",
-		abs, info.Size(), info.ModTime().UnixNano(), trackIndex, mode))
+	// The language is part of the key for a recognition pass, because it is part
+	// of the answer: "Astraeus" read as English and read as German are different
+	// text, and the file, its size, its mtime and the track index are all
+	// unchanged by a --ocr-language flag. Without this the cache served the old
+	// language's text until the cache directory was cleared by hand, and nothing
+	// said so (D-16 of the 2026-10-09 review).
+	//
+	// It is included for OCR mode only. A text extraction is a demux and does not
+	// read the language, so keying it that way would throw away a good cache
+	// entry every time the flag changed.
+	components := []string{
+		abs,
+		fmt.Sprint(info.Size()),
+		fmt.Sprint(info.ModTime().UnixNano()),
+		fmt.Sprint(trackIndex),
+		mode,
+	}
+	if mode == ocrCacheMode {
+		components = append(components, s.ocrLanguage)
+	}
+
+	// Joined with NUL rather than concatenated, so that a path ending in "1" and
+	// a size of "23" cannot collide with a path ending in "12" and a size of "3".
+	sum := sha256.Sum256([]byte(strings.Join(components, "\x00")))
 	return hex.EncodeToString(sum[:16])
 }

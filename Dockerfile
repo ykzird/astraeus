@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # Astraeus Media in one image: the server, the web UI it serves, and the ffmpeg
 # it shells out to for probing, transcoding and subtitle extraction.
 #
@@ -11,6 +9,11 @@
 # one, so a multi-arch build needs no emulation: the Go toolchain is native and
 # only the runtime base image differs per architecture.
 FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+
+# The official image pins GOTOOLCHAIN=local, so it uses the Go it ships and never
+# reads go.mod's `toolchain` line. That is how a lagging image silently builds a
+# release with an older patch than the module asks for.
+ENV GOTOOLCHAIN=auto
 
 WORKDIR /src
 
@@ -24,6 +27,22 @@ ARG TARGETARCH
 # The module files are copied first so the dependency layer survives a source
 # change, which is most of the build time.
 COPY go.mod go.sum ./
+
+# go.mod's `toolchain` line is what decides the Go that compiles this, and it is
+# what keeps the image and the release tarball on the same patched toolchain. A
+# base image tag only carries the major.minor, so without this check a lagging
+# `golang:1.26-bookworm` could quietly build the image with a Go that has the
+# range-header and MIME-header vulnerabilities the tarball was rebuilt to avoid.
+# `go` reads go.mod here, downloads the pinned toolchain if the image lacks it,
+# and this fails the build if it cannot.
+RUN go version \
+ && required="$(sed -n 's/^toolchain go//p' go.mod)" \
+ && current="$(go env GOVERSION | sed 's/^go//')" \
+ && if [ -n "$required" ] && [ "$(printf '%s\n%s\n' "$required" "$current" | sort -V | tail -1)" != "$current" ]; then \
+      echo "the effective Go here is $current but go.mod pins toolchain go$required, and GOTOOLCHAIN=auto could not fetch it (no network, or a proxy that blocks it)" >&2; \
+      exit 1; \
+    fi
+
 RUN go mod download
 
 COPY cmd ./cmd
@@ -57,7 +76,8 @@ LABEL org.opencontainers.image.title="Astraeus Media" \
 # ffmpeg is a hard dependency, not a convenience: without it the server can still
 # list a library but cannot probe a file, so it reports that at startup and
 # refuses playback. tesseract is the opposite - an optional one: with it, image
-# subtitle tracks (PGS) are read into text a browser can toggle and search;
+# subtitle tracks (PGS and VobSub) are read into text a browser can toggle and
+# search;
 # without it they keep the burn-in path. It is included so the packaged server
 # offers the better of the two. ca-certificates is for the TMDB metadata provider
 # over HTTPS; curl exists only for the container health check.
@@ -93,6 +113,21 @@ EXPOSE 8642
 # without repeating the path: `docker run astraeus-media scan --path /media`.
 # Without an ENTRYPOINT, "serve" would be looked up in $PATH and the container
 # would exit before logging anything.
+#
+# --addr is 0.0.0.0 here and the gate is off, which together mean the container
+# serves its library to anything that can reach the port. That is the right
+# default for a container - bind loopback and a published port reaches nothing -
+# and it puts the decision where it belongs, in the `-p` argument:
+#
+#   -p 127.0.0.1:8642:8642   publishes on the host's loopback only, which is the
+#                            shape deploy/README.md recommends, paired with a
+#                            TLS-terminating proxy for viewers
+#   -p 8642:8642             publishes on every interface
+#
+# Inside the container the port is always reachable, so a gate is not what makes
+# this safe; the published address and the proxy in front of it are. The systemd
+# unit takes the other route - loopback plus the mode the operator chooses - so
+# the two shapes differ here on purpose.
 ENTRYPOINT ["/usr/local/bin/astraeus-server"]
 CMD ["serve", \
      "--addr", "0.0.0.0:8642", \

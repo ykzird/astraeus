@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"mime"
 	"net/http"
 	"os"
 	"strconv"
@@ -19,7 +20,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ykzird/astraeus/internal/access"
+	"github.com/ykzird/astraeus/internal/httplabel"
 	"github.com/ykzird/astraeus/internal/images"
+	"github.com/ykzird/astraeus/internal/jobs"
 	"github.com/ykzird/astraeus/internal/library"
 	"github.com/ykzird/astraeus/internal/metadata"
 	"github.com/ykzird/astraeus/internal/observability"
@@ -51,8 +54,8 @@ type StreamManager interface {
 // handler tests do not need ffmpeg.
 type SubtitleConverter interface {
 	Convert(ctx context.Context, mediaPath string, trackIndex int) (string, error)
-	// ConvertImage renders an image-based track (PGS) as WebVTT by reading the
-	// text out of its bitmaps. Without an OCR engine it returns
+	// ConvertImage renders an image-based track (PGS or VobSub) as WebVTT by
+	// reading the text out of its bitmaps. Without an OCR engine it returns
 	// subtitles.ErrUnsupportedFormat, which the handler answers as it always
 	// did rather than as a server fault.
 	ConvertImage(ctx context.Context, mediaPath string, trackIndex int) (string, error)
@@ -68,7 +71,12 @@ type Deps struct {
 	// Scheduler re-scans every library; when nil, the scan-all endpoint is
 	// unavailable.
 	Scheduler *library.ScanScheduler
-	Worker    *metadata.Worker
+	// Jobs runs work that must outlive the request that asked for it. When nil,
+	// the endpoints that start long work run it synchronously, which is the
+	// behaviour every one of them had before the runner existed - a client that
+	// disconnects then cancels the work.
+	Jobs   *jobs.Runner
+	Worker *metadata.Worker
 	// Prober inspects media files. When nil, playback negotiation is disabled.
 	Prober streaming.Prober
 	// Streams produces segmented streams. When nil, only direct play works.
@@ -84,6 +92,10 @@ type Deps struct {
 	// Subtitles converts text subtitle tracks to WebVTT. When nil, no subtitle
 	// tracks are advertised.
 	Subtitles SubtitleConverter
+	// Policy decides which libraries a viewer may see and who may change the
+	// library. A nil Policy permits everything, which is what an install that
+	// has not written one has always done.
+	Policy *access.Policy
 	// WebDir is a directory of static UI assets served at /. When it is empty
 	// or missing, only the API is served.
 	WebDir string
@@ -95,7 +107,12 @@ type Deps struct {
 	// Tracer, when set, records a span per request and correlates the request
 	// log with it. A nil or disabled tracer is a no-op.
 	Tracer *tracing.Tracer
-	Logger *slog.Logger
+	// CrossOrigin enables browser cross-origin request protection, which
+	// refuses a state-changing request a page on another origin made with the
+	// browser's own credentials attached. It is on by default and disabled
+	// only for a client that cannot send the headers it checks.
+	CrossOrigin bool
+	Logger      *slog.Logger
 }
 
 // Server renders library state as JSON over HTTP.
@@ -103,6 +120,7 @@ type Server struct {
 	repo      library.Repository
 	scanner   *library.Scanner
 	scheduler *library.ScanScheduler
+	jobs      *jobs.Runner
 	worker    *metadata.Worker
 	prober    streaming.Prober
 	streams   StreamManager
@@ -111,9 +129,14 @@ type Server struct {
 	metrics   *observability.Metrics
 	subtitles SubtitleConverter
 	webFS     http.Handler
+	policy    *access.Policy
 	rateLimit func(http.Handler) http.Handler
 	tracer    *tracing.Tracer
 	logger    *slog.Logger
+	// crossOrigin protects state-changing requests from other origins. The
+	// zero value is still a valid protection object, so this is only nil for a
+	// Server built by hand in a test.
+	crossOrigin *http.CrossOriginProtection
 }
 
 // NewServer creates a Server.
@@ -127,6 +150,7 @@ func NewServer(deps Deps) *Server {
 		repo:      deps.Repository,
 		scanner:   deps.Scanner,
 		scheduler: deps.Scheduler,
+		jobs:      deps.Jobs,
 		worker:    deps.Worker,
 		prober:    deps.Prober,
 		streams:   deps.Streams,
@@ -134,16 +158,22 @@ func NewServer(deps Deps) *Server {
 		images:    deps.Images,
 		metrics:   deps.Metrics,
 		subtitles: deps.Subtitles,
+		policy:    deps.Policy,
 		rateLimit: deps.RateLimit,
 		tracer:    deps.Tracer,
 		logger:    logger,
+	}
+	if deps.CrossOrigin {
+		server.crossOrigin = http.NewCrossOriginProtection()
 	}
 
 	// The UI is served from the same origin as the API, so the browser needs
 	// no CORS configuration and no separate web server.
 	if deps.WebDir != "" {
 		if info, err := os.Stat(deps.WebDir); err == nil && info.IsDir() {
-			server.webFS = http.FileServer(http.Dir(deps.WebDir))
+			// Wrapped, not bare: http.FileServer lists directories and serves
+			// dotfiles, which is a map of the install for anyone who asks (A-10).
+			server.webFS = uiFileServer(http.FileServer(http.Dir(deps.WebDir)))
 			logger.Info("serving the web UI", "dir", deps.WebDir)
 		} else {
 			logger.Warn("web UI directory is not present; serving the API only", "dir", deps.WebDir)
@@ -175,6 +205,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/objects/{id}/file", s.handleObjectFile)
 	mux.HandleFunc("GET /api/objects/{id}/subtitles/{file}", s.handleSubtitle)
 	mux.HandleFunc("GET /api/system/capabilities", s.handleSystemCapabilities)
+	mux.HandleFunc("GET /api/jobs/{id}", s.handleGetJob)
 	mux.HandleFunc("GET /api/images/{size}/{file}", s.handleImage)
 
 	// Metrics live outside /api because that is the convention scrapers expect.
@@ -192,6 +223,13 @@ func (s *Server) Handler() http.Handler {
 	// any other, so it carries the same headers and appears in the same log. The
 	// tracer is outermost so a span covers the whole request, a refusal included.
 	handler := http.Handler(mux)
+	if s.crossOrigin != nil {
+		// Cross-origin protection refuses a state-changing request a browser
+		// made from another origin with credentials attached. It is outermost
+		// so a refusal happens before routing, and it is wrapped by the log and
+		// security headers like any other response.
+		handler = s.crossOrigin.Handler(handler)
+	}
 	if s.rateLimit != nil {
 		handler = s.rateLimit(handler)
 	}
@@ -294,15 +332,23 @@ func (s *Server) withRequestLogging(next http.Handler) http.Handler {
 		next.ServeHTTP(recorder, r)
 		elapsed := time.Since(start)
 
+		// The method is normalised before it becomes a label. net/http accepts any
+		// token as a method, so recording r.Method verbatim let a client create one
+		// series per invented verb - 300 requests made /metrics 5,441 lines, and
+		// the series are never freed (A-4 of the 2026-10-09 review).
+		method := httplabel.Method(r.Method)
 		s.metrics.IncCounter("astraeus_http_requests_total",
-			"HTTP requests served, by method and status code.",
-			map[string]string{"method": r.Method, "status": strconv.Itoa(recorder.status)})
+			"HTTP requests served, by method and status code. An unrecognised method is recorded as \"other\".",
+			map[string]string{"method": method, "status": strconv.Itoa(recorder.status)})
 		s.metrics.ObserveHistogram("astraeus_http_request_seconds",
-			"HTTP request duration.",
+			"HTTP request duration, by method.",
 			elapsed.Seconds(),
-			map[string]string{"method": r.Method})
+			map[string]string{"method": method})
 
 		attrs := []any{
+			// The raw method, not the normalised label: a log line is read by a
+			// person and is not a series, so "which verb did they actually send"
+			// is the useful thing to keep.
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", recorder.status,
@@ -351,7 +397,7 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListLibraries(w http.ResponseWriter, r *http.Request) {
-	libraries, err := s.repo.ListLibraries(r.Context())
+	libraries, err := s.access(r).libraries(r.Context())
 	if err != nil {
 		s.writeRepoError(w, r, err, "listing libraries")
 		return
@@ -366,6 +412,10 @@ type createLibraryRequest struct {
 }
 
 func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
 	var req createLibraryRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -384,13 +434,8 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info, err := os.Stat(req.Path)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_path", "path is not readable: "+err.Error())
-		return
-	}
-	if !info.IsDir() {
-		writeError(w, http.StatusBadRequest, "invalid_path", "path is not a directory")
+	if err := library.RootExists(req.Path); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_path", err.Error())
 		return
 	}
 
@@ -399,6 +444,19 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if !errors.Is(err, library.ErrNotFound) {
 		s.writeRepoError(w, r, err, "checking for an existing library")
+		return
+	}
+
+	// Overlapping roots are refused rather than allowed to take turns owning the
+	// same files (L-15 of the 2026-10-09 review). The check compares resolved
+	// paths, so /media and /mnt/media-link are caught too.
+	registered, err := s.repo.ListLibraries(r.Context())
+	if err != nil {
+		s.writeRepoError(w, r, err, "listing libraries")
+		return
+	}
+	if overlap, found := library.FindOverlap(registered, req.Path); found {
+		writeError(w, http.StatusConflict, "path_overlaps", overlap.Error())
 		return
 	}
 
@@ -418,7 +476,7 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetLibrary(w http.ResponseWriter, r *http.Request) {
-	lib, err := s.repo.GetLibrary(r.Context(), r.PathValue("id"))
+	lib, err := s.access(r).library(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting library")
 		return
@@ -427,6 +485,10 @@ func (s *Server) handleGetLibrary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteLibrary(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
 	if err := s.repo.DeleteLibrary(r.Context(), r.PathValue("id")); err != nil {
 		s.writeRepoError(w, r, err, "deleting library")
 		return
@@ -435,12 +497,26 @@ func (s *Server) handleDeleteLibrary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleScanLibrary(w http.ResponseWriter, r *http.Request) {
+	// Scanning writes to the library, so it is an admin operation rather than a
+	// visible one: an admin may scan a library it cannot see.
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
 	lib, err := s.repo.GetLibrary(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting library")
 		return
 	}
 
+	if s.startJob(w, r, "scan:"+lib.ID, func(ctx context.Context) (any, error) {
+		return s.scanner.ScanLibrary(ctx, lib)
+	}) {
+		return
+	}
+
+	// No runner configured: run it here, which is what this always did. A
+	// client that disconnects still cancels it in that shape.
 	result, err := s.scanner.ScanLibrary(r.Context(), lib)
 	if err != nil {
 		s.writeRepoError(w, r, err, "scanning library")
@@ -452,9 +528,19 @@ func (s *Server) handleScanLibrary(w http.ResponseWriter, r *http.Request) {
 // handleScanAll re-scans every registered library in one pass. It is the manual
 // override for the periodic scheduler.
 func (s *Server) handleScanAll(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
 	if s.scheduler == nil {
 		writeError(w, http.StatusServiceUnavailable, "scanning_unavailable",
 			"scanning every library is not configured on this server")
+		return
+	}
+
+	if s.startJob(w, r, "scan:all", func(ctx context.Context) (any, error) {
+		return s.scheduler.ScanAll(ctx)
+	}) {
 		return
 	}
 
@@ -467,15 +553,10 @@ func (s *Server) handleScanAll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListLibraryEntities(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	// Check the library exists so an unknown id is a 404 rather than an
-	// indistinguishable empty list.
-	if _, err := s.repo.GetLibrary(r.Context(), id); err != nil {
-		s.writeRepoError(w, r, err, "getting library")
-		return
-	}
-
-	entities, err := s.repo.ListEntitiesByLibrary(r.Context(), id)
+	// The accessor looks the library up first, so an unknown id is a 404 rather
+	// than an indistinguishable empty list - and a library this viewer may not
+	// see answers exactly the same way.
+	entities, err := s.access(r).entitiesInLibrary(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "listing entities")
 		return
@@ -484,7 +565,7 @@ func (s *Server) handleListLibraryEntities(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleListEntities(w http.ResponseWriter, r *http.Request) {
-	entities, err := s.repo.ListEntities(r.Context())
+	entities, err := s.access(r).entities(r.Context())
 	if err != nil {
 		s.writeRepoError(w, r, err, "listing entities")
 		return
@@ -534,18 +615,22 @@ func newProgressResource(progress *library.PlaybackProgress) *progressResource {
 
 func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	entity, err := s.repo.GetEntity(ctx, r.PathValue("id"))
+	// Everything below is read through the scoped view, so an entity in a
+	// library this viewer may not see is a 404 here exactly as an unknown id is.
+	scoped := s.access(r)
+
+	entity, err := scoped.entity(ctx, r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity")
 		return
 	}
 
-	objects, err := s.repo.GetObjectsByEntity(ctx, entity.ID)
+	objects, err := scoped.objects(ctx, entity.ID)
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity objects")
 		return
 	}
-	children, err := s.repo.ListChildren(ctx, entity.ID)
+	children, err := scoped.children(ctx, entity.ID)
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity children")
 		return
@@ -564,7 +649,7 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 		Progress: newProgressResource(progress),
 	}
 	if entity.ParentID != nil {
-		parent, err := s.repo.GetEntity(ctx, *entity.ParentID)
+		parent, err := scoped.entity(ctx, *entity.ParentID)
 		if err == nil {
 			parentResource := s.decorateEntity(*parent)
 			detail.Parent = &parentResource
@@ -578,6 +663,16 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnrich(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
+	if s.startJob(w, r, "enrich:all", func(ctx context.Context) (any, error) {
+		return s.worker.EnrichOnce(ctx)
+	}) {
+		return
+	}
+
 	result, err := s.worker.EnrichOnce(r.Context())
 	if err != nil {
 		s.writeRepoError(w, r, err, "enriching metadata")
@@ -660,13 +755,17 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entity, err := s.repo.GetEntity(ctx, r.PathValue("id"))
+	// Negotiation is a read of the entity and its objects, so it goes through
+	// the same scoped view the listings do: a viewer cannot start a session for
+	// a library it may not see, which is also what keeps the session URL from
+	// being a capability somebody else can replay.
+	entity, err := s.access(r).entity(ctx, r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity")
 		return
 	}
 
-	objects, err := s.repo.GetObjectsByEntity(ctx, entity.ID)
+	objects, err := s.access(r).objects(ctx, entity.ID)
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity objects")
 		return
@@ -755,7 +854,7 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 			return
 		case track.Text:
 			writeError(w, http.StatusBadRequest, "subtitle_not_image",
-				fmt.Sprintf("subtitle track %d is text-based (%s) and is delivered as a selectable track; only image subtitles (PGS, VobSub) are burned in",
+				fmt.Sprintf("subtitle track %d is text-based (%s) and is delivered as a selectable track; a bitmap subtitle is the kind that gets burned in",
 					track.Index, track.Codec))
 			return
 		}
@@ -780,13 +879,23 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	if !decision.Deliverable {
 		span.SetStatus(tracing.StatusError, strings.Join(decision.Reasons, "; "))
 	}
+	// A client that declared it cannot render subtitle tracks is not sent any.
+	// The field was read nowhere but its own normalisation (D-7 of the
+	// 2026-10-09 review), so a manifest could say `"subtitles": false` and still
+	// be handed WebVTT URLs it had just said it could not use. The tracks are
+	// omitted rather than the request refused: a client that cannot render them
+	// loses nothing, and this is information it already gave.
+	subtitles := s.subtitleResources(object.ID, info.Subtitles)
+	if !capability.Subtitles {
+		subtitles = nil
+	}
 	response := playbackResponse{
 		EntityID:     entity.ID,
 		ObjectID:     object.ID,
 		Mode:         decision.Mode,
 		Decision:     decision,
 		MediaInfo:    info,
-		Subtitles:    s.subtitleResources(object.ID, info.Subtitles),
+		Subtitles:    subtitles,
 		StartSeconds: startSeconds,
 	}
 
@@ -893,8 +1002,23 @@ func (s *Server) handleListProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A position outlives the grant that allowed it: revoking a viewer's access
+	// to a library must not leave that library's titles in their Continue
+	// watching list. Filtering after the query can return fewer rows than the
+	// limit asked for, which is the correct reading of a limit - but a viewer
+	// whose recent history is mostly hidden may need to play something visible
+	// before the list fills again.
+	scoped := s.access(r)
 	resources := make([]progressEntryResource, 0, len(entries))
 	for _, entry := range entries {
+		allowed, err := scoped.allowed(r.Context(), entry.Entity.LibraryID)
+		if err != nil {
+			s.writeRepoError(w, r, err, "checking playback progress")
+			return
+		}
+		if !allowed {
+			continue
+		}
 		resources = append(resources, progressEntryResource{
 			Entity:   s.decorateEntity(entry.Entity),
 			Progress: newProgressResource(&entry.Progress),
@@ -921,7 +1045,10 @@ type progressRequest struct {
 func (s *Server) handleSaveProgress(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	entity, err := s.repo.GetEntity(ctx, r.PathValue("id"))
+	// A viewer may only report a position for something it can see; otherwise a
+	// hidden entity would be a way to probe what the server holds, and a
+	// revoked viewer could keep writing positions nobody can read.
+	entity, err := s.access(r).entity(ctx, r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity")
 		return
@@ -1008,6 +1135,10 @@ func (s *Server) handleStopStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Deliberately not scoped the way the playlist route is. Stopping is
+	// cleanup rather than a read, the session id is an unguessable UUID, and
+	// requiring the entity to be visible would leave a transcode running when a
+	// grant is revoked mid-session - the opposite of what a revocation should do.
 	s.streams.Stop(id)
 	s.logger.InfoContext(r.Context(), "streaming session stopped by request", "session_id", id)
 	w.WriteHeader(http.StatusNoContent)
@@ -1017,7 +1148,7 @@ func (s *Server) handleStopStream(w http.ResponseWriter, r *http.Request) {
 // needs. http.ServeFile handles range requests, without which seeking in a
 // large file would not work.
 func (s *Server) handleObjectFile(w http.ResponseWriter, r *http.Request) {
-	object, err := s.repo.GetObject(r.Context(), r.PathValue("id"))
+	object, err := s.access(r).object(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting media object")
 		return
@@ -1047,6 +1178,22 @@ func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 			"segmented streaming is not configured on this server")
 		return
 	}
+	// A session URL is a capability: whoever holds it can fetch the media. It is
+	// only handed to a viewer that was allowed to negotiate, but that viewer can
+	// pass it on and a grant can be revoked afterwards, so the playlist and
+	// segment route re-checks the library the session belongs to rather than
+	// trusting that the negotiation happened.
+	session, ok := s.streams.Session(r.PathValue("session"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "session_not_found",
+			"no streaming session with that id is running")
+		return
+	}
+	if _, err := s.access(r).entity(r.Context(), session.EntityID); err != nil {
+		s.writeRepoError(w, r, err, "serving a stream")
+		return
+	}
+
 	s.streams.ServeFile(w, r, r.PathValue("session"), r.PathValue("file"))
 }
 
@@ -1173,7 +1320,7 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	object, err := s.repo.GetObject(r.Context(), r.PathValue("id"))
+	object, err := s.access(r).object(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting media object")
 		return
@@ -1197,10 +1344,10 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !track.Text {
-			// An image track needs OCR to become text, and the reader only
-			// understands PGS. Anything else - no engine installed, or VobSub,
-			// which it cannot read - keeps the explicit 415 naming the format
-			// rather than failing inside the extractor.
+			// An image track needs OCR to become text, and the reader has a
+			// decoder for PGS and for VobSub. Anything else - no engine
+			// installed, or a codec with no decoder - keeps the explicit 415
+			// naming the format rather than failing inside the extractor.
 			if !s.subtitles.OCRReady() {
 				writeError(w, http.StatusUnsupportedMediaType, "subtitle_format_unsupported",
 					"subtitle track "+indexPart+" is image-based ("+track.Codec+
@@ -1210,7 +1357,7 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 			if !subtitles.OCRSupportsCodec(track.Codec) {
 				writeError(w, http.StatusUnsupportedMediaType, "subtitle_format_unsupported",
 					"subtitle track "+indexPart+" is image-based ("+track.Codec+
-						") and the OCR reader only understands PGS ("+track.Codec+" is burn-only)")
+						") and the OCR reader has no decoder for it ("+track.Codec+" is burn-only)")
 				return
 			}
 			imageBased = true
@@ -1219,8 +1366,17 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 
 	var path string
 	if imageBased {
-		path, err = s.subtitles.ConvertImage(r.Context(), object.FilePath, trackIndex)
+		// OCR runs through the runner: one pass per (file, track) however many
+		// players ask for it, and a client that gives up does not cancel it
+		// partway through (L-13).
+		path, err = s.runExclusive(r.Context(),
+			fmt.Sprintf("ocr:%s:%d", object.FilePath, trackIndex),
+			func(ctx context.Context) (string, error) {
+				return s.subtitles.ConvertImage(ctx, object.FilePath, trackIndex)
+			})
 	} else {
+		// A text track is a demux, not a recognition pass: it is cheap enough to
+		// do inline, and there is no second caller to share it with.
 		path, err = s.subtitles.Convert(r.Context(), object.FilePath, trackIndex)
 	}
 	if err != nil {
@@ -1238,7 +1394,14 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	// private, not public. A subtitle track is reachable only through a library the
+	// viewer may see, so the answer is specific to one viewer's rights - and
+	// `public` invites a shared cache, or a proxy in front of the server, to keep
+	// it and hand it to somebody else (A-10 of the 2026-10-09 review). The
+	// `Content-Type` above is a bare string, not an attacker-controlled value, so
+	// it is not a header-injection route; the concern here is only who may reuse
+	// the response.
+	w.Header().Set("Cache-Control", "private, max-age=86400")
 	http.ServeFile(w, r, path)
 }
 
@@ -1290,7 +1453,23 @@ func filterEntities(entities []library.MediaEntity, status string) []library.Med
 	return filtered
 }
 
+// decodeJSON decodes a JSON request body, refusing anything that is not
+// presented as JSON.
+//
+// The Content-Type check is the primary cross-site request forgery defence, and
+// it is not decoration. A cross-origin HTML form can only send
+// application/x-www-form-urlencoded, multipart/form-data or text/plain, and a
+// `fetch` in no-cors mode can only send one of the three, so requiring JSON
+// means a page on another origin cannot get a browser to attach the visitor's
+// credentials to a well-formed request here. `json.Decoder` stops after the
+// first value, so a form's trailing "=" would otherwise not even be a problem.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type",
+			"this endpoint requires Content-Type: application/json")
+		return false
+	}
+
 	body := http.MaxBytesReader(w, r.Body, maxRequestBody)
 	defer func() { _ = body.Close() }()
 
@@ -1306,6 +1485,18 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
 		return false
 	}
 	return true
+}
+
+// isJSONContentType reports whether a Content-Type header names JSON. The
+// charset parameter is accepted and ignored; anything else, including an empty
+// header, is not.
+func isJSONContentType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return false
+	}
+	mediaType = strings.ToLower(mediaType)
+	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

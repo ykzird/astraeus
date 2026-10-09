@@ -37,11 +37,27 @@ const (
 	MetricSpansDropped         = "astraeus_spans_dropped_total"
 )
 
+// TranscodeBuckets are the bounds for the metrics that measure a transcode
+// starting, in seconds. They exist because one bucket list cannot serve both
+// ends of this server: DefaultBuckets jumps 2.5 → 5 → 10, so a transcode
+// startup lands inside a single bin and the p50 or p95 reported for it is an
+// interpolation across that bin rather than a measurement. In the round-14 load
+// run that read 7.50s where the client measured 6.10s. These are fine through
+// the seconds a transcode actually takes, and coarser than the defaults below a
+// quarter of a second, where a remux lives and a tenth of a second is not the
+// difference anyone is looking for.
+var TranscodeBuckets = []float64{
+	0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 30, 60,
+}
+
 // KPIDefinition describes one entry in the registry.
 type KPIDefinition struct {
 	Name string
 	Help string
 	Kind string // "counter", "gauge" or "histogram"
+	// Buckets override DefaultBuckets for this metric's histogram, in seconds.
+	// Leave nil to use the defaults.
+	Buckets []float64
 }
 
 // KPIRegistry is every metric this server emits.
@@ -50,11 +66,17 @@ var KPIRegistry = []KPIDefinition{
 		Name: MetricFirstSegment,
 		Help: "Time from stream preparation starting to the first segment being delivered to a client (the specification's fttt_latency).",
 		Kind: "histogram",
+		// The same shape as a transcode startup, because for a segmented
+		// delivery it is one.
+		Buckets: TranscodeBuckets,
 	},
 	{
 		Name: MetricTranscodeStartup,
 		Help: "Time from starting ffmpeg to the playlist being available (transcode_startup_time).",
 		Kind: "histogram",
+		// The metric the round-14 measurement found to be unreadable with the
+		// default bounds.
+		Buckets: TranscodeBuckets,
 	},
 	{
 		Name: MetricMetadataLookup,
@@ -179,7 +201,7 @@ func (m *Metrics) declare(definition KPIDefinition) {
 			m.histograms[definition.Name] = &histogramFamily{
 				name:    definition.Name,
 				help:    definition.Help,
-				buckets: append([]float64(nil), m.buckets...),
+				buckets: m.bucketBoundsFor(definition.Name),
 				series:  make(map[string]*histogramSeries),
 			}
 		}

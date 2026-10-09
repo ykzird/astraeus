@@ -29,10 +29,23 @@ The goal is to build a "media-first" spatial environment that moves away from th
 Both shapes exist as of 0.3.0 (`Dockerfile`, `deploy/astraeus.service`, and
 `deploy/README.md` as the runbook). The binary is pure Go with no cgo, so the
 image is a two-stage build: one stage compiles a static binary, the runtime stage
-adds the one hard dependency, ffmpeg. The container runs as a fixed non-root uid
+adds ffmpeg as its one external dependency. Without it the server still starts
+and lists a library, and the routes that need to probe or transcode a file answer
+503. The container runs as a fixed non-root uid
 with every writable path inside a single volume, and the unit binds loopback with
-the access gate on, so neither shape publishes an unauthenticated library by
-default. Deployment is where the server's own honesty matters most: the startup
+the access gate on. The two shapes differ in what they publish by default, and the
+difference is worth stating rather than smoothing over:
+
+- **The systemd unit binds `127.0.0.1:8642`**, so nothing off-host reaches it
+  until a reverse proxy is put in front - which is also where the identity comes
+  from, since token mode is unusable from a browser.
+- **The container binds `0.0.0.0:8642` with the gate off.** Inside a container a
+  loopback bind reaches nothing, so the default is to listen on every interface
+  and leave the decision to the published address: `-p 127.0.0.1:8642:8642` is
+  the recommended shape, and `-p 8642:8642` hands the library to anyone who can
+  reach the port. A gate is not what makes the container safe; the `-p` argument
+  and the proxy in front of it are. `deploy/README.md` says so where it shows
+  both. Deployment is where the server's own honesty matters most: the startup
 probe reports which encoders this host can actually use, so a container that
 cannot see a GPU says so instead of transcoding badly.
 
@@ -124,7 +137,7 @@ The system will track the following key metrics to ensure performance excellence
 
 ### 7.0 Response hardening
 
-Every response carries `X-Content-Type-Options`, `Referrer-Policy`,
+Every response the API produces carries `X-Content-Type-Options`, `Referrer-Policy`,
 `X-Frame-Options`, `Cross-Origin-Resource-Policy` and `Permissions-Policy`;
 documents also carry a content security policy with no `unsafe-inline` and no
 `unsafe-eval`, and `img-src 'self'` so artwork can only come from this server's
@@ -136,7 +149,11 @@ responses are exempt from the policy, which they could not act on.
 server speaks plain HTTP and browsers ignore the header there.
 
 ### 7.1 Authentication & Authorization
-*   **Access Model:** A single-gate, instance-wide access model.
+*   **Access Model:** A single gate that admits a request, plus an optional
+    per-viewer policy (`--access-policy`) deciding which libraries each viewer may
+    see and who may change the library. Visibility defaults to everything when no
+    policy is configured, so the single-gate model is what an install has until an
+    operator chooses otherwise.
 *   **Implementation:** Integration with **Tailscale** or **Cloudflare Access** for secure, identity-aware remote connectivity. No built-in user registration; access is managed by the administrator.
 
 ---
@@ -181,8 +198,12 @@ reference.
 The MVP uses **SQLite** (`modernc.org/sqlite`, pure Go, no cgo) through `sqlx`,
 behind a `library.Repository` interface. PostgreSQL remains the production
 target; a `PostgresRepository` implementing the same interface is the only
-change required. Schema creation is versioned and idempotent in Go rather than
-delegated to an external migration tool: the project has no migration
+change required. Schema creation is idempotent and atomic in Go rather than
+delegated to an external migration tool - one transaction per run, so a failed
+upgrade leaves the previous database intact. It is **not** versioned in the sense
+of an ordered list of numbered steps: `schema_migrations` records a single
+version and is never read, so an upgrade is detected by the shape of the schema.
+That is a known limitation: the project has no migration
 dependency, and the migrations also repair data written by the earlier
 prototype (backfilling `name`, resetting entities that were marked `Complete`
 without a `MetadataSet`).
@@ -327,19 +348,24 @@ Image-based subtitles (PGS, VobSub) carry pictures rather than text, and a
 browser has no way to render a timed bitmap. Two delivery paths exist, and the
 server offers the better one it can actually perform.
 
-**OCR, for PGS, when an engine is installed.** `internal/subtitles` decodes the
-HDMV PGS stream (PCS/ODS/PDS segments, run-length-encoded objects, the YCbCr
-palette) into bitmaps, renders each cue as dark glyphs on a white page, and hands
-it to `tesseract`, whose output becomes the WebVTT body. The resulting track is
-delivered, cached and served exactly like a text track, so it can be toggled,
-restyled and searched and costs a fetch rather than a re-encode. The OCR engine
-is an **optional runtime dependency**: when it is absent the server keeps the
-previous behaviour - no URL is advertised for an image track and the endpoint
-answers `415 subtitle_format_unsupported` - rather than failing. The reader
-covers PGS only; VobSub and DVB subtitles live in different containers with
-different palettes and stay burn-only, and the refusal names the format rather
-than failing inside the extractor. `subtitle_ocr_enabled` in
-`/api/system/capabilities` reports the host's answer.
+**OCR, for PGS and VobSub, when an engine is installed.** `internal/subtitles`
+decodes an image stream into bitmaps, renders each cue as dark glyphs on a white
+page, and hands it to `tesseract`, whose output becomes the WebVTT body. The
+resulting track is delivered, cached and served exactly like a text track, so it
+can be toggled, restyled and searched and costs a fetch rather than a re-encode.
+The OCR engine is an **optional runtime dependency**: when it is absent the
+server keeps the previous behaviour - no URL is advertised for an image track and
+the endpoint answers `415 subtitle_format_unsupported` - rather than failing.
+Two decoders exist. The PGS one reads the HDMV segments (PCS/ODS/PDS,
+run-length-encoded objects, the YCbCr palette) from a raw `.sup`. The VobSub one
+reads a `dvd_subtitle` track's control sequence, two interleaved run-length
+fields and its container's palette: because that palette lives outside the
+picture stream - in Matroska's codec private, or a `.idx` sidecar - the
+extraction keeps a container that carries one, and a bare MPEG-PS source with no
+palette is refused rather than rendered blank. DVB subtitles have no decoder and
+stay burn-only; the refusal names the format rather than failing inside the
+extractor. `subtitle_ocr_enabled` in `/api/system/capabilities` reports the
+host's answer.
 
 **Burn-in, as the fallback.** A client asks for it with `burn_subtitle_index` on
 the playback request; the decision then reports `burned_subtitle_index`, forces a
@@ -427,11 +453,11 @@ Three capabilities were added after the phases above were written:
     `ffmpeg` on demand, cached against the source file's size and modification
     time, and served at `/api/objects/{id}/subtitles/{track}.vtt`. The playback
     response lists every track and only advertises a URL for the ones that can
-    actually be delivered. Text tracks always can; an image-based PGS track can
-    when an OCR engine is installed, in which case it is decoded by the PGS
-    reader in `internal/subtitles` and read by `tesseract` into WebVTT. An image
-    track with no text path - no engine, or a codec the reader does not decode
-    (VobSub, DVB) - is delivered by **burn-in** instead (§9.3): the picture is
+    actually be delivered. Text tracks always can; an image-based PGS or VobSub
+    track can when an OCR engine is installed, in which case it is decoded by the
+    matching reader in `internal/subtitles` and read by `tesseract` into WebVTT.
+    An image track with no text path - no engine, or a codec no reader decodes
+    (DVB) - is delivered by **burn-in** instead (§9.3): the picture is
     re-encoded with the bitmap composited into it. The subtitle is decoded from a
     second opening of the input, scaled to the picture with `scale2ref` so a
     downscaled re-encode places it correctly, and overlaid after the plan's own

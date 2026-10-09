@@ -8,6 +8,26 @@ They are the evidence behind the README's playback claims. They need Node (for
 its built-in `WebSocket`, so there are no npm dependencies) and a Chromium
 binary.
 
+## Start here: the manual walk-through
+
+`E2E-MANUAL.md` is one ordered pass over the whole application, written to be
+**run by hand first** and automated afterwards. Where the harnesses below each
+check one feature deeply, it checks that the product works as a product, in the
+order a person meets it, and every step says whether a machine can assert it
+(`[auto]`), only a person can judge it (`[human]`), or both.
+
+`flows.json` is the same walk-through as data, for the Playwright conversion;
+`check-e2e-flows.test.mjs` fails when the two drift apart, and CI runs it. Run it
+yourself with:
+
+```sh
+node --test scripts/ui-verify/check-e2e-flows.test.mjs
+node scripts/ui-verify/check-e2e-flows.mjs          # prints the counts and any drift
+```
+
+The harnesses below are the deep per-feature checks the walk-through leans on,
+and several phases say so rather than repeating their work.
+
 ## Running
 
 Start the server, then run a harness against it with an entity id from

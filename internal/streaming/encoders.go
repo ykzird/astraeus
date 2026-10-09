@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -298,7 +300,34 @@ func hdrTagFilter(dynamicRange DynamicRange) string {
 		hdrTransferName(dynamicRange))
 }
 
-// videoFilters renders the -vf chain for a plan and an encoder.
+// evenDimensions is the scale expression that keeps a re-encode inside what
+// 4:2:0 encoders accept.
+//
+// It exists because "scale only when the picture is too big" leaves the one case
+// that matters: a source that already fits the client's box is re-encoded
+// untouched, and libx264 then refuses an odd dimension outright with "height not
+// divisible by 2" - an Xvid or MPEG-4 rip at 640x271 is the shape that finds
+// this, and it failed the session rather than playing (S-4 of the 2026-10-09
+// review). ffmpeg will not fix it for us either: it inserts no scaler, because
+// the frame is already yuv420p and only the encoder objects to the size.
+//
+// Rounding down, never up, so a re-encode can come in under the client's box but
+// never over it. The expression is evaluated per frame, so it is a no-op - and
+// costs nothing - on a source that is already even.
+const evenDimensions = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+// videoFilters renders the filter chain for a plan and an encoder, up to the
+// point where an encoder can accept the frames.
+//
+// The returned bool reports whether the chain ends in software frames that a
+// hardware encoder still has to receive. That distinction exists for subtitle
+// burn-in: the compositing filters are software-only (the review's S-5), so
+// uploading before the overlay hands hardware frames to a software filter and
+// ffmpeg refuses with "Impossible to convert between the formats supported by
+// the filter 'Parsed_scale2ref_3' and the filter 'auto_scale_2'". The burn graph
+// therefore takes the software part, overlays, and then applies
+// hardwareUploadFilters - which is why the upload is not simply the last entry
+// of one list.
 //
 // The two arrangements differ because VAAPI scales on the GPU after uploading
 // and cannot convert a transfer function itself (tonemap_vaapi exists but has
@@ -306,39 +335,80 @@ func hdrTagFilter(dynamicRange DynamicRange) string {
 // scales afterwards. Everything else scales first and then tone maps: the float
 // conversion is the expensive part, and doing it on a 1080p frame instead of a
 // 4K one costs a quarter as much for a picture nobody can tell apart.
-func videoFilters(encoder string, plan videoPlan) []string {
-	scale := ""
-	if plan.Height > 0 {
-		scale = fmt.Sprintf("scale=-2:%d", plan.Height)
-	}
-
-	var filters []string
-	if strings.HasSuffix(encoder, "_vaapi") {
+//
+// Every re-encode gets at least evenDimensions, whether or not it needs a
+// downscale, because the two are different questions.
+func videoFilters(encoder string, plan videoPlan) ([]string, bool) {
+	if !strings.HasSuffix(encoder, "_vaapi") {
+		scale := evenDimensions
+		if plan.Height > 0 {
+			scale = fmt.Sprintf("scale=-2:%d", plan.Height)
+		}
+		var filters []string
+		if scale != "" {
+			filters = append(filters, scale)
+		}
 		if plan.ToneMap {
 			filters = append(filters, toneMapFilterChain)
 		}
 		if plan.HDR() {
 			filters = append(filters, hdrTagFilter(plan.TargetRange))
 		}
-		format := "nv12"
-		if plan.HDR() {
-			format = plan.HDRPixelFormat
-		}
-		filters = append(filters, "format="+format, "hwupload")
-		if plan.Height > 0 {
-			filters = append(filters, fmt.Sprintf("scale_vaapi=w=-2:h=%d", plan.Height))
-		}
-		return filters
+		return filters, false
 	}
 
-	if scale != "" {
-		filters = append(filters, scale)
-	}
+	// VAAPI: everything that has to happen in software, in the order it has to
+	// happen. The upload and the hardware scale follow in
+	// hardwareUploadFilters, so a software compositing stage can go between.
+	var filters []string
 	if plan.ToneMap {
 		filters = append(filters, toneMapFilterChain)
 	}
 	if plan.HDR() {
 		filters = append(filters, hdrTagFilter(plan.TargetRange))
+	}
+	// The upload needs a software frame in the format hwupload knows how to
+	// convert, and that conversion is left off here because
+	// hardwareUploadFilters opens with it: for an ordinary session the two are
+	// adjacent, so this avoids emitting "format=nv12,format=nv12", and for a
+	// burn session the conversion has to happen after the overlay anyway.
+	//
+	// The format is nv12 and not yuv420p, which is not cosmetic: feeding
+	// hwupload yuv420p on this host produced "Terminating thread with return
+	// code -5" and an empty encode, which the startup probe correctly read as a
+	// broken encoder and rejected - taking the whole hardware path down with it.
+	return filters, true
+}
+
+// hardwareUploadFilters moves software frames onto the VAAPI surface and scales
+// them there. It is the tail of a VAAPI chain, and for a burn session it is
+// applied after the overlay rather than before it - which is why the conversion
+// it opens with lives here rather than in videoFilters.
+//
+// The conversion is not assumed to be already done, because the compositing
+// filters in a burn graph can hand back a different format; a conversion that
+// is already correct costs nothing.
+func hardwareUploadFilters(plan videoPlan) []string {
+	format := "nv12"
+	if plan.HDR() {
+		format = plan.HDRPixelFormat
+	}
+	filters := []string{"format=" + format, "hwupload"}
+	if plan.Height > 0 {
+		return append(filters, fmt.Sprintf("scale_vaapi=w=-2:h=%d", plan.Height))
+	}
+	// VAAPI needs its own spelling, and it needs the same evenness: the
+	// hardware scaler rounds, but relying on that is not a guarantee the way an
+	// explicit trunc is.
+	return append(filters, "scale_vaapi=w=trunc(iw/2)*2:h=trunc(ih/2)*2")
+}
+
+// videoFilterChain joins the software chain and, when the encoder needs it, the
+// hardware upload that follows.
+func videoFilterChain(encoder string, plan videoPlan) []string {
+	filters, needsUpload := videoFilters(encoder, plan)
+	if needsUpload {
+		filters = append(filters, hardwareUploadFilters(plan)...)
 	}
 	return filters
 }
@@ -396,7 +466,7 @@ func videoStreamSuffix(streams, index int) string {
 //     machine without the hardware says so instead of quietly using its CPU.
 func encoderOutputArgs(encoder string, plan videoPlan, dev encoderDevice, streams, index int) []string {
 	suffix := videoStreamSuffix(streams, index)
-	args := encoderVideoArgs(encoder, suffix)
+	args := encoderVideoArgs(encoder, suffix, plan)
 	if filters := encoderFilterArgs(encoder, plan, suffix); len(filters) > 0 {
 		args = append(args, filters...)
 	}
@@ -409,41 +479,134 @@ func encoderOutputArgs(encoder string, plan videoPlan, dev encoderDevice, stream
 // -vf to the same output. A burn is always a single rendition, so there is no
 // stream specifier either.
 func encoderBurnedVideoArgs(encoder string, plan videoPlan) []string {
-	return append(encoderVideoArgs(encoder, ""), encoderTrailerArgs(encoder, plan, "")...)
+	return append(encoderVideoArgs(encoder, "", plan), encoderTrailerArgs(encoder, plan, "")...)
 }
 
-// encoderVideoArgs is the codec and rate-control half of the video options,
+// encoderVideoArgs is the codec and constant-quality half of the video options,
 // which a burn session shares with an ordinary one.
-func encoderVideoArgs(encoder, suffix string) []string {
+//
+// Each family has its own vocabulary for the same intent - "good quality, let
+// the bitrate follow" - and they are not interchangeable:
+//
+//   - NVENC takes a preset from p1..p7 and constant quality through
+//     "-rc vbr -cq N". No -b:v, so quality decides the bitrate.
+//   - QSV uses -global_quality.
+//   - VAAPI has no quality knob at all; it takes a hardware surface through the
+//     upload filter and encodes it.
+//   - AMF uses -quality for the speed/quality preset and QP values for constant
+//     quality, which it infers from the presence of -qp_*.
+//   - VideoToolbox is quality-driven through -q:v. -allow_sw stays off, so a
+//     machine without the hardware says so instead of quietly using its CPU.
+//
+// When the client declared a ceiling, the family's capped mode is used instead
+// of its constant-quality one. That is not a matter of style: a constant-quality
+// hardware encode ignores -maxrate on its own, which is S-1 of the 2026-10-09
+// review - a 308 kbps target shipped at 5.4 Mbps. The two modes are mutually
+// exclusive, because -rc cqp and -rc vbr_peak cannot both apply, so the cap
+// decides which one is rendered rather than being appended to the other.
+func encoderVideoArgs(encoder, suffix string, plan videoPlan) []string {
 	option := func(name string) string { return name + suffix }
+	capped := plan.BitrateKbps > 0
 	switch {
 	case strings.HasSuffix(encoder, "_nvenc"):
-		return []string{option("-c:v"), encoder, option("-preset"), nvencPreset,
-			option("-tune"), "hq", option("-rc"), "vbr", option("-cq"), "22"}
+		args := []string{option("-c:v"), encoder, option("-preset"), nvencPreset, option("-tune"), "hq"}
+		if !capped {
+			args = append(args, option("-rc"), "vbr", option("-cq"), "22")
+		}
+		return append(args, rateControlArgs(encoder, plan, suffix)...)
 	case strings.HasSuffix(encoder, "_qsv"):
-		return []string{option("-c:v"), encoder, option("-preset"), "veryfast", option("-global_quality"), "22"}
+		args := []string{option("-c:v"), encoder, option("-preset"), "veryfast"}
+		if !capped {
+			args = append(args, option("-global_quality"), "22")
+		}
+		return append(args, rateControlArgs(encoder, plan, suffix)...)
 	case strings.HasSuffix(encoder, "_vaapi"):
-		return []string{option("-c:v"), encoder}
+		return append([]string{option("-c:v"), encoder}, rateControlArgs(encoder, plan, suffix)...)
 	case strings.HasSuffix(encoder, "_amf"):
-		return []string{option("-c:v"), encoder, option("-quality"), "balanced",
-			option("-rc"), "cqp", option("-qp_i"), "22", option("-qp_p"), "22", option("-qp_b"), "22"}
+		args := []string{option("-c:v"), encoder, option("-quality"), "balanced"}
+		if !capped {
+			// The constant-quality mode: AMF infers it from the QP values.
+			args = append(args, option("-rc"), "cqp",
+				option("-qp_i"), "22", option("-qp_p"), "22", option("-qp_b"), "22")
+		}
+		return append(args, rateControlArgs(encoder, plan, suffix)...)
 	case strings.HasSuffix(encoder, "_videotoolbox"):
 		return []string{option("-c:v"), encoder, option("-q:v"), "60"}
 	case encoder == "libx264" || encoder == "libx265":
-		return []string{option("-c:v"), encoder, option("-preset"), "veryfast", option("-crf"), "21"}
+		return append([]string{option("-c:v"), encoder, option("-preset"), "veryfast", option("-crf"), "21"},
+			rateControlArgs(encoder, plan, suffix)...)
 	case encoder == "libvpx-vp9":
-		return []string{option("-c:v"), encoder, option("-crf"), "31", option("-b:v"), "0"}
+		return append([]string{option("-c:v"), encoder, option("-crf"), "31", option("-b:v"), "0"},
+			rateControlArgs(encoder, plan, suffix)...)
 	case encoder == "libsvtav1" || encoder == "libaom-av1":
-		return []string{option("-c:v"), encoder, option("-crf"), "30"}
+		return append([]string{option("-c:v"), encoder, option("-crf"), "30"},
+			rateControlArgs(encoder, plan, suffix)...)
 	default:
-		return []string{option("-c:v"), encoder}
+		return append([]string{option("-c:v"), encoder}, rateControlArgs(encoder, plan, suffix)...)
+	}
+}
+
+// rateControlArgs renders the bitrate ceiling for one encoder family.
+//
+// The families do not share a spelling, and the difference is not cosmetic:
+// a hardware encoder's constant-quality mode treats -maxrate as advice and
+// ignores it, so the ceiling has to be expressed in that family's own rate
+// control. Measured on this host against a 6 s 720p source with a 308 kbps
+// video target:
+//
+//	spelling                              produced
+//	------------------------------------  --------
+//	h264_vaapi -maxrate 308k -bufsize 616k   5255 kbps   (ignored)
+//	h264_vaapi -rc_mode VBR -b:v 308k ...      688 kbps
+//	h264_vaapi -rc_mode QVBR -b:v 308k ...    1097 kbps
+//	libx264 -crf 21 -maxrate 308k ...          344 kbps
+//
+// So VAAPI gets an explicit -b:v and a VBR rate-control mode. A software
+// encoder needs no -b:v: -maxrate bounds a CRF encode without dictating its
+// rate, which is what makes a quality-driven ladder possible at all.
+//
+// The bufsize is twice the ceiling, which is the usual compromise - smaller
+// makes the rate snap to the limit and the picture visibly pump, larger lets a
+// burst overshoot.
+//
+// QSV, AMF, NVENC and VideoToolbox spellings are reasoned from their documented
+// option sets rather than measured, because this project has run none of them on
+// hardware. That is not left to faith: probeEncoder verifies the ceiling on the
+// machine at startup and rejects a family that does not honour it.
+func rateControlArgs(encoder string, plan videoPlan, suffix string) []string {
+	if plan.BitrateKbps <= 0 {
+		return nil
+	}
+	option := func(name string) string { return name + suffix }
+	ceiling := fmt.Sprintf("%dk", plan.BitrateKbps)
+	bufsize := fmt.Sprintf("%dk", plan.BitrateKbps*2)
+
+	switch {
+	case strings.HasSuffix(encoder, "_vaapi"):
+		return []string{option("-rc_mode"), "VBR", option("-b:v"), ceiling,
+			option("-maxrate"), ceiling, option("-bufsize"), bufsize}
+	case strings.HasSuffix(encoder, "_qsv"):
+		// -global_quality alone is ICQ, which ignores a ceiling; VBR plus -b:v
+		// is the mode that does not.
+		return []string{option("-b:v"), ceiling, option("-maxrate"), ceiling,
+			option("-bufsize"), bufsize}
+	case strings.HasSuffix(encoder, "_amf"):
+		// -rc cqp ignores -b:v, so the capped mode replaces it.
+		return []string{option("-rc"), "vbr_peak", option("-b:v"), ceiling,
+			option("-maxrate"), ceiling, option("-bufsize"), bufsize}
+	case strings.HasSuffix(encoder, "_nvenc"):
+		// NVENC's VBR mode honours -maxrate, but only once a target exists.
+		return []string{option("-b:v"), ceiling, option("-maxrate"), ceiling,
+			option("-bufsize"), bufsize}
+	default:
+		return []string{option("-maxrate"), ceiling, option("-bufsize"), bufsize}
 	}
 }
 
 // encoderFilterArgs renders the picture filter chain as the option spelling the
 // output needs.
 func encoderFilterArgs(encoder string, plan videoPlan, suffix string) []string {
-	filters := videoFilters(encoder, plan)
+	filters := videoFilterChain(encoder, plan)
 	if len(filters) == 0 {
 		return nil
 	}
@@ -457,38 +620,13 @@ func encoderFilterArgs(encoder string, plan videoPlan, suffix string) []string {
 	return []string{filterFlag, strings.Join(filters, ",")}
 }
 
-// encoderTrailerArgs is the ceiling and pixel format, which follow the filters.
+// encoderTrailerArgs is the pixel format, which follows the filters.
 func encoderTrailerArgs(encoder string, plan videoPlan, suffix string) []string {
 	var args []string
-	if cap := bitrateCapArgs(plan, suffix); len(cap) > 0 {
-		args = append(args, cap...)
-	}
 	if format := outputPixelFormat(encoder, plan); format != "" {
 		args = append(args, "-pix_fmt"+suffix, format)
 	}
 	return args
-}
-
-// bitrateCapArgs renders a bitrate ceiling as a VBV constraint.
-//
-// -maxrate with -bufsize is the one spelling every family here understands: it
-// bounds the rate without dictating it, so a software CRF encode keeps choosing
-// its own quality and simply cannot exceed the ceiling, and a hardware encoder's
-// constant-quality mode is bounded the same way. Asking for -b:v instead would
-// turn quality-driven encodes into fixed-rate ones for no benefit.
-//
-// Measured on this host: the same 9 Mbps source encoded at 3.3 Mbps uncapped came
-// out at 605 kbps with a 500 kbps ceiling, muxing overhead included. The bufsize
-// is twice the ceiling, which is the usual compromise - smaller makes the rate
-// snap to the limit and the picture visibly pump, larger lets a burst overshoot.
-func bitrateCapArgs(plan videoPlan, suffix string) []string {
-	if plan.BitrateKbps <= 0 {
-		return nil
-	}
-	return []string{
-		"-maxrate" + suffix, fmt.Sprintf("%dk", plan.BitrateKbps),
-		"-bufsize" + suffix, fmt.Sprintf("%dk", plan.BitrateKbps*2),
-	}
 }
 
 // nvencPreset is the speed/quality preset for NVENC. The range is p1 (fastest,
@@ -541,6 +679,60 @@ func hdrPixelFormatCandidates(encoder string) []string {
 	}
 }
 
+// forcedIDRFlag returns the per-family option that makes a forced keyframe an
+// actual IDR frame, or nil for encoders that need none.
+//
+// The two are not the same thing, and only an IDR frame is a key the HLS muxer
+// will cut at. NVENC spells it -forced-idr and QSV and AMF spell it -forced_idr;
+// all three default to false, so a forced keyframe that is not an IDR frame is
+// simply not a key, and the muxer falls back to the encoder's native GOP - which
+// is the slow-first-segment problem -force_key_frames exists to remove (S-15 of
+// the 2026-10-09 review).
+//
+// Software encoders and VAAPI are deliberately absent: their forced keyframes
+// are already the frame the muxer cuts on, and on this host both cut at exactly
+// 2.000 s with no flag at all. Passing a flag an encoder does not know is an
+// error rather than a no-op, which is why this is a table of spellings and not a
+// single unconditional option.
+//
+// The spellings for NVENC, QSV and AMF are reasoned from their documented option
+// sets rather than measured, because this project has run none of them on
+// hardware.
+func forcedIDRFlag(encoder string) []string {
+	switch {
+	case strings.HasSuffix(encoder, "_nvenc"):
+		return []string{"-forced-idr", "1"}
+	case strings.HasSuffix(encoder, "_qsv"), strings.HasSuffix(encoder, "_amf"):
+		return []string{"-forced_idr", "1"}
+	default:
+		return nil
+	}
+}
+
+// encoderCanCarryHDR reports whether an ffmpeg encoder produces a codec that
+// can deliver high dynamic range.
+//
+// H.264 is the one that cannot, and the omission is deliberate rather than a
+// quality judgement: a 10-bit H.264 stream is not an HDR delivery format - no
+// browser or television treats it as one - so probing libx264 for 10-bit
+// support and recording that it succeeded advertised H.264 as an HDR encoder.
+// Negotiation then kept an HDR range while targeting H.264 and delivered
+// High-10 frames tagged PQ with washed-out colour (S-6 of the 2026-10-09
+// review). HEVC, AV1 and VP9 can all carry it and are the codecs
+// hdrVideoCodecPreference offers.
+//
+// An encoder's name always contains the codec it produces - libx264, h264_vaapi,
+// h264_nvenc, hevc_qsv, libsvtav1, libvpx-vp9 - so it is matched on the name
+// rather than on a second table that would have to be kept in step. HEVC is
+// spelled "x265" for the software encoder and "hevc" for every hardware one, so
+// both are matched.
+func encoderCanCarryHDR(encoder string) bool {
+	name := strings.ToLower(encoder)
+	return strings.Contains(name, "hevc") || strings.Contains(name, "x265") ||
+		strings.Contains(name, "av1") ||
+		strings.Contains(name, "vp9") || strings.Contains(name, "vp8")
+}
+
 // EncoderForHDR returns the encoder and pixel format to use for a 10-bit HDR
 // stream of the given codec, and whether this host has one.
 //
@@ -587,9 +779,10 @@ func probeEncoder(ctx context.Context, ffmpegBin, encoder string, dev encoderDev
 	probeCtx, cancel := context.WithTimeout(ctx, encoderProbeTimeout)
 	defer cancel()
 
-	args := []string{"-hide_banner", "-loglevel", "error"}
+	args := []string{"-hide_banner", "-loglevel", "info"}
 	args = append(args, encoderInputArgs(encoder, dev)...)
-	args = append(args, "-f", "lavfi", "-i", "testsrc=size=320x240:rate=5:duration=0.2")
+	args = append(args, "-f", "lavfi", "-i",
+		fmt.Sprintf("testsrc=size=320x240:rate=10:duration=%d", probeSourceSeconds))
 	args = append(args, encoderOutputArgs(encoder, plan, dev, 1, 0)...)
 	args = append(args, "-f", "null", "-")
 
@@ -601,7 +794,76 @@ func probeEncoder(ctx context.Context, ffmpegBin, encoder string, dev encoderDev
 	if err := probe.Run(); err != nil {
 		return fmt.Errorf("%w: %s", err, firstComplaint(stderr.String()))
 	}
+	if err := verifyProbeCeiling(encoder, plan, stderr.String()); err != nil {
+		return err
+	}
 	return nil
+}
+
+// probeSourceSeconds is how much material the probe encodes. Long enough that
+// the byte count is large compared with ffmpeg's KiB rounding, short enough to
+// stay a startup-cost footnote.
+const probeSourceSeconds = 1
+
+// probeCapTolerance is how far above the declared ceiling a probe encode may
+// land before the family is called out. The null muxer reports whole KiB, the
+// encoder needs a moment to converge, and container overhead is not free, so an
+// exact bound would reject working encoders. Two-and-a-half times the ceiling
+// still catches the failure this check exists for: a family that ignores the
+// ceiling entirely runs two orders of magnitude over.
+const probeCapTolerance = 2.5
+
+// verifyProbeCeiling checks that an encoder actually honours the bitrate ceiling
+// it was handed.
+//
+// This is the second half of the S-1 fix, and the half that makes the first half
+// honest. The rate-control spellings for QSV, AMF, NVENC and VideoToolbox are
+// reasoned from their documented option sets, not measured, because this project
+// has never run them on hardware. An encoder that accepts the options and
+// ignores them would otherwise ship as "capped": the master playlist would
+// advertise a rung the segments do not honour, and the first person to notice
+// would be a viewer on a slow link.
+//
+// So a family that cannot hold a ceiling is rejected at startup exactly like one
+// that cannot open a session, with the measured rate in the rejection reason.
+// Software encoders are exempt: they hold the ceiling with -maxrate alone, which
+// the integration suite measures on every run.
+func verifyProbeCeiling(encoder string, plan videoPlan, output string) error {
+	if plan.BitrateKbps <= 0 || !isHardwareEncoder(encoder) {
+		return nil
+	}
+	measured, ok := probeVideoKib(output)
+	if !ok {
+		// The line is missing rather than wrong, which happens when ffmpeg's
+		// own reporting changes. Silence would be worse than a rejection.
+		return fmt.Errorf("could not read the probe's output size, so the %d kbps ceiling is unverified",
+			plan.BitrateKbps)
+	}
+
+	measuredKbps := int(float64(measured*8) / probeSourceSeconds)
+	limit := int(float64(plan.BitrateKbps) * probeCapTolerance)
+	if measuredKbps > limit {
+		return fmt.Errorf("ignores the bitrate ceiling: asked for %d kbps, encoded %d kbps",
+			plan.BitrateKbps, measuredKbps)
+	}
+	return nil
+}
+
+// probeVideoKib reads the video byte count out of ffmpeg's null-muxer summary
+// ("video:3KiB audio:0KiB ..."). The last match wins, in case the line appears
+// more than once in a longer log.
+var probeVideoKibPattern = regexp.MustCompile(`video:(\d+)KiB`)
+
+func probeVideoKib(output string) (int, bool) {
+	matches := probeVideoKibPattern.FindAllStringSubmatch(output, -1)
+	if len(matches) == 0 {
+		return 0, false
+	}
+	value, err := strconv.Atoi(matches[len(matches)-1][1])
+	if err != nil {
+		return 0, false
+	}
+	return value, true
 }
 
 // probeEncoderSDR verifies that an encoder can open a session at all.

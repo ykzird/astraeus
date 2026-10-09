@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -30,6 +31,10 @@ var _ Store = (library.Repository)(nil)
 
 // EnrichResult reports the outcome of one enrichment pass.
 type EnrichResult struct {
+	// Skipped counts entities that went away between the list this pass read and
+	// the write it made. They are not failures and not successes: the entity they
+	// describe no longer exists.
+	Skipped   int `json:"skipped"`
 	Processed int `json:"processed"`
 	Enriched  int `json:"enriched"`
 	Failed    int `json:"failed"`
@@ -45,6 +50,20 @@ type Worker struct {
 	logger   *slog.Logger
 	now      func() time.Time
 	metrics  *observability.Metrics
+	// dedupe, when set, decides whether a pass should run. The background loop
+	// and an API-triggered pass share it, so the two cannot enrich the same
+	// entities at once (A-B7 of the 2026-10-09 review).
+	dedupe Dedupe
+}
+
+// Dedupe reports whether an enrichment pass may start now.
+//
+// It exists so the periodic loop and the API can share one answer without either
+// knowing about the other. RunOnce is called when the pass may proceed; it may
+// return (nil, nil) when the pass was refused, which is not an error - another
+// pass is simply already doing the work.
+type Dedupe interface {
+	RunOnce(key string, work func() (any, error)) (any, error)
 }
 
 // NewWorker creates a Worker.
@@ -64,9 +83,19 @@ func NewWorker(store Store, provider Provider, interval time.Duration, logger *s
 	}
 }
 
+// EnrichKey is the job key that makes one enrichment pass exclusive. The API and
+// the background loop both use it, which is what stops them overlapping.
+const EnrichKey = "enrich:all"
+
 // SetMetrics attaches a metrics collector. Passing nil disables instrumentation.
 func (w *Worker) SetMetrics(metrics *observability.Metrics) {
 	w.metrics = metrics
+}
+
+// SetDedupe attaches the guard the background loop and the API share. Passing
+// nil means every pass runs, which is what a worker used on its own does.
+func (w *Worker) SetDedupe(dedupe Dedupe) {
+	w.dedupe = dedupe
 }
 
 // Start runs one enrichment pass immediately, then once per interval until the
@@ -89,6 +118,19 @@ func (w *Worker) Start(ctx context.Context) {
 }
 
 func (w *Worker) runPass(ctx context.Context) {
+	// A pass the API is already running is not run again. Without this, the
+	// ticker can fire while a manual enrich is in flight and both walk the same
+	// incomplete entities, calling the provider twice for each.
+	if w.dedupe != nil {
+		_, err := w.dedupe.RunOnce(EnrichKey, func() (any, error) {
+			return w.EnrichOnce(ctx)
+		})
+		if err != nil {
+			w.logger.ErrorContext(ctx, "metadata enrichment pass failed", "error", err)
+		}
+		return
+	}
+
 	result, err := w.EnrichOnce(ctx)
 	if err != nil {
 		w.logger.ErrorContext(ctx, "metadata enrichment pass failed", "error", err)
@@ -96,7 +138,8 @@ func (w *Worker) runPass(ctx context.Context) {
 	}
 	if result.Processed > 0 {
 		w.logger.InfoContext(ctx, "metadata enrichment pass complete",
-			"processed", result.Processed, "enriched", result.Enriched, "failed", result.Failed)
+			"processed", result.Processed, "enriched", result.Enriched, "failed", result.Failed,
+			"skipped", result.Skipped)
 	}
 }
 
@@ -154,6 +197,22 @@ func (w *Worker) EnrichOnce(ctx context.Context) (EnrichResult, error) {
 		entity.Status = library.StatusComplete
 		entity.UpdatedAt = w.now()
 		if err := w.store.UpdateEntity(ctx, &entity); err != nil {
+			// A pruned entity is not a failure of the pass. A scan running
+			// concurrently can remove an entity between the list this pass read and
+			// the write it is making, and aborting the whole pass because one of a
+			// thousand entities went away means the other nine hundred and
+			// ninety-nine are not enriched - and the next pass starts from the
+			// beginning of a list that has changed again (L-18 of the 2026-10-09
+			// review).
+			if errors.Is(err, library.ErrNotFound) {
+				result.Skipped++
+				w.logger.DebugContext(ctx, "entity disappeared during the pass",
+					"entity_id", entity.ID, "name", entity.Name)
+				continue
+			}
+			// Anything else is a real failure of the store, and that stops the pass:
+			// continuing would mean trying every remaining entity against a database
+			// that is not answering.
 			return result, err
 		}
 		result.Enriched++

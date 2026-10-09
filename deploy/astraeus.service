@@ -12,11 +12,10 @@ User=astraeus
 Group=astraeus
 
 # Secrets live in an environment file rather than in this unit, which is
-# world-readable and usually in a git repository. The file is optional, so a
-# LAN-only install with --auth-mode none still starts.
+# world-readable and usually in a git repository. The file is optional, so an
+# install with no secrets still starts.
 #
 #   /etc/astraeus/astraeus.env, mode 0600, owned by root:
-#     ASTRAEUS_AUTH_TOKEN=<openssl rand -hex 32>
 #     TMDB_API_KEY=<themoviedb api key, optional>
 EnvironmentFile=-/etc/astraeus/astraeus.env
 
@@ -27,9 +26,22 @@ EnvironmentFile=-/etc/astraeus/astraeus.env
 #   /var/cache/astraeus caches: artwork and extracted subtitles
 #   /srv/media          the library, mounted read-only if it lives elsewhere
 #
-# --auth-mode token rather than the default "none": an install that survives a
-# reboot is an install somebody will eventually expose. Set ASTRAEUS_AUTH_TOKEN
-# in the environment file above.
+# --auth-mode is left at its default, "none", because this unit is meant to serve
+# the web UI on a trusted network and that is the only mode a browser can use.
+# It used to say --auth-mode token, which no browser can satisfy: the gate needs
+# an Authorization: Bearer header, a navigation cannot send one, and the UI has no
+# way to set one - so the documented install served a UI whose every request was
+# refused with 401 (DD-13 of the 2026-10-09 review).
+#
+# To run it where the network is not trusted, put it behind an authenticating
+# reverse proxy and use --auth-mode proxy, which believes an identity header from
+# a trusted address. deploy/tls/README.md is that runbook. --auth-mode token
+# remains available for API clients and scripts, which is what it is for: it
+# leaves the browser UI unusable, deliberately, and should not be the mode a
+# default install starts in.
+#
+# --addr is loopback above, so the trusted network is reached through the reverse
+# proxy described there rather than by binding this unit to a public interface.
 ExecStart=/usr/local/bin/astraeus-server serve \
     --addr 127.0.0.1:8642 \
     --web-dir /usr/local/share/astraeus/web \
@@ -37,7 +49,6 @@ ExecStart=/usr/local/bin/astraeus-server serve \
     --stream-root /var/lib/astraeus/streams \
     --image-cache /var/cache/astraeus/images \
     --subtitle-cache /var/cache/astraeus/subtitles \
-    --auth-mode token \
     --log-format json
 
 Restart=on-failure

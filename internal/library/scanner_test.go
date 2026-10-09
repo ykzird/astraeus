@@ -2,13 +2,15 @@ package library_test
 
 import (
 	"context"
-	"github.com/ykzird/astraeus/internal/library"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/ykzird/astraeus/internal/library"
 )
 
 func writeFile(t *testing.T, path, content string) {
@@ -320,7 +322,7 @@ func TestScanner_ScanLibrary_ShowsBuildsHierarchy(t *testing.T) {
 	}
 }
 
-func TestScanner_ScanLibrary_WarnsOnUnplaceableFile(t *testing.T) {
+func TestScanner_ScanLibrary_NotesAnUnplaceableFile(t *testing.T) {
 	t.Parallel()
 
 	repo := newTestRepo(t)
@@ -337,8 +339,14 @@ func TestScanner_ScanLibrary_WarnsOnUnplaceableFile(t *testing.T) {
 	if result.FilesSeen != 1 {
 		t.Errorf("files seen = %d, want 1", result.FilesSeen)
 	}
-	if len(result.Warnings) != 1 {
-		t.Errorf("warnings = %v, want exactly one", result.Warnings)
+	// A notice, not a warning: the file was read and simply could not be
+	// classified. Warnings mean the scan could not read every path, and only
+	// those block a prune (L-7).
+	if len(result.Notices) != 1 {
+		t.Errorf("notices = %v, want exactly one", result.Notices)
+	}
+	if len(result.Warnings) != 0 {
+		t.Errorf("warnings = %v, want none: an unplaceable file was read successfully", result.Warnings)
 	}
 	entities, err := repo.ListEntitiesByLibrary(ctx, lib.ID)
 	if err != nil {
@@ -613,4 +621,197 @@ func hasEntityNamed(entities []library.MediaEntity, name string) bool {
 		}
 	}
 	return false
+}
+
+// TestScanner_PrunesDespiteAnUnplaceableFile is the regression test for L-7.
+//
+// An unplaceable file used to be recorded as a warning, and a warning means the
+// scan may not have seen the whole disk - so it refused to prune. That is right
+// for a subtree it could not read and wrong for a file it read and could not
+// name: a multi-episode name like S01E02E03 is the common trigger, and its
+// presence disabled pruning for the whole library permanently. Deleting a file
+// then left its entity in place for good, and every later scan repeated the same
+// warning.
+func TestScanner_PrunesDespiteAnUnplaceableFile(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	root := t.TempDir()
+
+	// A show whose season directory holds one episode the scanner can place and one
+	// it cannot classify at all.
+	//
+	// The unplaceable fixture used to be "Show S01E02E03.mkv" - a two-episode
+	// marker - which the scanner learned to read while fixing L-17. A fixture that
+	// becomes placeable stops testing what this test is about, so the unnameable
+	// file is now one with no marker in it at all.
+	scene := filepath.Join(root, "Show", "Season 01")
+	writeFile(t, filepath.Join(scene, "Show S01E01.mkv"), "episode one")
+	writeFile(t, filepath.Join(scene, "Show - an extra featurette.mkv"), "not an episode")
+
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	scanner := library.NewScanner(repo, newTestLogger())
+
+	first, err := scanner.ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if len(first.Notices) != 1 {
+		t.Fatalf("notices = %v, want exactly one for the unplaceable file", first.Notices)
+	}
+	if first.EntitiesCreated == 0 {
+		t.Fatalf("the placeable file produced no entities, so there is nothing to prune")
+	}
+
+	// The episode is deleted from disk. The unplaceable file is still there.
+	if err := os.Remove(filepath.Join(scene, "Show S01E01.mkv")); err != nil {
+		t.Fatalf("removing the episode: %v", err)
+	}
+
+	second, err := scanner.ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+
+	if second.EntitiesPruned == 0 {
+		t.Errorf("nothing was pruned although the only placeable file was deleted\n"+
+			"notices=%v warnings=%v - an unplaceable file must not disable pruning",
+			second.Notices, second.Warnings)
+	}
+
+	entities, err := repo.ListEntitiesByLibrary(ctx, lib.ID)
+	if err != nil {
+		t.Fatalf("listing entities: %v", err)
+	}
+	for _, entity := range entities {
+		if strings.Contains(entity.Name, "S01E01") {
+			t.Errorf("the deleted episode's entity is still present: %+v", entity)
+		}
+	}
+}
+
+// TestScanner_StillRefusesToPruneWhenAPathCannotBeRead guards the other half:
+// the warnings distinction must not have weakened the guard it exists for.
+func TestScanner_StillRefusesToPruneWhenAPathCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("this test needs Unix file permissions")
+	}
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	root := t.TempDir()
+
+	writeFile(t, filepath.Join(root, "Show S01E01.mkv"), "episode one")
+	unreadable := filepath.Join(root, "private")
+	if err := os.MkdirAll(unreadable, 0o000); err != nil {
+		t.Fatalf("creating the unreadable directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o755) })
+
+	if _, err := os.ReadDir(unreadable); err == nil {
+		t.Skip("running as a user that can read a 0000 directory")
+	}
+
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	if _, err := library.NewScanner(repo, newTestLogger()).ScanLibrary(ctx, lib); err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(root, "Show S01E01.mkv")); err != nil {
+		t.Fatalf("removing the episode: %v", err)
+	}
+
+	result, err := library.NewScanner(repo, newTestLogger()).ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	if result.EntitiesPruned != 0 {
+		t.Errorf("a scan that could not read a path pruned %d entities; an unreadable "+
+			"subtree means the disk view is incomplete", result.EntitiesPruned)
+	}
+}
+
+// TestScanner_KeepsASeriesNamedExtrasAndDropsSamples is the scanner-level half of
+// L-17's ignore rules.
+//
+// IsIgnored matched whole directory names from one list used for both directories
+// and files, and it got both ends wrong. "Extras" is a name an actual series has -
+// Ricky Gervais's - and skipping the directory dropped it from the library with no
+// warning. And a sample is named for the title it came from, so the whole-name test
+// matched none of them: "Dune.2021.2160p.sample.mkv" stayed in the library as a
+// film.
+func TestScanner_KeepsASeriesNamedExtrasAndDropsSamples(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	root := t.TempDir()
+
+	// A series that happens to be called Extras.
+	extras := filepath.Join(root, "Extras", "Season 01")
+	writeFile(t, filepath.Join(extras, "Extras S01E01.mkv"), "episode one")
+
+	// And a film whose release shipped a sample beside it.
+	films := filepath.Join(root, "Films")
+	writeFile(t, filepath.Join(films, "Dune.2021.2160p.mkv"), "the feature")
+	writeFile(t, filepath.Join(films, "Dune.2021.2160p.sample.mkv"), "a sample")
+	// A samples directory, whose contents are named for the title rather than
+	// "sample", so only the directory rule can catch these.
+	samplesDir := filepath.Join(films, "Dune.2021.Samples")
+	writeFile(t, filepath.Join(samplesDir, "Dune.2021.sample-one.mkv"), "a sample")
+	writeFile(t, filepath.Join(samplesDir, "Dune.2021.sample-two.mkv"), "a sample")
+	// A featurette directory, which is supplementary wherever it appears.
+	writeFile(t, filepath.Join(films, "Featurettes", "about-the-film.mkv"), "a featurette")
+
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	scanner := library.NewScanner(repo, newTestLogger())
+	result, err := scanner.ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	// FilesSeen is counted before ingest, so it is the number of files the walk
+	// decided to *keep*. Two videos is the episode and the feature; everything
+	// else here is a sample or a featurette.
+	//
+	// Asserting on entities instead would not test this: a sample that the walk
+	// keeps becomes an unplaceable file rather than a title, so the library looks
+	// the same while the sample is sitting in it - which is exactly how the review
+	// found samples in the local database.
+	if result.FilesSeen != 2 {
+		t.Errorf("FilesSeen = %d, want 2 (the episode and the feature): the walk kept a "+
+			"sample or a featurette. Notices=%v", result.FilesSeen, result.Notices)
+	}
+
+	entities, err := repo.ListEntitiesByLibrary(ctx, lib.ID)
+	if err != nil {
+		t.Fatalf("listing entities: %v", err)
+	}
+
+	var names []string
+	for _, entity := range entities {
+		names = append(names, entity.Name)
+	}
+	joined := strings.Join(names, "|")
+
+	if !strings.Contains(joined, "Extras") {
+		t.Errorf("the series called Extras is not in the library at all (entities %v): a "+
+			"directory name was treated as supplementary material even though it is also "+
+			"a series name", names)
+	}
+
+	// The samples must not have become films of their own.
+	for _, name := range names {
+		if strings.Contains(name, "sample") {
+			t.Errorf("a sample was scanned as a title: %q (entities %v)", name, names)
+		}
+	}
+	for _, name := range names {
+		if strings.Contains(strings.ToLower(name), "featurette") {
+			t.Errorf("a featurette was scanned as a title: %q (entities %v)", name, names)
+		}
+	}
 }

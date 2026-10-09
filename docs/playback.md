@@ -48,13 +48,24 @@ earlier than requested.
 }
 ```
 
+A body that is present must name **at least one container, one video codec and
+one audio codec**. Any of the three missing is `400 invalid_capability`, which is
+why `start_seconds` cannot be sent on its own: prefer starting from the built-in
+profile and overriding what you need, rather than sending a body that names only
+an offset.
+
 The body may also carry `start_seconds`, the offset into the source at which the
 session should begin; the response echoes it back as `start_seconds` so a client
 can keep a continuous timeline across a seek or a quality change. A negative
 value, or one at or past the end of the media, is rejected with `400`.
 
 Omit the body to use the built-in browser profile, which caps at **1920x1080,
-8-bit, stereo**. Those three limits are not arbitrary: they are the ones a
+8-bit, stereo**. That cap is a `max_height`, so a body-less request is **one
+rendition, not a ladder** — see [Adaptive bitrate](#adaptive-bitrate), where
+`max_height` alone means "give me exactly this". It is a deliberate difference
+from what the UI sends: the UI's body omits the height fields as well, so its
+request adapts up to 1080p while a body-less one is pinned at it. If you want a
+ladder from a script, send `preferred_height`. Those three limits are not arbitrary: they are the ones a
 browser cannot be relied on to exceed. A 4K source would otherwise be
 re-encoded at 4K (about four times the CPU) for a client that usually cannot
 decode it; 10-bit H.264 ("High 10") and 5.1 AAC are refused outright by
@@ -204,7 +215,7 @@ playback failed.
 
 Neither signal on its own is trustworthy. `ffmpeg -encoders` lists what was
 *compiled in* — this project's own development machine lists NVENC, AMF,
-QuickSync and VAAPI and can use none of them. A populated `/dev/dri` says nothing
+QuickSync, VideoToolbox and VAAPI and can use none of them. A populated `/dev/dri` says nothing
 about the GPU vendor either, since an AMD machine exposes a device directory
 exactly as an Intel one does.
 
@@ -263,19 +274,35 @@ therefore offer the choice without probing anything itself.
 
 ## Image subtitles
 
+Reading an image track is cached, keyed on the file, its size, its modification
+time, the track index and **the OCR language**. The language belongs in that key
+because it is part of the answer: the same bitmap read as English and as German is
+different text, and none of the other inputs changes when the language does. So
+changing `--ocr-language` re-reads the track rather than serving what the previous
+language produced.
+
 Text tracks are served to the browser as WebVTT. Image-based tracks (PGS, VobSub)
 carry pictures rather than text, so no browser can render one as a subtitle
 track. There are two ways to show one, and the server chooses the better one it
 can actually do.
 
-**OCR reads PGS into text.** When `tesseract` is installed (that is, when
-`subtitle_ocr_enabled` is true), an image track is advertised with a URL like a
-text track and served as WebVTT: the subtitle stream is demuxed with ffmpeg, the
-PGS bitmaps are decoded by `internal/subtitles`, each cue's picture is turned
+**OCR reads PGS and VobSub into text.** When `tesseract` is installed (that is,
+when `subtitle_ocr_enabled` is true), an image track is advertised with a URL like
+a text track and served as WebVTT: the subtitle stream is demuxed with ffmpeg,
+its bitmaps are decoded by `internal/subtitles`, each cue's picture is turned
 into dark glyphs on a white page, and tesseract returns the words. The result is
 an ordinary `<track>` — the viewer can toggle it, restyle it and search it, and
 switching it on costs nothing but a fetch. That is the whole point: a burn can do
 none of those things.
+
+The two readers differ in where a track keeps its palette. PGS carries its own
+inside the picture stream, so its extraction is a raw `.sup`. A VobSub track does
+not: the palette lives in the container, as the `size:`/`palette:` text of a
+`.idx` sidecar, or the same text in Matroska's codec private. A Matroska source
+is therefore kept as Matroska — its subtitle stream is copied into a standalone
+Matroska file and the palette travels with it — and any other source is demuxed
+into raw SPU packets with the codec private read out beside them, because an
+image-only copy would drop the palette and leave nothing to render.
 
 The runtime dependency is treated as optional, not assumed. Without tesseract the
 server does not fail: it logs that image subtitles will be burned in, withholds
@@ -300,10 +327,16 @@ subtitle stream in the same graph does not deliver subtitle frames.
 
 What OCR covers, honestly:
 
-- **PGS only.** The reader is an HDMV PGS decoder. VobSub (`dvd_subtitle`) and
-  DVB subtitles are different containers with different palettes; they keep the
-  `415` refusal and are offered as a burn, rather than being advertised and then
-  failing inside the extractor. The message names the format.
+- **PGS and VobSub, not DVB.** Two decoders exist: HDMV PGS, and VobSub
+  (`dvd_subtitle`), whose control sequence, run-length fields and container
+  palette are decoded by `internal/subtitles`. DVB subtitles are still
+  burn-only: their palette and composition live in the stream and no decoder for
+  them has been written, so they keep the `415` refusal and are offered as a
+  burn rather than being advertised and then failing inside the extractor. The
+  message names the format.
+- **VobSub needs a container that carries the palette.** A bare MPEG-PS stream
+  has none, and the extraction says so rather than rendering every pixel
+  transparent; a disc rip's `.idx` sidecar is the ordinary source of one.
 - **It is OCR, so it can be wrong.** Recognition of a small or unusual font can
   misread a word, and a picture that is not text can be read as some. The
   fixtures are sized so the recogniser reads them exactly; a real disc's subtitles
@@ -336,7 +369,10 @@ fields, three meanings:
   is the deterministic request, and on a small host it is also the cheap one: a
   ladder is up to three encodes, a pin is one.
 - **neither** — "adapt as far as my box allows." A ladder topped at the client's
-  own ceiling or the source.
+  own ceiling or the source. Note that a **request with no body is not this
+  case**: the built-in profile it applies sets `max_height: 1080`, so a body-less
+  request is the pin above. This is the case for a body that is present and names
+  no height.
 
 `max_height` alongside `preferred_height` is the hard ceiling that ladder stays
 under, so a manifest can say "my screen is 1080" and "I chose 720" at once. A

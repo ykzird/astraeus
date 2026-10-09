@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,6 +34,7 @@ import (
 	"github.com/ykzird/astraeus/internal/access"
 	"github.com/ykzird/astraeus/internal/api"
 	"github.com/ykzird/astraeus/internal/images"
+	"github.com/ykzird/astraeus/internal/jobs"
 	"github.com/ykzird/astraeus/internal/library"
 	"github.com/ykzird/astraeus/internal/library/sqlite"
 	"github.com/ykzird/astraeus/internal/metadata"
@@ -111,10 +113,52 @@ type config struct {
 
 func (c *config) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.dbPath, "db", "astraeus.db", "path to the SQLite database file")
-	fs.StringVar(&c.tmdbKey, "tmdb-key", os.Getenv("TMDB_API_KEY"),
-		"TMDB API key; without one, synthetic metadata is used instead")
+	// The default is deliberately empty and the environment is read after
+	// parsing, in open. Using os.Getenv here as the default would print the
+	// key in `-h` output and in the usage block flag.ExitOnError prints on any
+	// parse error, which is exactly how a typo in a unit file writes a secret
+	// into the journal.
+	fs.StringVar(&c.tmdbKey, "tmdb-key", "",
+		"TMDB API key; defaults to $TMDB_API_KEY, and without one synthetic metadata is used instead")
 	fs.StringVar(&c.logLevel, "log-level", "info", "log level: debug, info, warn or error")
 	fs.StringVar(&c.logFormat, "log-format", "text", "log format: text or json")
+}
+
+// applyEnv fills values the operator set in the environment rather than on the
+// command line. It runs after flag parsing so that a secret never becomes a
+// flag default, and an explicit flag still wins.
+func (c *config) applyEnv() {
+	if c.tmdbKey == "" {
+		c.tmdbKey = os.Getenv("TMDB_API_KEY")
+	}
+}
+
+// resolveIdentityHeader turns --auth-header/--auth-provider into the single
+// header the gate will believe. It deliberately has no default: a header the
+// proxy in front does not overwrite is an identity any client can claim, so
+// naming the proxy is the operator's decision, not the code's.
+//
+// Naming both spellings of the same thing is an error rather than a precedence
+// rule, because the two can disagree and only the operator knows which one is
+// right.
+func resolveIdentityHeader(header, provider string) (string, error) {
+	header = strings.TrimSpace(header)
+	provider = strings.TrimSpace(provider)
+
+	if header != "" && provider != "" {
+		return "", errors.New("--auth-header and --auth-provider are mutually exclusive; " +
+			"use --auth-header for a custom proxy header or --auth-provider for a known one")
+	}
+	if provider != "" {
+		resolved, ok := access.IdentityProviderHeader(provider)
+		if !ok {
+			return "", fmt.Errorf("unknown --auth-provider %q: want one of %s, "+
+				"or name a custom header with --auth-header",
+				provider, strings.Join(access.IdentityProviders(), ", "))
+		}
+		return resolved, nil
+	}
+	return header, nil
 }
 
 // newLogger builds the structured logger described by the config.
@@ -147,6 +191,8 @@ type env struct {
 }
 
 func (c *config) open() (*env, error) {
+	c.applyEnv()
+
 	logger, err := c.newLogger()
 	if err != nil {
 		return nil, err
@@ -191,7 +237,8 @@ func runServe(args []string) error {
 	var cfg config
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfg.register(fs)
-	addr := fs.String("addr", ":8642", "address to listen on")
+	addr := fs.String("addr", "127.0.0.1:8642",
+		"address to listen on; loopback by default, so serving the LAN is an explicit choice")
 	enrichInterval := fs.Duration("enrich-interval", 6*time.Hour,
 		"how often the background metadata worker runs; 0 disables it")
 	scanInterval := fs.Duration("scan-interval", 6*time.Hour,
@@ -205,6 +252,11 @@ func runServe(args []string) error {
 	deviceDir := fs.String("device-dir", "/dev/dri",
 		"directory containing hardware transcoding devices (Intel QuickSync / VAAPI)")
 	segmentSeconds := fs.Int("segment-seconds", 6, "target HLS segment duration in seconds")
+	sessionTTL := fs.Duration("session-ttl", 30*time.Minute,
+		"how long an idle streaming session is kept before its encoder is stopped. "+
+			"An idle session is one no client has asked for, which includes a viewer who "+
+			"paused: hls.js stops polling once a playlist is complete, so a short TTL ends "+
+			"playback under a viewer who is still watching")
 	webDir := fs.String("web-dir", "web", "directory of static UI assets served at /; empty serves the API only")
 	imageCache := fs.String("image-cache", filepath.Join(os.TempDir(), "astraeus-images"),
 		"directory caching artwork proxied from the metadata provider")
@@ -212,21 +264,30 @@ func runServe(args []string) error {
 		"upstream root for artwork images")
 	subtitleCache := fs.String("subtitle-cache", filepath.Join(os.TempDir(), "astraeus-subtitles"),
 		"directory caching subtitle tracks converted to WebVTT")
+	ocrTimeout := fs.Duration("ocr-timeout", 30*time.Minute,
+		"how long one image-subtitle recognition pass may take; it runs tesseract once per cue, "+
+			"so a feature-length track needs far more than a demux does")
 	tesseractBin := fs.String("tesseract-bin", "tesseract",
-		"OCR executable used to read image subtitles (PGS) into text; a missing one leaves them burn-only")
+		"OCR executable used to read image subtitles (PGS, VobSub) into text; a missing one leaves them burn-only")
 	ocrLanguage := fs.String("ocr-language", "",
 		"language passed to the OCR executable, for example eng; empty uses its own default")
 
 	authMode := fs.String("auth-mode", string(access.ModeNone),
 		"access gate: none, proxy (trust an identity header from the access proxy) or token")
-	authHeaders := fs.String("auth-header", strings.Join(access.DefaultIdentityHeaders, ","),
-		"identity headers believed from the access proxy (comma separated, proxy mode)")
+	authHeaders := fs.String("auth-header", "",
+		"the single identity header the access proxy sets (required in proxy mode, or use --auth-provider)")
+	authProvider := fs.String("auth-provider", "",
+		"the identity proxy in front: "+strings.Join(access.IdentityProviders(), " or ")+
+			" (an alternative to --auth-header)")
 	trustedProxies := fs.String("trusted-proxy", "",
 		"addresses or CIDRs whose identity headers are believed (comma separated, required in proxy mode)")
-	authToken := fs.String("auth-token", os.Getenv("ASTRAEUS_AUTH_TOKEN"),
-		"bearer token for token mode; prefer setting ASTRAEUS_AUTH_TOKEN over passing it as an argument")
+	authToken := fs.String("auth-token", "",
+		"bearer token for token mode; prefer setting ASTRAEUS_AUTH_TOKEN, which is used when this is empty")
 	authExempt := fs.String("auth-exempt", "/api/health",
 		"paths that bypass the access gate (comma separated, exact matches)")
+	accessPolicy := fs.String("access-policy", "",
+		"access policy file: which libraries each viewer may see, and who may change the library "+
+			"(empty means every admitted viewer sees and may change everything)")
 	rateLimit := fs.Float64("rate-limit", 0,
 		"API requests per second allowed per client (0 disables; only /api paths are limited)")
 	rateLimitBurst := fs.Int("rate-limit-burst", 0,
@@ -235,8 +296,24 @@ func runServe(args []string) error {
 		"OTLP/HTTP endpoint to export traces to, for example http://127.0.0.1:4318 (empty disables tracing)")
 	otelServiceName := fs.String("otel-service-name", "astraeus-media",
 		"service.name recorded on exported traces")
+	allowedHosts := fs.String("allowed-hosts", "",
+		"Host names this server answers for, comma separated; empty means loopback, this host's name "+
+			"and any address named by --addr")
+	crossOrigin := fs.Bool("cross-origin-protection", true,
+		"refuse state-changing requests a browser made from another origin")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	identityHeader, err := resolveIdentityHeader(*authHeaders, *authProvider)
+	if err != nil {
+		return err
+	}
+	// The token is read from the environment only after parsing, so it never
+	// becomes a flag default that `-h` or a mistyped flag would print. An
+	// explicit --auth-token still wins.
+	if *authToken == "" {
+		*authToken = os.Getenv("ASTRAEUS_AUTH_TOKEN")
 	}
 
 	app, err := cfg.open()
@@ -255,33 +332,86 @@ func runServe(args []string) error {
 	observability.DeclareKPIs(metrics)
 	app.worker.SetMetrics(metrics)
 
+	// The Host check is what makes DNS rebinding useless: a name the operator
+	// did not list is answered with 421 rather than with the library.
+	hosts, err := api.ParseAllowedHosts([]string{*allowedHosts})
+	if err != nil {
+		return err
+	}
+	if len(hosts) == 0 {
+		hosts = api.WithLocalHostname(api.DefaultAllowedHosts(*addr))
+	}
+
 	// Validate the access configuration before anything starts, so a mistake
 	// fails immediately instead of after the server has begun working.
 	mode, err := access.ParseMode(*authMode)
 	if err != nil {
 		return err
 	}
+	// The identity header is only meaningful in proxy mode. Saying so is
+	// deliberate: an operator who sets it in token mode believes the gate is
+	// checking a proxy header it never looks at.
+	if mode != access.ModeProxy && identityHeader != "" {
+		return fmt.Errorf("an identity header (--auth-header or --auth-provider) is only used in proxy mode, not %s", mode)
+	}
 	prefixes, err := access.ParseTrustedProxies([]string{*trustedProxies})
 	if err != nil {
 		return err
 	}
 	gate, err := access.New(access.Config{
-		Mode:            mode,
-		IdentityHeaders: splitList(*authHeaders),
-		TrustedProxies:  prefixes,
-		Token:           *authToken,
-		ExemptPaths:     splitList(*authExempt),
-		Metrics:         metrics,
-		Logger:          app.logger,
+		Mode:           mode,
+		IdentityHeader: identityHeader,
+		TrustedProxies: prefixes,
+		Token:          *authToken,
+		ExemptPaths:    splitList(*authExempt),
+		Metrics:        metrics,
+		Logger:         app.logger,
 	})
 	if err != nil {
 		return err
 	}
 
+	// The access policy is what turns a gate that admits a request into one that
+	// decides what the request may see. It is optional: without a file every
+	// admitted viewer sees every library, which is what an install has always
+	// done. A file that cannot be read is an error rather than a fallback,
+	// because starting open when the operator asked for restricted is the one
+	// failure mode this must not have.
+	var policy *access.Policy
+	if *accessPolicy != "" {
+		policy, err = access.LoadPolicy(*accessPolicy)
+		if err != nil {
+			return err
+		}
+		app.logger.Info("access policy loaded",
+			"path", policy.Source(),
+			"viewers", policy.Viewers(),
+			"admins", policy.Admins(),
+			"default", map[bool]string{true: "all", false: "none"}[policy.DefaultAll()])
+	}
+
+	// Long work runs on a runner rather than inside the request that asked for
+	// it. It descends from the signal context, so a shutdown cancels the jobs
+	// while a client going away does not - which is the difference the review's
+	// W-2 turns on: the UI's fifteen-second timeout used to end the scan. The
+	// background loops use it too, so a manual pass and a periodic one cannot
+	// overlap.
+	runner := jobs.New(ctx, jobs.Config{}, app.logger)
+	defer runner.Close()
+
+	// One worker, not two. This used to build a second metadata.Worker for the
+	// background loop while the API kept the one env.open made, so an enrichment
+	// pass driven from the API and a periodic one could overlap: both walked the
+	// same incomplete entities and both called the provider, which is a wasted
+	// lookup per entity against a rate-limited API (A-B7 of the 2026-10-09
+	// review). app.worker is the one the API submits to, so it is the one the
+	// loop drives.
 	if *enrichInterval > 0 {
-		worker := metadata.NewWorker(app.repo, app.provider, *enrichInterval, app.logger)
-		worker.SetMetrics(metrics)
-		go worker.Start(ctx)
+		// The loop defers to the same key the API uses, so a tick that lands
+		// while a manual enrich is running does nothing rather than repeating
+		// every provider lookup.
+		app.worker.SetDedupe(runner)
+		go app.worker.Start(ctx)
 	}
 
 	// Periodic scanning is what makes files appear without anyone asking; the
@@ -291,13 +421,16 @@ func runServe(args []string) error {
 	go scheduler.Start(ctx)
 
 	deps := api.Deps{
-		Repository: app.repo,
-		Scanner:    app.scanner,
-		Scheduler:  scheduler,
-		Worker:     app.worker,
-		Metrics:    metrics,
-		WebDir:     *webDir,
-		Logger:     app.logger,
+		Repository:  app.repo,
+		Scanner:     app.scanner,
+		Scheduler:   scheduler,
+		Worker:      app.worker,
+		Jobs:        runner,
+		Metrics:     metrics,
+		Policy:      policy,
+		WebDir:      *webDir,
+		CrossOrigin: *crossOrigin,
+		Logger:      app.logger,
 	}
 
 	// Tracing is opt-in and off without an endpoint: a media server should not
@@ -395,6 +528,7 @@ func runServe(args []string) error {
 			FFmpegBin:      *ffmpegBin,
 			RootDir:        *streamRoot,
 			SegmentSeconds: *segmentSeconds,
+			SessionTTL:     *sessionTTL,
 			MaxSessions:    *maxSessions,
 			Server:         deps.Server,
 			Metrics:        metrics,
@@ -413,10 +547,17 @@ func runServe(args []string) error {
 		// their burn-in path, and this is said at startup rather than
 		// discovered when a client asks for one.
 		subtitleService, err := subtitles.New(subtitles.Config{
-			FFmpegBin:    *ffmpegBin,
+			FFmpegBin: *ffmpegBin,
+			// The probe binary too. Leaving it out meant the subtitle service
+			// looked up "ffprobe" in PATH whatever --ffprobe said, so an install
+			// that points at a vendored or renamed binary worked for playback and
+			// silently did not for image subtitles (L-14 of the 2026-10-09
+			// review).
+			FFprobeBin:   *ffprobeBin,
 			TesseractBin: *tesseractBin,
 			OCRLanguage:  *ocrLanguage,
 			CacheDir:     *subtitleCache,
+			OCRTimeout:   *ocrTimeout,
 			Logger:       app.logger,
 		})
 		if err != nil {
@@ -438,6 +579,11 @@ func runServe(args []string) error {
 
 	handler := api.NewServer(deps).Handler()
 
+	// The Host check is outermost: a name the operator did not list is refused
+	// before routing, before the gate, and before anything reads the library.
+	handler = api.HostAllowlist(hosts, handler)
+	app.logger.Info("host names accepted", "hosts", hosts)
+
 	// The access gate wraps everything, including the UI and /metrics.
 	handler = gate.Middleware(handler)
 	if mode != access.ModeNone {
@@ -446,9 +592,31 @@ func runServe(args []string) error {
 	}
 
 	server := &http.Server{
-		Addr:              *addr,
-		Handler:           handler,
+		Addr:    *addr,
+		Handler: handler,
+		// Bounded reads, unbounded writes. A request that cannot finish sending
+		// its headers or its body is not a client this server needs to keep, and
+		// holding the connection is a way to spend its sockets one slow byte at a
+		// time (A-9 of the 2026-10-09 review).
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// A client that keeps a connection open and sends nothing is also not
+		// worth a socket. Well above a browser's own keep-alive, so an idle tab
+		// reconnects rather than being cut off.
+		IdleTimeout: 120 * time.Second,
+		// MaxHeaderBytes is left at Go's default of 1 MiB, which is a large
+		// allowance for headers this server does not read beyond a token, an
+		// identity and a content type. It is lowered here to a size that still
+		// fits a long URL and every header a browser sends.
+		MaxHeaderBytes: 64 << 10,
+
+		// WriteTimeout is deliberately unset. HLS is served by holding a response
+		// open and writing segments as they are produced, and a write deadline
+		// would cut a stream off mid-film. The handlers that can write slowly
+		// bound themselves: session segments come from a directory the producer
+		// is filling, and the job endpoints answer immediately rather than
+		// waiting. An operator who wants a deadline can set one per handler with
+		// http.ResponseController.
 	}
 
 	errCh := make(chan error, 1)
@@ -511,6 +679,9 @@ func runScan(args []string) error {
 	for _, warning := range result.Warnings {
 		fmt.Printf("  warning: %s\n", warning)
 	}
+	for _, notice := range result.Notices {
+		fmt.Printf("  notice: %s\n", notice)
+	}
 	fmt.Println("\nRun 'astraeus-server enrich' to attach metadata.")
 	return nil
 }
@@ -530,6 +701,18 @@ func resolveLibrary(ctx context.Context, app *env, libraryID, path, kind, name s
 			return existing, nil
 		} else if !errors.Is(err, library.ErrNotFound) {
 			return nil, err
+		}
+
+		// The same refusal the API makes, because a CLI that registers an
+		// overlapping root creates the same problem: two libraries taking turns
+		// owning one file, with the entity it belongs to following the scan order
+		// (L-15 of the 2026-10-09 review).
+		registered, err := app.repo.ListLibraries(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if overlap, found := library.FindOverlap(registered, abs); found {
+			return nil, fmt.Errorf("registering %s: %w", abs, overlap)
 		}
 
 		parsedKind, err := library.ParseLibraryKind(kind)
@@ -743,7 +926,32 @@ func apiClientKey(r *http.Request) string {
 		return "identity:" + identity
 	}
 	if addr, ok := access.ClientAddress(r); ok {
-		return "address:" + addr.String()
+		return "address:" + rateLimitAddress(addr)
 	}
 	return ""
+}
+
+// rateLimitAddress groups an address the way a rate limit wants it grouped.
+//
+// An IPv6 host is routinely given a whole /64, and a single machine can use any
+// address in it. Keying per address therefore handed one host 2^64 buckets and
+// made the limit meaningless for exactly the clients most likely to run a loop
+// (A-6 of the 2026-10-09 review). The /64 is the unit that is actually allocated,
+// so it is the unit that is limited.
+//
+// IPv4 is left alone. It is not allocated in blocks that size to one client, and
+// widening it - 127.0.0.0/24 would put a whole LAN in one bucket - would start
+// charging one client for another's requests.
+func rateLimitAddress(addr netip.Addr) string {
+	if !addr.Is6() {
+		return addr.String()
+	}
+	prefix, err := addr.Prefix(64)
+	if err != nil {
+		// Not reachable for a valid IPv6 address, but a key is not the place to
+		// panic; falling back to the address narrows the bucket rather than
+		// widening it.
+		return addr.String()
+	}
+	return prefix.String()
 }

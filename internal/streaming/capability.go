@@ -48,9 +48,17 @@ type ClientCapability struct {
 	SupportsHDR bool `json:"supports_hdr"`
 	// AudioTrackIndex selects which audio stream to deliver, as the ffmpeg
 	// stream index reported in a probe's audio_tracks. Zero means the server's
-	// choice: the track the file marks default, or its first. A track that does
-	// not exist is not an error - the default is delivered and the reasons say
-	// so - because a missing track is not a reason to refuse the film.
+	// choice: the track the file marks default, or its first.
+	//
+	// A track that does not exist does not stop negotiation - the default is
+	// delivered and the Reasons say so - because a missing track is not a reason
+	// to refuse the film. That is this type's own tolerance and not the API's
+	// answer, which is 400 unknown_audio_track: by the time a request arrives the
+	// client has been told which indices exist, so an index the file does not
+	// have is a typo worth naming rather than something to quietly reinterpret.
+	// The two are consistent - the boundary refuses, and this fallback exists for
+	// callers that are not a request - but the comment used to read as though the
+	// API never refuses.
 	AudioTrackIndex int `json:"audio_track_index"`
 	// MaxAudioChannels is the most channels the client can decode. Chromium's
 	// media pipeline refuses a 5.1 AAC SourceBuffer, and browsers output stereo
@@ -67,7 +75,15 @@ type ClientCapability struct {
 	BurnSubtitleIndex int `json:"burn_subtitle_index"`
 	// SupportsHLS enables the segmented delivery modes.
 	SupportsHLS bool `json:"supports_hls"`
-	// Subtitles indicates the client can render subtitle tracks.
+	// Subtitles indicates the client can render subtitle tracks. A client that
+	// says false is not sent any: the tracks are omitted from the playback
+	// response rather than the request refused, because a client that cannot
+	// render them loses nothing and this is information it already gave.
+	//
+	// The zero value is false, and the built-in profile sets it true, so a client
+	// that sends no body is offered subtitles as a browser would expect. A client
+	// that sends a body must say so - which is why every documented example
+	// includes it.
 	Subtitles bool `json:"subtitles"`
 }
 
@@ -226,6 +242,80 @@ var videoCodecPreference = []string{"h264", "hevc", "vp9", "av1"}
 // no browser or television treats it as an HDR format, so re-encoding PQ content
 // into it produces a stream that plays as washed-out SDR.
 var hdrVideoCodecPreference = []string{"hevc", "av1", "vp9"}
+
+// segmentContainerCanCarry reports whether the container the segmented modes
+// actually mux into can carry a codec.
+//
+// The segmented modes always mux MPEG-TS (hls.go passes no -hls_segment_type),
+// and MPEG-TS is not a general container: it carries H.264 and HEVC, and it
+// carries almost nothing else. A stream it cannot describe is still accepted by
+// ffmpeg - exit status 0, no warning - and written out as a private stream of
+// type 6, which every probe then reports as "bin_data". The session appears to
+// start and the viewer gets a black or silent picture with nothing in the log
+// (S-3 of the 2026-10-09 review).
+//
+// Measured on this host, muxing one stream of each codec into MPEG-TS:
+//
+//	h264, hevc        carried
+//	vp9, av1          bin_data        (VP9 also measured through -c copy)
+//	flac, vorbis      bin_data
+//	aac, mp3, ac3     carried
+//
+// So a stream whose codecs this reports false for has to be re-encoded rather
+// than copied, even when the client would have decoded it happily: the client's
+// capability is about what it can play, and this is about what the segment
+// container can hold. The two are different questions and the code only asked
+// the first one.
+//
+// The durable fix is fMP4 segments, which carry all of these and are what Apple
+// requires for HEVC. Until then this table is what keeps negotiation honest, and
+// it is deliberately a table rather than a rule so that its entries can be
+// checked one at a time.
+func segmentContainerCanCarry(codec string) bool {
+	switch NormaliseVideoCodec(codec) {
+	case "h264", "hevc":
+		return true
+	}
+	switch NormaliseAudioCodec(codec) {
+	case "aac", "mp3", "ac3", "eac3":
+		return true
+	}
+	return false
+}
+
+// uncarriableCodecs names the codecs that forced a re-encode because the segment
+// container cannot hold them, for the decision's Reasons.
+func uncarriableCodecs(info *MediaInfo, hasAudio bool, audioCodec string) string {
+	var names []string
+	if !segmentContainerCanCarry(info.VideoCodec) {
+		names = append(names, info.VideoCodec)
+	}
+	if hasAudio && !segmentContainerCanCarry(audioCodec) {
+		names = append(names, audioCodec)
+	}
+	if len(names) == 0 {
+		// Unreachable when the caller checked first, but a blank name would be
+		// worse than saying nothing.
+		return "a codec in this file"
+	}
+	return strings.Join(names, " and ")
+}
+
+// codecCanCarryHDR reports whether a video codec can deliver high dynamic range.
+//
+// H.264 cannot, which is why it is absent from hdrVideoCodecPreference and why
+// negotiation tone maps an HDR source rather than targeting it (S-6 of the
+// 2026-10-09 review). The predicate is stated separately from the preference
+// order because the two answer different questions: the list is about what to
+// prefer, this is about what is possible.
+func codecCanCarryHDR(codec string) bool {
+	switch NormaliseVideoCodec(codec) {
+	case "hevc", "av1", "vp9":
+		return true
+	default:
+		return false
+	}
+}
 
 // audioCodecPreference is the equivalent order for audio.
 var audioCodecPreference = []string{"aac", "opus", "mp3", "ac3", "eac3", "flac"}

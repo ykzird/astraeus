@@ -2,6 +2,16 @@ module github.com/ykzird/astraeus
 
 go 1.26.3
 
+// The toolchain line is what keeps the released binary off a Go with known
+// stdlib vulnerabilities. It is deliberately the newest 1.26 patch rather than
+// the minimum this module needs: `go` stays at the language version the code is
+// written against, while every build - CI, release and the Dockerfile builder -
+// uses this toolchain, and `toolchain` outranks whatever Go the runner happens
+// to have installed. Dependabot raises dependencies, not this line, so it is
+// bumped by hand when a patch releases; govulncheck in CI is what makes a
+// forgotten bump fail loudly.
+toolchain go1.26.9
+
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jmoiron/sqlx v1.4.0

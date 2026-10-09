@@ -50,14 +50,51 @@ type ImageCue struct {
 }
 
 // ParsePGS decodes a .sup stream into its cues, in presentation order.
+//
+// It collects every cue, which means every cue's decoded bitmap is held at once.
+// A caller that only needs to look at each cue in turn - OCR does - should use
+// StreamPGS instead (L-3 of the 2026-10-09 review).
 func ParsePGS(r io.Reader) ([]ImageCue, error) {
+	var cues []ImageCue
+	err := StreamPGS(r, func(cue ImageCue) error {
+		cues = append(cues, cue)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cues, nil
+}
+
+// StreamPGS decodes a .sup stream and hands each cue to emit as soon as it is
+// complete, without retaining it.
+//
+// This is the shape a feature-length track needs. A subtitle bitmap is a decoded
+// RGBA image - a 4K one is tens of megabytes - and a broadcast track has
+// thousands of cues, so collecting them all before doing anything with them
+// holds the whole track in memory at once. OCR only ever looks at one cue at a
+// time, so streaming lets each image be recognised and dropped.
+//
+// emit must not retain the cue's Image: the caller is free to reuse it.
+func StreamPGS(r io.Reader, emit func(ImageCue) error) error {
 	decoder := newPGSDecoder()
 
 	var (
-		cues    []ImageCue
 		open    *ImageCue
 		lastPTS uint32
 	)
+
+	// close hands the open cue on and clears it, so its image is released as
+	// soon as the caller has seen it.
+	closeOpen := func(end time.Duration) error {
+		if open == nil || end <= open.Start {
+			return nil
+		}
+		cue := *open
+		cue.End = end
+		open = nil
+		return emit(cue)
+	}
 
 	for {
 		segment, err := readPGSSegment(r)
@@ -65,7 +102,7 @@ func ParsePGS(r io.Reader) ([]ImageCue, error) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		lastPTS = segment.pts
 
@@ -82,10 +119,8 @@ func ParsePGS(r io.Reader) ([]ImageCue, error) {
 			var display *pgsDisplay
 			display, err = decoder.complete()
 			if err == nil && display != nil {
-				if open != nil {
-					open.End = pgsDuration(display.pts)
-					cues = append(cues, *open)
-					open = nil
+				if err := closeOpen(pgsDuration(display.pts)); err != nil {
+					return err
 				}
 				if display.image != nil {
 					open = &ImageCue{Start: pgsDuration(display.pts), Image: display.image}
@@ -93,19 +128,13 @@ func ParsePGS(r io.Reader) ([]ImageCue, error) {
 			}
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	// A stream whose last cue is never cleared still has a cue: it ends where
 	// the stream does. A zero-length one is dropped rather than handed on.
-	if open != nil {
-		if end := pgsDuration(lastPTS); end > open.Start {
-			open.End = end
-			cues = append(cues, *open)
-		}
-	}
-	return cues, nil
+	return closeOpen(pgsDuration(lastPTS))
 }
 
 // pgsDuration converts a 90 kHz presentation timestamp to a duration.
@@ -285,7 +314,20 @@ func (d *pgsDecoder) addODS(body []byte) error {
 // A set with no composition objects clears the screen, except when it is only
 // updating the palette, which leaves what is on screen in place.
 func (d *pgsDecoder) complete() (*pgsDisplay, error) {
-	defer func() { d.pending = pgsPresentation{} }()
+	defer func() {
+		d.pending = pgsPresentation{}
+		// The objects are released with the display set that used them. Only a
+		// display set whose palette is being updated without new objects leaves
+		// the screen alone, and that case has no objects to release either.
+		//
+		// Keeping them was an unbounded retention rather than a lookup cache:
+		// every bitmap ever decoded for the stream stayed reachable, so a
+		// feature-length track's worth of images stayed resident even after the
+		// cue that used them had been handed on (L-3 of the 2026-10-09 review).
+		// A display set that needs an object always sends its ODS, so nothing
+		// is lost by dropping them.
+		d.objects = make(map[uint16]*pgsObject)
+	}()
 
 	if !d.pending.havePCS {
 		return nil, nil
@@ -323,6 +365,13 @@ func (d *pgsDecoder) compose() *image.RGBA {
 		if object == nil || object.width <= 0 || object.height <= 0 {
 			continue
 		}
+		// A position is clamped rather than trusted: the field is a 16-bit
+		// unsigned number, so an object can claim to sit 65535 pixels away from
+		// anything, which is how the 17 GB bounding box was reachable. Clamping
+		// keeps the picture - a real subpicture's elements are inside the frame -
+		// and an element entirely outside it simply contributes nothing.
+		element.x = clampPGSCoord(element.x)
+		element.y = clampPGSCoord(element.y)
 		if len(items) == 0 {
 			minX, minY = element.x, element.y
 			maxX, maxY = element.x+object.width, element.y+object.height
@@ -338,7 +387,15 @@ func (d *pgsDecoder) compose() *image.RGBA {
 		return nil
 	}
 
-	img := image.NewRGBA(image.Rect(0, 0, maxX-minX, maxY-minY))
+	width, height := maxX-minX, maxY-minY
+	if width <= 0 || height <= 0 {
+		return nil
+	}
+	if err := checkPGSPlane(width, height); err != nil {
+		return nil
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	for _, item := range items {
 		for row := 0; row < item.object.height; row++ {
 			for column := 0; column < item.object.width; column++ {
@@ -353,6 +410,62 @@ func (d *pgsDecoder) compose() *image.RGBA {
 	return img
 }
 
+// PGS resources are bounded, because the input is not trusted.
+//
+// A library file is usually a download, and the PGS bitmap inside it is just
+// bytes: the format's width and height are 16-bit fields, so a 125-byte stream
+// can declare two 1x1 objects at (0,0) and (65535,65535). Composing those needs
+// a bounding box 65536 pixels square, which is image.NewRGBA asking for 17 GB -
+// and that is a runtime fatal error rather than a panic, so net/http cannot
+// recover it and the process dies on the first OCR request (L-3 of the 2026-10-09
+// review).
+//
+// The limits are generous rather than tight. A composition canvas larger than
+// 8K cannot be a real subpicture: the largest commercial format is 4K, whose
+// frame is 8.3 megapixels, so the pixel cap is set above that and a single
+// object bigger than a whole 8K frame is treated as malformed.
+const (
+	// maxPGSCanvasDimension bounds a declared video or object dimension.
+	maxPGSCanvasDimension = 8192
+	// maxPGSPixels bounds one object's plane and one composed image, at about
+	// 67 megapixels - eight times a 4K frame, so no real subpicture is refused.
+	maxPGSPixels = 64 << 20
+)
+
+// checkPGSPlane refuses a bitmap whose geometry could not come from a real
+// subpicture, before anything is allocated for it.
+//
+// The check is on the dimensions and on their product: a 65535x65535 object has
+// a plausible-looking width and an implausible area, and it is the area that
+// decides how much memory the plane needs.
+func checkPGSPlane(width, height int) error {
+	if width <= 0 || height <= 0 {
+		return fmt.Errorf("%w: a %dx%d bitmap is empty", ErrInvalidPGS, width, height)
+	}
+	if width > maxPGSCanvasDimension || height > maxPGSCanvasDimension {
+		return fmt.Errorf("%w: a %dx%d bitmap exceeds the %d-pixel limit",
+			ErrInvalidPGS, width, height, maxPGSCanvasDimension)
+	}
+	if width*height > maxPGSPixels {
+		return fmt.Errorf("%w: a %dx%d bitmap is %d pixels, over the %d-pixel limit",
+			ErrInvalidPGS, width, height, width*height, maxPGSPixels)
+	}
+	return nil
+}
+
+// clampPGSCoord bounds one element position. Real positions are inside a video
+// frame, so a value beyond the largest canvas dimension is a malformed or
+// hostile stream rather than a place on screen.
+func clampPGSCoord(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > maxPGSCanvasDimension {
+		return maxPGSCanvasDimension
+	}
+	return value
+}
+
 // decodePGSObject decodes one object's data: its size, then a run-length
 // encoded plane of palette indexes.
 func decodePGSObject(data []byte) (*pgsObject, error) {
@@ -364,6 +477,9 @@ func decodePGSObject(data []byte) (*pgsObject, error) {
 	if width <= 0 || height <= 0 {
 		return nil, nil
 	}
+	if err := checkPGSPlane(width, height); err != nil {
+		return nil, err
+	}
 	indexes, err := decodePGSRLE(data[4:], width, height)
 	if err != nil {
 		return nil, err
@@ -374,7 +490,17 @@ func decodePGSObject(data []byte) (*pgsObject, error) {
 // decodePGSRLE expands the object's run-length encoding into width*height
 // palette indexes. The encoding has four forms, chosen by the top two bits of
 // the byte after a zero: a short clear run, a long clear run, a short coloured
-// run, and a long coloured run. A non-zero first byte is itself a run length.
+// run, and a long coloured run.
+//
+// A non-zero first byte is not a run length. It is one pixel of that palette
+// index, and reading it as "count then colour" is L-1 of the 2026-10-09 review:
+// it also swallows the byte that follows, which on real Blu-ray subtitles is
+// very often the 0x00 that opens the next escape, so every later run is
+// misframed. The fixture encoder made the same misreading, which is why the
+// tests agreed with the code.
+//
+// ffmpeg's pgssubdec.c is the reference: a non-zero byte is the colour and the
+// run is one pixel.
 func decodePGSRLE(data []byte, width, height int) ([]byte, error) {
 	total := width * height
 	indexes := make([]byte, 0, total)
@@ -389,12 +515,9 @@ func decodePGSRLE(data []byte, width, height int) ([]byte, error) {
 			count int
 		)
 		if first := data[offset]; first != 0 {
+			// One pixel of this colour; nothing follows it in the stream.
 			offset++
-			if offset >= len(data) {
-				return nil, fmt.Errorf("%w: object data ended inside a run", ErrInvalidPGS)
-			}
-			value, count = data[offset], int(first)
-			offset++
+			value, count = first, 1
 		} else {
 			offset++
 			if offset >= len(data) {

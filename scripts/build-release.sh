@@ -82,13 +82,18 @@ for platform in "${platforms[@]}"; do
 	cp README.md SPECIFICATION.md TODO.md CONTEXT.md CONTRIBUTING.md SECURITY.md "$stage/"
 	cp -R deploy "$stage/"
 
+	# The README's header image is a relative path, so a reader of the installed
+	# README needs the file beside it. Shipping the README without its assets
+	# leaves a broken image in the one document a new user opens first.
+	cp -R assets "$stage/"
+
 	# Of docs/, ship only the pages a reader of the installed README needs to use
 	# the thing. The repository's own working documents - handoff.md, and the
 	# reviews - are about building it, not using it, and installing an internal
 	# audit onto a user's host is noise they did not ask for.
 	mkdir -p "$stage/docs"
 	cp docs/index.md docs/playback.md docs/configuration.md docs/api.md \
-		docs/development.md "$stage/docs/"
+		docs/development.md docs/troubleshooting.md "$stage/docs/"
 
 	# That runbook is this layout's acceptance test, so run it here. A missing
 	# file is a broken release, and this is the last point at which the build
@@ -96,7 +101,9 @@ for platform in "${platforms[@]}"; do
 	for f in astraeus-server web README.md SPECIFICATION.md TODO.md CONTEXT.md \
 		CONTRIBUTING.md SECURITY.md LICENSE THIRD_PARTY_NOTICES.md deploy \
 		deploy/astraeus.service docs/index.md docs/playback.md \
-		docs/configuration.md docs/api.md docs/development.md; do
+		docs/configuration.md docs/api.md docs/development.md \
+		docs/troubleshooting.md \
+		assets/astraeus.png; do
 		[[ -e "$stage/$f" ]] || {
 			echo "build-release: $f is missing from $name, so the runbook in deploy/README.md cannot be followed from this archive" >&2
 			exit 1

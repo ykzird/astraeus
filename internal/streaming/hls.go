@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/ykzird/astraeus/internal/ffmpegprocess"
 	"github.com/ykzird/astraeus/internal/observability"
 	"github.com/ykzird/astraeus/internal/tracing"
 )
@@ -25,9 +26,21 @@ const (
 	// defaultSegmentSeconds is the HLS target segment duration. Six seconds is
 	// the usual compromise between startup latency and request overhead.
 	defaultSegmentSeconds = 6
-	// defaultSessionTTL is how long an unwatched session is kept before its
-	// ffmpeg process is stopped.
-	defaultSessionTTL = 2 * time.Minute
+	// defaultSessionTTL is how long an idle session is kept before its ffmpeg
+	// process is stopped.
+	//
+	// Idle means no client has asked for anything, which is not the same as
+	// unwatched. hls.js stops polling once a playlist carries #EXT-X-ENDLIST -
+	// which a fast remux writes well before the viewer has finished watching - so
+	// a short TTL ends the session under someone who paused. At two minutes the
+	// review measured exactly that: the session was reaped and the UI offered
+	// "Recovery was not possible" (S-10 of the 2026-10-09 review).
+	//
+	// Half an hour covers a pause, a phone call, and a viewer who walked away
+	// without closing the tab. It is configurable with --session-ttl, because the
+	// right value is a function of how the install is used rather than of
+	// anything the server knows.
+	defaultSessionTTL = 30 * time.Minute
 	// playlistWait bounds how long Start waits for ffmpeg to publish a
 	// playlist before giving up.
 	playlistWait = 30 * time.Second
@@ -35,8 +48,25 @@ const (
 	stderrLimit = 8 << 10
 )
 
+// recordStreamFailure counts one failed session, in the one place that does it.
+func recordStreamFailure(metrics *observability.Metrics, metric string, mode PlaybackMode) {
+	metrics.IncCounter(metric,
+		"Segmented streaming failures: sessions that never produced a playlist, plus ffmpeg exiting unexpectedly.",
+		map[string]string{"mode": string(mode)})
+}
+
 // ErrTooManySessions is returned when the concurrent stream limit is reached.
 var ErrTooManySessions = errors.New("streaming: too many concurrent sessions")
+
+// errFFmpegFailed marks a failure that came from ffmpeg itself, as opposed to
+// one the request hit before ffmpeg was any part of the problem.
+//
+// The distinction decides whether the hardware-to-software retry is worth
+// attempting (S-11 of the 2026-10-09 review). Falling back on a capacity refusal
+// logged "hardware transcode failed" and started a second ffmpeg for a request
+// the software encoder would refuse just as fast, and falling back on a client
+// disconnect spawned a process nobody was waiting for.
+var errFFmpegFailed = errors.New("streaming: ffmpeg failed")
 
 // sessionMarkerFile marks a directory as ours. The reaper removes only
 // directories carrying it.
@@ -123,6 +153,21 @@ func (s *Session) PlaylistPath() string {
 // Done is closed once the underlying ffmpeg process has exited.
 func (s *Session) Done() <-chan struct{} { return s.done }
 
+// Failed reports whether the session's encoder exited with an error.
+//
+// It is false while the session runs and false when it finishes successfully,
+// which is what lets a caller tell "this stream is broken" from "this stream is
+// over" - the first is worth ending early, the second must keep serving its last
+// segments.
+func (s *Session) Failed() bool {
+	select {
+	case <-s.done:
+		return s.Err() != nil
+	default:
+		return false
+	}
+}
+
 // Err reports why the session ended, if it failed.
 func (s *Session) Err() error {
 	s.mu.Lock()
@@ -192,6 +237,65 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*Session
+	// pending counts sessions that have reserved a slot but are not in
+	// sessions yet: mkdir, building the command line and cmd.Start all happen
+	// before a session can be published, and checking the limit without
+	// reserving let concurrent callers all pass the same check (S-2 of the
+	// 2026-10-09 review: ten parallel starts against a limit of two left nine
+	// ffmpeg processes running).
+	pending int
+}
+
+// ActiveSessions reports how many sessions are running, including the ones that
+// have claimed a slot but are not yet published.
+//
+// The pending count is the point: a caller that wants to know whether the limit
+// is actually respected has to see the reservations too, or it sees a number
+// that dips during exactly the window the limit exists to guard.
+func (m *Manager) ActiveSessions() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions) + m.pending
+}
+
+// reserveSlot claims one of the MaxSessions slots, or reports the limit as
+// reached.
+//
+// The claim and the check are the same critical section on purpose. A caller
+// that passes the check must already own the slot, because otherwise the work
+// between the check and the publication of the session - which includes forking
+// ffmpeg - is a window every concurrent caller can pass through at once.
+func (m *Manager) reserveSlot() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	limit := m.cfg.MaxSessions
+	active := len(m.sessions) + m.pending
+	if limit > 0 && active >= limit {
+		return fmt.Errorf("%w (%d running, limit %d)", ErrTooManySessions, active, limit)
+	}
+	m.pending++
+	return nil
+}
+
+// releaseSlot returns a reservation that did not become a session.
+func (m *Manager) releaseSlot() {
+	m.mu.Lock()
+	if m.pending > 0 {
+		m.pending--
+	}
+	m.mu.Unlock()
+}
+
+// publishSlot turns a reservation into a published session.
+func (m *Manager) publishSlot(session *Session) {
+	m.mu.Lock()
+	if m.pending > 0 {
+		m.pending--
+	}
+	m.sessions[session.ID] = session
+	m.mu.Unlock()
+	m.updateActiveGauge()
 }
 
 // NewManager creates a Manager and prepares its working directory.
@@ -222,7 +326,10 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	}
 
 	manager := &Manager{cfg: cfg, baseCtx: ctx, sessions: make(map[string]*Session)}
-	manager.sweepStaleDirectories(cfg.RootDir, cfg.SessionTTL)
+	// At startup nothing is in the map, so every marked directory is an orphan and
+	// the grace alone decides. Using the session TTL here skipped exactly the
+	// directories a fast restart leaves (S-13).
+	manager.SweepOrphans()
 	return manager, nil
 }
 
@@ -233,12 +340,13 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 // Only directories older than the TTL are removed, so a second instance sharing
 // the same root does not lose its live sessions. Running more than one instance
 // against one root is therefore discouraged.
-func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration) {
+func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration, live map[string]bool) int {
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return
+		return 0
 	}
 
+	removed := 0
 	cutoff := time.Now().Add(-olderThan)
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -246,6 +354,12 @@ func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration) {
 		}
 		info, err := entry.Info()
 		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		// A directory a live session owns, whatever its age. The map is the
+		// authority, not the modification time: a session that has produced nothing
+		// yet still has a directory, and removing it stops playback.
+		if live[entry.Name()] {
 			continue
 		}
 		path := filepath.Join(root, entry.Name())
@@ -260,7 +374,9 @@ func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration) {
 			continue
 		}
 		m.cfg.Logger.Info("removed stale session directory", "path", path)
+		removed++
 	}
+	return removed
 }
 
 // Config exposes the manager configuration for callers that need to build URLs
@@ -303,7 +419,10 @@ func (m *Manager) StartAt(ctx context.Context, entityID, objectPath string, deci
 
 	cfg := m.cfg
 	session, err := m.startOnce(ctx, entityID, objectPath, decision, cfg, startSeconds)
-	if err == nil || !wouldUseHardware(decision, cfg) {
+	// A software retry only makes sense when ffmpeg is what failed. A capacity
+	// refusal would be refused again just as fast, and a client that has gone
+	// away is not waiting for either attempt (S-11).
+	if err == nil || !wouldUseHardware(decision, cfg) || !errors.Is(err, errFFmpegFailed) {
 		if err != nil {
 			span.RecordError(err)
 		} else {
@@ -390,13 +509,17 @@ func softwareOnlyDecision(decision Decision, server ServerCapability) Decision {
 
 // startOnce prepares and launches one session with the given configuration.
 func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, decision Decision, cfg ManagerConfig, startSeconds float64) (*Session, error) {
-	m.mu.Lock()
-	active := len(m.sessions)
-	limit := m.cfg.MaxSessions
-	m.mu.Unlock()
-	if limit > 0 && active >= limit {
-		return nil, fmt.Errorf("%w (%d running, limit %d)", ErrTooManySessions, active, limit)
+	if err := m.reserveSlot(); err != nil {
+		return nil, err
 	}
+	// Every path from here to publishSlot has to release the reservation, or a
+	// failed start leaks a slot until the process restarts.
+	reserved := true
+	defer func() {
+		if reserved {
+			m.releaseSlot()
+		}
+	}()
 
 	if decision.Mode == ModeDirectPlay {
 		return nil, ErrDirectPlayHasNoSession
@@ -450,7 +573,7 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 	if err := cmd.Start(); err != nil {
 		cancel()
 		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("starting ffmpeg: %w", err)
+		return nil, fmt.Errorf("starting ffmpeg: %w: %w", err, errFFmpegFailed)
 	}
 	cfg.Logger.InfoContext(ctx, "streaming session started",
 		"session_id", sessionID, "entity_id", entityID, "mode", decision.Mode)
@@ -463,19 +586,20 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 			session.runErr = waitErr
 		}
 		session.mu.Unlock()
+		// One failure, one count. The wait goroutine is the only recorder, so a
+		// failure observed here and again by the startup branch below is no
+		// longer counted twice (S-12).
 		if waitErr != nil && runCtx.Err() == nil {
-			cfg.Metrics.IncCounter("astraeus_stream_errors_total",
-				"Segmented streaming failures: sessions that never produced a playlist, plus ffmpeg exiting unexpectedly.",
-				map[string]string{"mode": string(decision.Mode)})
+			recordStreamFailure(cfg.Metrics, observability.MetricStreamErrors, decision.Mode)
 			cfg.Logger.Error("ffmpeg exited unexpectedly",
 				"session_id", sessionID, "error", waitErr, "stderr", session.Diagnostics())
 		}
 	}()
 
-	m.mu.Lock()
-	m.sessions[sessionID] = session
-	m.mu.Unlock()
-	m.updateActiveGauge()
+	// The session is published and the reservation becomes a real slot in one
+	// critical section, so the limit counts it from here on.
+	m.publishSlot(session)
+	reserved = false
 
 	startupStart := time.Now()
 	if err := m.waitForPlaylist(ctx, session); err != nil {
@@ -484,11 +608,13 @@ func (m *Manager) startOnce(ctx context.Context, entityID, objectPath string, de
 		cfg.Metrics.IncCounter("astraeus_stream_sessions_total",
 			"Segmented streaming sessions, by mode and outcome.",
 			map[string]string{"mode": string(decision.Mode), "outcome": "failed"})
-		cfg.Metrics.IncCounter("astraeus_stream_errors_total",
-			"Segmented streaming failures: sessions that never produced a playlist, plus ffmpeg exiting unexpectedly.",
-			map[string]string{"mode": string(decision.Mode)})
+		// The error count belongs to the wait goroutine, which records it when
+		// ffmpeg exits unexpectedly - that is the only place that knows whether
+		// the failure was ffmpeg's or this context's. Counting again here
+		// inflated the metric (S-12), and the count is asynchronous, so there is
+		// no way to tell from here whether it has happened yet.
 		m.Stop(sessionID)
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", err, errFFmpegFailed)
 	}
 
 	cfg.Metrics.ObserveHistogram("astraeus_transcode_startup_seconds",
@@ -594,16 +720,87 @@ func (m *Manager) Reap(now time.Time) int {
 	var stale []string
 	for id, session := range m.sessions {
 		if now.Sub(session.LastAccess()) > m.cfg.SessionTTL {
+			m.cfg.Logger.Info("reaping idle streaming session", "session_id", id)
+			stale = append(stale, id)
+			continue
+		}
+		// A session whose ffmpeg died is also finished with, however recently a
+		// client touched it. hls.js keeps polling a playlist that will never be
+		// completed, and every poll is a touch, so the idle rule never fires and
+		// the slot is held while the viewer watches a stalled player (S-9 of the
+		// 2026-10-09 review).
+		//
+		// Only a *failed* session is reaped here. A session that finished
+		// successfully has a complete playlist with #EXT-X-ENDLIST, and a client
+		// still fetching its last segments must keep being served.
+		if session.Failed() {
+			m.cfg.Logger.Warn("reaping a streaming session whose encoder died",
+				"session_id", id, "error", session.Err())
 			stale = append(stale, id)
 		}
 	}
 	m.mu.Unlock()
 
 	for _, id := range stale {
-		m.cfg.Logger.Info("reaping idle streaming session", "session_id", id)
 		m.Stop(id)
 	}
 	return len(stale)
+}
+
+// SessionTTL reports how long an idle session is kept.
+//
+// It exists so the value can be asserted rather than read out of a struct: the
+// default is what decides whether a viewer who pauses loses their stream, so it
+// is worth a test that fails when someone shortens it without thinking about that
+// (S-10 of the 2026-10-09 review).
+func (m *Manager) SessionTTL() time.Duration {
+	return m.cfg.SessionTTL
+}
+
+// SweepOrphans removes session directories no live session owns.
+//
+// It exists because the startup sweep alone cannot cover the case that matters: a
+// process killed outright leaves its directories, and a restart *within* the TTL
+// leaves them younger than the age check - so the one sweep that would have seen
+// them skipped them, and no later sweep ever runs. On a long-lived server the
+// result was directories that were never revisited, potentially many gigabytes of
+// them, in a directory that defaults to a temporary filesystem (S-13 of the
+// 2026-10-09 review).
+//
+// Called on every reap tick, where "not in m.sessions" is evidence rather than an
+// inference from age: a directory from *this* run belongs to a session in the map
+// until it is stopped, and anything else with our marker is left over.
+func (m *Manager) SweepOrphans() int {
+	// A session's directory is named after it, so the live ones can be excluded by
+	// name. This is not a refinement - the first version of this sweep removed a
+	// running session's output during a test, because the short grace period that
+	// makes the sweep useful also made it reach the live directory before the TTL
+	// would have. Age cannot distinguish them; membership can.
+	m.mu.Lock()
+	live := make(map[string]bool, len(m.sessions))
+	for id := range m.sessions {
+		live[id] = true
+	}
+	m.mu.Unlock()
+
+	return m.sweepStaleDirectories(m.cfg.RootDir, m.orphanAge(), live)
+}
+
+// orphanAge is how old a marked directory must be before the sweep will touch it.
+//
+// A short grace period rather than the session TTL, because the evidence is
+// different: the TTL has to guess whether a viewer is coming back, while the sweep
+// knows the directory is not any live session's. The grace is only there to avoid
+// racing a session that has created its directory but not yet published itself -
+// which reserveSlot's pending count covers, but a directory on disk is not the
+// same thing as a count in memory.
+const orphanGrace = time.Minute
+
+func (m *Manager) orphanAge() time.Duration {
+	if m.cfg.SessionTTL < orphanGrace {
+		return m.cfg.SessionTTL
+	}
+	return orphanGrace
 }
 
 // ReapLoop reaps idle sessions until the context is cancelled.
@@ -623,6 +820,10 @@ func (m *Manager) ReapLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			m.Reap(time.Now())
+			// Every tick, not only at startup: a directory left by a process that
+			// was killed is younger than any age check at the moment the next run
+			// starts, and would otherwise never be looked at again (S-13).
+			m.SweepOrphans()
 		}
 	}
 }
@@ -638,6 +839,16 @@ func (m *Manager) ServeFile(w http.ResponseWriter, r *http.Request, sessionID, n
 	session, ok := m.Session(sessionID)
 	if !ok {
 		http.Error(w, "streaming session not found", http.StatusNotFound)
+		return
+	}
+
+	// A failed session is Gone rather than 404: the client had a session and it
+	// broke, and it needs to know that so it can renegotiate instead of retrying a
+	// playlist that will never grow. The check is before touch(), because a poll
+	// for a dead session is not evidence that anybody is watching it.
+	if session.Failed() {
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "the stream failed: "+session.Err().Error(), http.StatusGone)
 		return
 	}
 	session.touch()
@@ -718,6 +929,10 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		"-loglevel", "error",
 		"-y",
 	}
+	// The input is a path from the library, and ffmpeg would otherwise treat a
+	// file that looks like a playlist as instructions to fetch other URLs -
+	// making this server issue requests wherever the file says (S-17).
+	args = append(args, ffmpegprocess.Args()...)
 	if startSeconds > 0 {
 		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
 	}
@@ -778,6 +993,17 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 			// first rung would be cut on the boundary.
 			args = append(args, "-force_key_frames"+videoStreamSuffix(len(plans), index),
 				fmt.Sprintf("expr:gte(t,n_forced*%d)", cfg.SegmentSeconds))
+			// Forcing a keyframe is not the same as forcing an IDR frame, and
+			// only an IDR frame is a key the HLS muxer can cut at. NVENC, QSV
+			// and AMF all default their forced-IDR flags to false, so without
+			// this the forced keyframes are not marked as key and the cut falls
+			// back to the encoder's native GOP - the slow-first-segment problem
+			// -force_key_frames exists to remove (S-15). Software and VAAPI need
+			// no flag: both produce a keyframe that is already what the muxer
+			// cuts on, measured at exactly 2.000 s on this host.
+			if flag := forcedIDRFlag(encoder); len(flag) > 0 {
+				args = append(args, flag[0]+videoStreamSuffix(len(plans), index), flag[1])
+			}
 		}
 	default:
 		return nil, fmt.Errorf("unsupported video action %q", decision.VideoAction)
@@ -789,11 +1015,16 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 	case ActionCopy:
 		args = append(args, "-c:a", "copy")
 	case ActionTranscode:
-		codec := decision.TargetAudioCodec
-		if codec == "" {
-			codec = "aac"
+		// The encoder, not the codec: ffmpeg's "opus" is its native
+		// experimental encoder and refuses to run, while the one that works is
+		// "libopus". NegotiateForServer resolves this into a decision; a
+		// decision built by hand with only a codec falls back to its most
+		// portable encoder here rather than passing the codec through.
+		encoder := decision.TargetAudioEncoder
+		if encoder == "" {
+			encoder = audioEncoderOrDefault(decision.TargetAudioCodec)
 		}
-		args = append(args, "-c:a", codec, "-b:a", "192k")
+		args = append(args, "-c:a", encoder, "-b:a", "192k")
 		if decision.TargetAudioChannels > 0 {
 			// Chromium refuses a 5.1 AAC SourceBuffer outright, and a browser
 			// outputs stereo anyway, so a negotiated downmix is what makes a
@@ -804,6 +1035,15 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		return nil, fmt.Errorf("unsupported audio action %q", decision.AudioAction)
 	}
 
+	// No -hls_segment_type, so ffmpeg's default MPEG-TS muxer is what produces
+	// the segments. That is load-bearing rather than incidental:
+	// segmentContainerCanCarry in negotiate.go decides which codecs negotiation
+	// may copy on the strength of it, because MPEG-TS carries H.264 and HEVC and
+	// writes everything else out as bin_data without complaining (S-3 of the
+	// 2026-10-09 review). Switching this to fmp4 would be the better long-term
+	// answer - fMP4 carries AV1, VP9, Opus and FLAC, and Apple requires it for
+	// HEVC - but it changes the segment extension, the playlist and what the UI
+	// fetches, so the two must move together.
 	args = append(args,
 		"-f", "hls",
 		"-hls_time", fmt.Sprint(cfg.SegmentSeconds),
@@ -838,11 +1078,26 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 // *after* the plan's own filters, which is what makes it right for a tone map:
 // a subtitle bitmap is SDR white, and it must be laid over the finished SDR
 // picture rather than passed through the HDR-to-SDR conversion with it.
+//
+// The graph is built in three stages for a hardware encoder, and that split is
+// the S-5 fix. scale2ref and overlay are software filters, so a chain that
+// uploaded to a VAAPI surface first handed them hardware frames and ffmpeg
+// refused: "Impossible to convert between the formats supported by the filter
+// 'Parsed_scale2ref_3' and the filter 'auto_scale_2'". Every burn on a VAAPI
+// host therefore failed once and was retried in software, which cost a second
+// ffmpeg start, logged a misleading "hardware transcode failed", and bumped the
+// fallback counter for a session that was going to fail every time.
+//
+// So: software filters, then the overlay, then upload and scale on the GPU. The
+// hardware path is still used, and it is used after the point that cannot work
+// on hardware.
 func burnFilterGraph(encoder string, plan videoPlan, subtitleIndex int) string {
+	software, needsUpload := videoFilters(encoder, plan)
+
 	var graph strings.Builder
 	graph.WriteString("[0:v:0]")
-	if filters := videoFilters(encoder, plan); len(filters) > 0 {
-		graph.WriteString(strings.Join(filters, ","))
+	if len(software) > 0 {
+		graph.WriteString(strings.Join(software, ","))
 	} else {
 		graph.WriteString("null")
 	}
@@ -852,7 +1107,18 @@ func burnFilterGraph(encoder string, plan videoPlan, subtitleIndex int) string {
 	// tracks come first would otherwise burn the wrong stream.
 	fmt.Fprintf(&graph, "[1:%d]format=rgba[burn0];", subtitleIndex)
 	graph.WriteString("[burn0][base]scale2ref=flags=neighbor[burn][base2];")
-	graph.WriteString("[base2][burn]overlay=format=auto[v]")
+	graph.WriteString("[base2][burn]overlay=format=auto")
+
+	if !needsUpload {
+		graph.WriteString("[v]")
+		return graph.String()
+	}
+
+	// The composited software frames are what the hardware encoder needs; upload
+	// them and scale on the device, exactly as the non-burn chain does.
+	graph.WriteString("[composited];[composited]")
+	graph.WriteString(strings.Join(hardwareUploadFilters(plan), ","))
+	graph.WriteString("[v]")
 	return graph.String()
 }
 

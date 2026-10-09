@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/ykzird/astraeus/internal/library"
@@ -215,5 +217,125 @@ func TestTMDB_FetchMetadata_UnsupportedType(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected an error for an unsupported entity type")
+	}
+}
+
+// TestTMDB_UnreachableDoesNotLeakTheKey is the regression test for L-10.
+//
+// The v3 API key travels as a query parameter, and net/http reports a failed
+// request as a *url.Error whose message embeds the whole URL. A worker that
+// logs the wrapped error - which it does - therefore logged the key in full
+// every time TMDB was unreachable.
+func TestTMDB_UnreachableDoesNotLeakTheKey(t *testing.T) {
+	t.Parallel()
+
+	const key = "SECRET-KEY-123"
+
+	provider := NewTMDB(key)
+	// A port nothing is listening on: the request fails at the transport, which
+	// is the path that produces the *url.Error.
+	provider.baseURL = "http://127.0.0.1:1"
+
+	_, err := provider.FetchMetadata(context.Background(), &library.MediaEntity{
+		ID:   "entity-6",
+		Type: library.MovieEntity,
+		Name: "Dune",
+	})
+	if err == nil {
+		t.Fatal("expected the unreachable provider to fail")
+	}
+	if strings.Contains(err.Error(), key) {
+		t.Errorf("the API key leaked into the error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "api_key=REDACTED") {
+		t.Errorf("error = %v, want the query redacted so the cause stays readable", err)
+	}
+	// The error must still say what failed.
+	if !errors.As(err, new(*url.Error)) {
+		t.Errorf("error = %v, want it to keep the *url.Error cause", err)
+	}
+}
+
+func TestRedactQuery(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "the key is replaced, the query is kept",
+			raw:  "https://api.themoviedb.org/3/search/movie?api_key=secret&query=Dune",
+			want: "https://api.themoviedb.org/3/search/movie?api_key=REDACTED&query=REDACTED",
+		},
+		{
+			name: "no query is unchanged",
+			raw:  "https://api.themoviedb.org/3/search/movie",
+			want: "https://api.themoviedb.org/3/search/movie",
+		},
+		{
+			name: "an unparseable URL is dropped rather than echoed",
+			raw:  "http://[::1]:namedport/search?api_key=secret",
+			want: "REDACTED",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := redactQuery(tt.raw); got != tt.want {
+				t.Errorf("redactQuery(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTMDB_RefusesAnOversizedResponse is L-18's third item.
+//
+// The response body went straight into a JSON decoder with no bound, and the body
+// is somebody else's: a misconfiguration, a proxy's error page or a hostile
+// response would be read into memory without limit.
+func TestTMDB_RefusesAnOversizedResponse(t *testing.T) {
+	t.Parallel()
+
+	// A response that is valid JSON of the expected shape, but far larger than the
+	// limit. Being valid is the point: the size is what has to refuse it.
+	var builder strings.Builder
+	builder.WriteString(`{"results":[{"id":1,"title":"`)
+	builder.WriteString(strings.Repeat("x", maxResponseBytes))
+	builder.WriteString(`"}]}`)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(builder.String()))
+	}))
+	t.Cleanup(server.Close)
+
+	provider := NewTMDB("test-key")
+	provider.baseURL = server.URL
+
+	entity := library.MediaEntity{ID: "e1", Type: library.MovieEntity, Name: "Dune"}
+	if _, err := provider.FetchMetadata(context.Background(), &entity); err == nil {
+		t.Errorf("a %d-byte response was accepted, want a refusal: the body is somebody "+
+			"else's and has no size guarantee", builder.Len())
+	} else if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("the refusal does not say the response was too large: %v", err)
+	}
+
+	// And a normal response still works, so the bound is not refusing everything.
+	small := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"id":1,"title":"Dune","release_date":"2021-10-22"}]}`))
+	}))
+	t.Cleanup(small.Close)
+	provider.baseURL = small.URL
+
+	meta, err := provider.FetchMetadata(context.Background(), &entity)
+	if err != nil {
+		t.Fatalf("a normal response was refused: %v", err)
+	}
+	if meta == nil || meta.Title != "Dune" {
+		t.Errorf("meta = %+v, want the parsed title", meta)
 	}
 }

@@ -1,0 +1,340 @@
+package access
+
+// Access policy: which libraries a viewer may see, and who may change the
+// library at all.
+//
+// This is deliberately a file rather than a table or an API. Authorization that
+// a client can grant itself is not authorization, so the policy is something an
+// operator writes on the host and the server reads at startup — the same shape
+// as the gate's own configuration. The model is small enough that a table could
+// back it later; nothing outside this file assumes where the grants come from.
+//
+// A nil Policy allows everything, which is what an install has always done and
+// is what keeps this change invisible until somebody configures it.
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+)
+
+// Policy is the operator's answer to "what may this viewer see, and who may
+// change things".
+//
+// The zero value is not usable; load one with LoadPolicy, or leave the pointer
+// nil to permit everything.
+type Policy struct {
+	// viewers maps a lower-cased identity to its grants. Identities come from
+	// the access gate, and are compared case-insensitively because they are
+	// usually e-mail addresses and nobody means Alice@ and alice@ to differ.
+	viewers map[string]grant
+	// unlisted is what a viewer the file does not mention may see.
+	unlisted grant
+	// admins are the identities allowed to change the library: scan, enrich,
+	// add and remove libraries. Being an admin says nothing about visibility,
+	// which is a separate grant — see the file format below.
+	admins map[string]bool
+	// source is where the policy was read from, for the startup log line.
+	source string
+}
+
+// grant is what one viewer (or the default) may see.
+type grant struct {
+	// all is a literal "*": every library, including ones added later.
+	all bool
+	// libraries are names or ids as written in the file. A name that does not
+	// exist yet is not an error and simply matches nothing, so a policy can be
+	// written before the library it refers to is added.
+	libraries []string
+}
+
+// LoadPolicy reads a policy file.
+//
+// It returns an error rather than a partial policy: a file that cannot be
+// understood is a misconfiguration, and starting with a policy that is not the
+// one written is how an operator ends up explaining an outage.
+func LoadPolicy(path string) (*Policy, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("access policy: %w", err)
+	}
+	defer file.Close()
+
+	policy, err := ParsePolicy(file)
+	if err != nil {
+		return nil, fmt.Errorf("access policy %s: %w", path, err)
+	}
+	policy.source = path
+	return policy, nil
+}
+
+// ParsePolicy reads a policy from a reader. The format is one directive or
+// grant per line:
+//
+//	# comments start with a hash
+//	default: none            # or "all"; what an unlisted viewer may see
+//	admin: alice@example.com # comma separated; may scan and change libraries
+//	alice@example.com: *     # "*" is every library, including future ones
+//	bob@example.com: Movies, Documentaries
+//
+// A grant names a library by its name (case-insensitive) or by its id (exact).
+// A viewer that appears twice has its grants combined.
+//
+// A comment runs from a "#" that starts a line or follows whitespace to the end
+// of that line, so a note may sit beside a directive or a grant. A "#" with no
+// whitespace before it is part of the value rather than the start of a comment,
+// which is what lets a library or identity whose name contains one be granted.
+//
+// Values are comma-separated, and a backslash escapes the next character. That
+// is how an identity containing a comma is listed at all:
+//
+//	admin: CN=alice\,O=Acme
+//
+// which deploy/tls/README.md needs, because the identity a client-certificate
+// proxy forwards is the whole subject rather than its common name.
+func ParsePolicy(r io.Reader) (*Policy, error) {
+	policy := &Policy{
+		viewers: make(map[string]grant),
+		admins:  make(map[string]bool),
+	}
+	// A policy in use denies by default: an operator who writes a file is
+	// choosing who may see what, and "everyone, unless listed" would make the
+	// file a list of exceptions rather than of grants. "default: all" asks for
+	// the other arrangement explicitly.
+	policy.unlisted = grant{}
+	sawDefault := false
+
+	scanner := bufio.NewScanner(r)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// A comment may follow a directive, which is how the documented example
+		// is written: "default: none            # an unlisted viewer sees
+		// nothing". Only a line-leading comment used to be recognised, so every
+		// such note became part of the value: the default failed to parse, and
+		// on an identity line the note was split at its commas into junk
+		// identities (D-1 of the 2026-10-09 review).
+		line = stripPolicyComment(line)
+		if line == "" {
+			continue
+		}
+
+		key, value, found := strings.Cut(line, ":")
+		if !found {
+			return nil, fmt.Errorf("line %d: %q is neither a directive nor an identity grant", lineNumber, line)
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" {
+			return nil, fmt.Errorf("line %d: no identity or directive before the colon", lineNumber)
+		}
+
+		switch strings.ToLower(key) {
+		case "default":
+			if sawDefault {
+				return nil, fmt.Errorf("line %d: default is set more than once", lineNumber)
+			}
+			sawDefault = true
+			switch strings.ToLower(value) {
+			case "none":
+				policy.unlisted = grant{}
+			case "all", "*":
+				policy.unlisted = grant{all: true}
+			default:
+				return nil, fmt.Errorf("line %d: default must be none or all, not %q", lineNumber, value)
+			}
+		case "admin":
+			for _, identity := range splitList(value) {
+				policy.admins[strings.ToLower(identity)] = true
+			}
+		default:
+			existing := policy.viewers[strings.ToLower(unescapePolicy(key))]
+			for _, library := range splitList(value) {
+				if library == "*" {
+					existing.all = true
+					continue
+				}
+				existing.libraries = append(existing.libraries, library)
+			}
+			policy.viewers[strings.ToLower(unescapePolicy(key))] = existing
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading policy: %w", err)
+	}
+
+	return policy, nil
+}
+
+// stripPolicyComment removes a trailing comment from one line.
+//
+// A "#" starts a comment when it begins the line or follows whitespace, so
+// "alice@example.com: Kids # the children" is a grant with a note, while a "#"
+// inside a value - an identity or a library name that contains one - is left
+// alone. The parser has no quoting rules, so this is the rule that lets the
+// documented example work without inventing an escape syntax nobody writes.
+func stripPolicyComment(line string) string {
+	for i := 0; i < len(line); i++ {
+		if line[i] != '#' {
+			continue
+		}
+		if i == 0 || line[i-1] == ' ' || line[i-1] == '	' {
+			return strings.TrimSpace(line[:i])
+		}
+	}
+	return line
+}
+
+// splitList splits a comma-separated value, dropping empty entries so that
+// "Movies," and "Movies, Documentaries" mean the same thing.
+func splitList(value string) []string {
+	out := make([]string, 0, 2)
+	var current strings.Builder
+
+	// A backslash makes the next character literal, which is what lets an
+	// identity that contains a comma be listed. This is not decoration: the
+	// client-certificate identity deploy/tls/ produces is a whole subject -
+	// "CN=alice,O=Acme" - and without an escape it was split into two identities,
+	// neither of which matched the viewer the proxy actually names.
+	//
+	// A trailing backslash is kept literally rather than treated as an error.
+	// The file is a human's, and refusing to load it over a stray backslash helps
+	// nobody.
+	escaped := false
+	flush := func() {
+		if trimmed := strings.TrimSpace(current.String()); trimmed != "" {
+			out = append(out, trimmed)
+		}
+		current.Reset()
+	}
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if escaped {
+			current.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		switch ch {
+		case '\\':
+			escaped = true
+		case ',':
+			flush()
+		default:
+			current.WriteByte(ch)
+		}
+	}
+	// A trailing backslash escapes nothing, so it is kept rather than dropped.
+	// Dropping it would silently rename an identity or a library.
+	if escaped {
+		current.WriteByte('\\')
+	}
+	flush()
+	return out
+}
+
+// unescapePolicy resolves backslash escapes in a key.
+//
+// A key is not split on commas, so it does not go through splitList - but it can
+// carry an escape for the same reason a value can: the identity a
+// client-certificate proxy forwards contains a comma, and "CN=alice\,O=Acme" has
+// to become the one identity the proxy will actually name. Leaving the backslash
+// in place produced a key nothing ever matched, so the grant was silently
+// ignored - an admin who was not one, and a viewer who saw nothing.
+func unescapePolicy(value string) string {
+	if !strings.Contains(value, "\\") {
+		return value
+	}
+	var out strings.Builder
+	out.Grow(len(value))
+	escaped := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if escaped {
+			out.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		out.WriteByte(ch)
+	}
+	if escaped {
+		out.WriteByte('\\')
+	}
+	return out.String()
+}
+
+// AllowsLibrary reports whether viewer may see the library with this id and
+// name. A nil policy allows everything.
+func (p *Policy) AllowsLibrary(viewer, libraryID, libraryName string) bool {
+	if p == nil {
+		return true
+	}
+
+	granted, listed := p.viewers[strings.ToLower(viewer)]
+	if !listed {
+		granted = p.unlisted
+	}
+	if granted.all {
+		return true
+	}
+
+	for _, allowed := range granted.libraries {
+		// An id is matched exactly because it is opaque and machine-written; a
+		// name is matched case-insensitively because a person typed it.
+		if allowed == libraryID || strings.EqualFold(allowed, libraryName) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsAdmin reports whether viewer may change the library. A nil policy makes
+// every viewer an admin, which is the behaviour an install has had until now.
+func (p *Policy) IsAdmin(viewer string) bool {
+	if p == nil {
+		return true
+	}
+	return p.admins[strings.ToLower(viewer)]
+}
+
+// Source is where the policy was read from, or "" when there is none.
+func (p *Policy) Source() string {
+	if p == nil {
+		return ""
+	}
+	return p.source
+}
+
+// DefaultAll reports whether an unlisted viewer may see every library.
+func (p *Policy) DefaultAll() bool {
+	if p == nil {
+		return true
+	}
+	return p.unlisted.all
+}
+
+// Viewers is how many identities the policy names, which is what the startup
+// line reports so an operator can see the file took effect.
+func (p *Policy) Viewers() int {
+	if p == nil {
+		return 0
+	}
+	return len(p.viewers)
+}
+
+// Admins is how many identities may change the library.
+func (p *Policy) Admins() int {
+	if p == nil {
+		return 0
+	}
+	return len(p.admins)
+}

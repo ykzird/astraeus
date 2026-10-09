@@ -7,12 +7,14 @@ Both run the same server; pick by how you already run things.
 Whatever you pick, four facts decide whether the install is sound:
 
 - **ffmpeg and ffprobe are dependencies, not extras.** The server reports their
-  absence at startup and refuses playback without them.
+  absence at startup and degrades rather than refusing to start: the library
+  still lists, direct play still works if `ffprobe` is present, and the routes
+  that need a probe or a transcode answer `503 streaming_unavailable`.
 - **tesseract is optional, and its absence changes behaviour rather than breaking
-  anything.** With it, image subtitle tracks (PGS) are read into text a browser
-  can toggle and search; without it they are offered as a burn-in instead, and
-  `/api/system/capabilities` reports `subtitle_ocr_enabled: false`. The container
-  image includes it; a systemd install can add it with
+  anything.** With it, image subtitle tracks (PGS and VobSub) are read into text
+  a browser can toggle and search; without it they are offered as a burn-in
+  instead, and `/api/system/capabilities` reports `subtitle_ocr_enabled: false`.
+  The container image includes it; a systemd install can add it with
   `apt-get install tesseract-ocr` (or the distribution's equivalent).
 - **`--auth-mode` defaults to `none`.** That is right for a trusted LAN and wrong
   for anything else. Both shapes below turn the gate on before anything is
@@ -27,8 +29,10 @@ Whatever you pick, four facts decide whether the install is sound:
 ```sh
 docker build -t astraeus-media:0.18.0 .
 
-# The image's default command serves on :8642 with every writable path inside
-# /data. This one has no access gate, so keep it on loopback.
+# The image's default command passes --addr 0.0.0.0:8642 itself, because a
+# container's port has to be reachable from outside it to be published. The
+# writable paths are all inside /data. This run has no access gate, so publish
+# it on loopback only; `-p 8642:8642` would put it on every interface.
 docker run -d --name astraeus \
   -p 127.0.0.1:8642:8642 \
   -v /srv/media:/media:ro \
@@ -55,24 +59,31 @@ The image's default command already sets every writable path inside one volume:
 | `/media` | your library, mounted read-only |
 | `/app/web` | the web UI the binary serves |
 
-A realistic run, with the gate on and the library read-only:
+A realistic run, with the library read-only:
 
 ```sh
 docker run -d --name astraeus \
   -p 127.0.0.1:8642:8642 \
-  -e ASTRAEUS_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
   astraeus-media:0.18.0 \
   serve --addr 0.0.0.0:8642 --web-dir /app/web \
         --db /data/astraeus.db --stream-root /data/streams \
-        --image-cache /data/images --subtitle-cache /data/subtitles \
-        --auth-mode token
+        --image-cache /data/images --subtitle-cache /data/subtitles
 ```
 
 Publishing on `127.0.0.1` and putting a reverse proxy in front is the intended
-shape; `-p 8642:8642` publishes it to every interface, which without
-`--auth-mode` hands anyone who can reach the port the whole library.
+shape, and it is what makes the port safe: `-p 8642:8642` publishes it to every
+interface and hands anyone who can reach it the whole library.
+
+**Do not add `--auth-mode token` to that command and expect the web UI to work.**
+A browser cannot send an `Authorization: Bearer` header on a navigation, so every
+request the UI makes is refused with `401`. Token mode is for API clients and
+scripts. For viewers, terminate TLS at a proxy and use `--auth-mode proxy` - see
+[`tls/README.md`](tls/README.md).
+[`tls/README.md`](tls/README.md) is the runbook for the proxy side: terminating
+TLS, sending `Strict-Transport-Security`, and giving each viewer an identity the
+gate can believe.
 
 **Which gate mode you choose changes what "per viewer" means.** Playback progress
 is keyed on the identity the gate attaches, so `--auth-mode proxy` (Tailscale or
@@ -130,9 +141,10 @@ sudo install -d -o astraeus -g astraeus /var/cache/astraeus/images /var/cache/as
 
 # 2. The binary and the web UI it serves, and the documentation the README
 #    links to. The archive carries the user-facing pages and not the project's
-#    working documents, so the README's link to docs/handoff.md resolves in a
-#    checkout and not in this installed tree; the trailing chmod is because this
-#    repository's own files are not world-readable.
+#    working documents; the README links to docs/handoff.md by absolute URL, so
+#    that link reaches GitHub from an installed tree rather than resolving
+#    locally. The trailing chmod is because this repository's own files are not
+#    world-readable.
 sudo install -m 0755 astraeus-server /usr/local/bin/astraeus-server
 sudo install -d /usr/local/share/astraeus
 sudo cp -r web /usr/local/share/astraeus/web
@@ -142,11 +154,11 @@ sudo cp -r README.md SPECIFICATION.md TODO.md CONTEXT.md CONTRIBUTING.md \
   /usr/local/share/doc/astraeus/
 sudo chmod -R a+rX /usr/local/share/doc/astraeus
 
-# 3. The token the unit reads, and the unit itself.
+# 3. The environment file the unit reads (optional: TMDB_API_KEY goes here), and
+#    the unit itself. The unit installs without a token in it on purpose - see
+#    the note below the block.
 sudo install -d -m 0755 /etc/astraeus
-printf 'ASTRAEUS_AUTH_TOKEN=%s\n' "$(openssl rand -hex 32)" \
-  | sudo tee /etc/astraeus/astraeus.env >/dev/null
-sudo chmod 0600 /etc/astraeus/astraeus.env
+sudo install -m 0600 /dev/null /etc/astraeus/astraeus.env
 sudo install -m 0644 deploy/astraeus.service /etc/systemd/system/astraeus.service
 
 # 4. Check what you are about to start, then start it.
@@ -158,12 +170,44 @@ systemctl status astraeus
 # family, which takes seconds on a slow or emulated host - so wait for it rather
 # than treating the line above as proof that it is already serving.
 for i in $(seq 1 30); do curl -sf localhost:8642/api/health && break; sleep 1; done
+
+# 5. Register the library. The unit starts an empty server; it has nothing to
+#    serve until this has run once. Run the CLI AS THE SERVICE USER, not as root
+#    - see the note below.
+sudo -u astraeus /usr/local/bin/astraeus-server scan \
+  --db /var/lib/astraeus/astraeus.db \
+  --path /srv/media --kind movies --name "Films"
 ```
 
-The unit binds **127.0.0.1:8642** and enables `--auth-mode token`, so nothing is
-reachable from off-host until you put a TLS-terminating reverse proxy in front of
-it. `TMDB_API_KEY` goes in the same environment file if you want real metadata
-instead of the synthetic fallback.
+```sh
+# ...or register it over the API, which is the same operation:
+curl -s -X POST localhost:8642/api/libraries -H 'Content-Type: application/json' \
+  -d '{"name":"Films","path":"/srv/media","kind":"movies"}'
+```
+
+**Run the CLI as `astraeus`, not as `root`.** The database is in WAL mode, so the
+process that first opens it creates `astraeus.db-wal` and `astraeus.db-shm`
+*owned by that process*. A `root`-run `scan` leaves root-owned sidecars that the
+service, which runs as `astraeus`, cannot write — and the service then fails at
+startup with a readonly-database or database-is-locked error that names neither
+the file nor the reason. If it has already happened:
+
+```sh
+sudo chown -R astraeus:astraeus /var/lib/astraeus
+```
+
+The unit binds **127.0.0.1:8642** and leaves `--auth-mode` at its default `none`,
+so nothing is reachable from off-host until you put a TLS-terminating reverse
+proxy in front of it - and the UI works when you browse to it on the host or
+through that proxy. `TMDB_API_KEY` goes in the environment file if you want real
+metadata instead of the synthetic fallback.
+
+The unit deliberately does **not** set `--auth-mode token`, which an earlier
+version of this runbook did. A browser cannot send an `Authorization: Bearer`
+header on a navigation and `web/app.js` has no way to set one, so that install
+served a UI whose every request was refused with `401` - the runbook presented a
+broken install as the finished one. Token mode remains for API clients and
+scripts; a viewers-facing install uses `proxy` behind the TLS terminator.
 
 ### What the unit hardens, and what has been observed
 
@@ -236,15 +280,26 @@ artifact and the image and publishes nothing, which is how to check a change to
 it without spending a tag.
 
 **What a release contains.** One `astraeus-server_<version>_<os>_<arch>.tar.gz`
-per platform — `linux/amd64` and `linux/arm64` by default — each holding the
-binary, the `web` directory it serves (a server without a UI is half a server),
-the `deploy` directory with the systemd unit, the user-facing pages of `docs/`
-(`index.md`, `playback.md`, `configuration.md`, `api.md` and `development.md`),
-`LICENSE` and `THIRD_PARTY_NOTICES.md`, plus a `checksums.txt` covering them.
+per platform — `linux/amd64` and `linux/arm64` by default — each holding:
+
+- the `astraeus-server` binary;
+- the `web` directory it serves (a server without a UI is half a server) and the
+  `assets` directory holding the README's header image, which is a relative path
+  and would otherwise be broken in the first document a new user opens;
+- the `deploy` directory with the systemd unit;
+- the user-facing pages of `docs/`: `index.md`, `playback.md`,
+  `configuration.md`, `api.md`, `development.md` and `troubleshooting.md`;
+- the top-level documents a reader of the installed tree needs: `README.md`,
+  `SPECIFICATION.md`, `TODO.md`, `CONTEXT.md`, `CONTRIBUTING.md` and
+  `SECURITY.md`;
+- `LICENSE`, `THIRD_PARTY_NOTICES.md` and a `checksums.txt` covering them all.
 The archive is self-sufficient: the systemd runbook above is meant to be followed
 from an extracted one, and every path it names is in there. It deliberately does
 **not** carry the repository's working documents — `docs/handoff.md` and the
-reviews — which are about building the server rather than using it:
+review reports it links to — which are about building the server rather than
+using it. `scripts/build-release.sh` asserts every path the runbook names is
+present, so a document that stops being shipped fails the build rather than
+failing on a user's machine:
 
 ```sh
 sha256sum -c checksums.txt          # from inside the extracted release dir
@@ -291,17 +346,89 @@ by design, which is exactly where the second defect was hiding.
 
 ## Backups and upgrades
 
+Three things are state, and one of them is easy to forget because it is not under
+the data directory:
+
+| What | Where | Why it is state |
+| --- | --- | --- |
+| The database | `/var/lib/astraeus/astraeus.db` | Libraries, entities, metadata, and every viewer's resume position |
+| The access policy | `/etc/astraeus/access-policy.conf` | Who may see and change what. Losing it is losing the configuration, not the data |
+| The environment file | `/etc/astraeus/astraeus.env`, mode `0600` | `TMDB_API_KEY`, and any token an API client uses |
+
+Nothing under `/var/cache` needs preserving: artwork and extracted subtitles are
+re-derived, and stream directories are swept at startup. Nothing in `web` is
+state either — it is served from the archive.
+
+### The database
+
+**The copy has to be taken properly.** `sqlite3` is required and is not otherwise
+a dependency of this project, so install it (`apt install sqlite3`) or use one of
+the alternatives below. The database is in **WAL mode**, which means that while
+the server is running there are `astraeus.db-wal` and `astraeus.db-shm` files
+beside it holding commits that are not yet in the main file. A `cp` of
+`astraeus.db` alone while the server runs gives you a database *missing its most
+recent writes*, and it does so silently.
+
 ```sh
-# The database is the state. Stop the server, or copy it with SQLite's own
-# backup API so a write in flight cannot tear the copy.
-sqlite3 /var/lib/astraeus/astraeus.db ".backup /var/backups/astraeus-$(date +%F).db"
+# The whole state, with a consistent database. Stop the service first, which is
+# the simplest correct thing, or use ".backup" alone if it must stay up.
+sudo systemctl stop astraeus
+sudo install -d -m 0755 /var/backups/astraeus
+sudo cp -a /var/lib/astraeus/astraeus.db "/var/backups/astraeus/astraeus-$(date +%F).db"
+sudo cp -a /etc/astraeus "/var/backups/astraeus/etc-$(date +%F)"
+sudo systemctl start astraeus
 ```
 
+```sh
+# Without stopping it: SQLite's own backup API takes a consistent snapshot even
+# with writes in flight, and the WAL is folded in - so the -wal and -shm files do
+# not need copying. This is the one to prefer on a server that must stay up.
+sqlite3 /var/lib/astraeus/astraeus.db \
+  ".backup '/var/backups/astraeus/astraeus-$(date +%F).db'"
+```
+
+```sh
+# In the container, where sqlite3 may not be installed on the host. The volume
+# name is whatever Docker actually made - it carries the Compose project as a
+# prefix when Compose started it - so find it rather than assuming the short name.
+volume="$(docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "/data" }}{{ .Name }}{{ end }}{{ end }}' astraeus)"
+echo "the data volume is $volume"      # e.g. astraeus_astraeus-data
+
+# Stopping the container is what makes the tar consistent, for the same WAL
+# reason as above: the sidecars are checkpointed on a clean shutdown.
+docker stop astraeus
+docker run --rm -v "$volume":/data -v /var/backups:/backup debian:bookworm-slim \
+  tar czf "/backup/astraeus-$(date +%F).tar.gz" -C /data .
+docker start astraeus
+```
+
+### Restoring
+
+Stop the service, put the database back **and remove any stranded sidecars**, then
+start it. Leaving a `-wal` from a different database beside a restored one is the
+one way to get a restore that looks successful and is not:
+
+```sh
+sudo systemctl stop astraeus
+sudo rm -f /var/lib/astraeus/astraeus.db-wal /var/lib/astraeus/astraeus.db-shm
+sudo cp -a /var/backups/astraeus/astraeus-2026-10-09.db /var/lib/astraeus/astraeus.db
+sudo chown astraeus:astraeus /var/lib/astraeus/astraeus.db
+sudo systemctl start astraeus
+curl -sf localhost:8642/api/health && curl -s localhost:8642/api/libraries
+```
+
+### Upgrades
+
 Schema migrations live in the binary and run at startup; a database written by an
-older build is upgraded in place. **The server does not keep a backup before it
-does**, so take one first if the database matters — the command above is the one
-to run. Upgrading is then: replace the binary and the `web` directory, restart.
-Nothing under `/var/cache` needs to be preserved.
+older build is upgraded in place, and since the migration is a single transaction
+a failed upgrade leaves the previous database intact and startable. **The server
+does not keep a backup before it runs them**, so take one first if the database
+matters.
+
+The migrations are forward-only. There is no down-migration, so rolling back to an
+older binary against an upgraded database is not supported — restoring the backup
+above is the way back. Upgrading is then: replace the binary and the `web`
+directory, restart.
 
 One upgrade changes shape rather than adding tables: playback progress became
 per viewer, which SQLite cannot do in place, so the table is rebuilt in a
@@ -314,14 +441,18 @@ identity that wrote them was never recorded.
 
 ## Not covered yet
 
-- **TLS.** Put Caddy, nginx or Tailscale in front; the server speaks plain HTTP.
-- **Multiple users or per-user libraries.** The gate is instance-wide: it decides
-  whether a request is admitted, not what it may see, so every admitted user sees
-  the whole library. Playback progress is per viewer, but access is not.
+- **Per-library access is covered; anything finer is not.** `--access-policy`
+  decides which libraries a viewer may see and who may change the library, and a
+  hidden library answers `404` rather than advertising itself. What is still
+  absent: per-entity or per-tag permission, any notion of a role *inside* a
+  library a viewer can see, and self-service — the policy is a file an operator
+  writes, not something a client can ask for. See
+  [`docs/configuration.md`](../docs/configuration.md).
 - **Kubernetes manifests, Windows or macOS packaging.** Release archives are
   built for Linux, and the image is Linux-only; `scripts/build-release.sh` takes
   extra `goos/goarch` arguments if that changes.
-- **Hardware encoders have never run.** VAAPI, NVENC, AMF and VideoToolbox are
+- **Hardware encoders have never run.** VAAPI, QuickSync, NVENC, AMF and
+  VideoToolbox are
   implemented and unit-tested, and the startup probe is what validates them on
   the machine that starts the server — but no host with a GPU has been available,
   so the CPU path is the only one observed end to end.

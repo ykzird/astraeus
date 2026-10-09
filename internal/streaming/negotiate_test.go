@@ -250,6 +250,90 @@ func TestEncoderFor(t *testing.T) {
 	}
 }
 
+// TestNegotiateForServer_ResolvesTheAudioEncoder is the regression test for S-7
+// at the point where the two names are actually distinguished.
+//
+// Negotiate is pure and only knows codec names, so it leaves TargetAudioEncoder
+// empty. NegotiateForServer has the server capability and is the only place that
+// can turn "the client wants Opus" into "run libopus" - and until this was
+// fixed it checked the encoder and then threw the answer away, so the session
+// passed the codec name to -c:a and ffmpeg refused to run its experimental
+// native encoder.
+func TestNegotiateForServer_ResolvesTheAudioEncoder(t *testing.T) {
+	t.Parallel()
+
+	server := ServerCapability{
+		VideoEncoders: []string{"libx264"},
+		AudioEncoders: []string{"aac", "libopus", "libvorbis", "libmp3lame"},
+	}
+
+	tests := []struct {
+		name      string
+		audio     string
+		wantCodec string
+		wantEnc   string
+	}{
+		{name: "opus needs libopus", audio: "opus", wantCodec: "opus", wantEnc: "libopus"},
+		{name: "vorbis needs libvorbis", audio: "vorbis", wantCodec: "vorbis", wantEnc: "libvorbis"},
+		{name: "mp3 needs libmp3lame", audio: "mp3", wantCodec: "mp3", wantEnc: "libmp3lame"},
+		{name: "aac is its own encoder", audio: "aac", wantCodec: "aac", wantEnc: "aac"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// A source in a codec the browser cannot copy, so audio and video
+			// both transcode.
+			info := &MediaInfo{
+				Width: 1920, Height: 1080, VideoCodec: "ffv1", AudioCodec: "pcm_s16le",
+				Container: "matroska", DurationSeconds: 60,
+			}
+			capability := ClientCapability{
+				Containers: []string{"mp4"}, VideoCodecs: []string{"h264"},
+				AudioCodecs: []string{tt.audio}, MaxAudioChannels: 2,
+				// Without this the decision is undeliverable and negotiation
+				// returns before the audio encoder is resolved at all, which
+				// would make this test pass for the wrong reason.
+				SupportsHLS: true,
+			}
+
+			decision := NegotiateForServer(info, capability, server)
+			if decision.AudioAction != ActionTranscode {
+				t.Fatalf("audio action = %q, want a transcode", decision.AudioAction)
+			}
+			if decision.TargetAudioCodec != tt.wantCodec {
+				t.Fatalf("audio codec = %q, want %q", decision.TargetAudioCodec, tt.wantCodec)
+			}
+			if decision.TargetAudioEncoder != tt.wantEnc {
+				t.Errorf("audio encoder = %q, want %q: the codec name is not the encoder name",
+					decision.TargetAudioEncoder, tt.wantEnc)
+			}
+		})
+	}
+}
+
+// TestNegotiate_LeavesTheEncoderUnresolved guards the pure/total split: Negotiate
+// has no server to consult, so it must not invent an encoder name.
+func TestNegotiate_LeavesTheEncoderUnresolved(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Width: 1920, Height: 1080, VideoCodec: "ffv1", AudioCodec: "pcm_s16le",
+		Container: "matroska", DurationSeconds: 60,
+	}
+	capability := ClientCapability{
+		Containers: []string{"mp4"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"opus"}, MaxAudioChannels: 2,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.AudioAction == ActionTranscode && decision.TargetAudioEncoder != "" {
+		t.Errorf("pure Negotiate resolved %q with no server to check against",
+			decision.TargetAudioEncoder)
+	}
+}
+
 func TestBuildFFmpegArgs(t *testing.T) {
 	t.Parallel()
 
@@ -282,6 +366,99 @@ func TestBuildFFmpegArgs(t *testing.T) {
 			},
 			cfg:       software,
 			wantParts: []string{"-c:v libx264", "-crf 21", "-vf scale=-2:720", "-c:a aac", "-b:a 192k"},
+		},
+		{
+			// S-15: a forced keyframe on NVENC is not an IDR frame unless the
+			// family's own flag says so, and only an IDR frame is a key the HLS
+			// muxer cuts at. NVENC spells it with a hyphen.
+			name: "nvenc gets its forced-idr spelling",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+			},
+			cfg:       ManagerConfig{SegmentSeconds: 6, Server: ServerCapability{VideoEncoders: []string{"h264_nvenc"}, AudioEncoders: []string{"aac"}}},
+			wantParts: []string{"-c:v h264_nvenc", "-forced-idr 1", "-force_key_frames expr:gte(t,n_forced*6)"},
+		},
+		{
+			// QSV and AMF spell the same option with an underscore.
+			name: "qsv gets its forced_idr spelling",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+			},
+			cfg:       ManagerConfig{SegmentSeconds: 6, Server: ServerCapability{VideoEncoders: []string{"h264_qsv"}, AudioEncoders: []string{"aac"}}},
+			wantParts: []string{"-c:v h264_qsv", "-forced_idr 1"},
+			denyParts: []string{"-forced-idr"},
+		},
+		{
+			// The encoders that already cut where they are told must not be
+			// given an option they do not know: ffmpeg treats an unknown
+			// option as an error, not a no-op.
+			name: "software and vaapi get no forced-IDR flag",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+			},
+			cfg:       ManagerConfig{SegmentSeconds: 6, Server: ServerCapability{VideoEncoders: []string{"libx264", "h264_vaapi"}, AudioEncoders: []string{"aac"}}},
+			wantParts: []string{"-force_key_frames expr:gte(t,n_forced*6)"},
+			denyParts: []string{"-forced-idr", "-forced_idr"},
+		},
+		{
+			// S-7 of the 2026-10-09 review. ffmpeg's "opus" is its native
+			// experimental encoder, which refuses to run without -strict -2;
+			// the encoder that works is "libopus". NegotiatorForServer now
+			// resolves the codec into an encoder and the session passes that.
+			name: "an opus target passes the encoder, not the codec name",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "opus",
+				TargetAudioEncoder: "libopus",
+			},
+			cfg:       software,
+			wantParts: []string{"-c:a libopus"},
+			denyParts: []string{"-c:a opus "},
+		},
+		{
+			name: "a vorbis target passes libvorbis",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "vorbis",
+				TargetAudioEncoder: "libvorbis",
+			},
+			cfg:       software,
+			wantParts: []string{"-c:a libvorbis"},
+			denyParts: []string{"-c:a vorbis "},
+		},
+		{
+			// A decision built by hand carries no resolved encoder, which is
+			// what the pure Negotiate tests produce. The builder has to fall
+			// back to the codec's known encoder rather than passing the codec
+			// name straight through.
+			name: "a hand-built decision with only a codec still gets an encoder",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "opus",
+			},
+			cfg:       software,
+			wantParts: []string{"-c:a libopus"},
+			denyParts: []string{"-c:a opus "},
+		},
+		{
+			name: "an aac target is unchanged",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+				TargetAudioEncoder: "aac",
+			},
+			cfg:       software,
+			wantParts: []string{"-c:a aac", "-b:a 192k"},
 		},
 		{
 			name: "transcode prefers quick sync when the host has it",
@@ -1133,22 +1310,92 @@ func TestNegotiateForServer_KeepsHDRWhenTheEncoderWasVerified(t *testing.T) {
 	}
 }
 
-// TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped covers the dead end
-// in the other direction: the client can show HDR but only decodes H.264, which
-// has no meaningful 10-bit HDR form. The picture is tone mapped to SDR, which is
-// the best that can honestly be delivered.
-func TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped(t *testing.T) {
-	t.Parallel()
-
+// hdrClientWithOnlyH264 is the dead end in the other direction: the client can
+// show HDR but only decodes H.264, which has no meaningful 10-bit HDR form.
+func hdrClientWithOnlyH264() ClientCapability {
 	capability := hdrCapability()
 	capability.Containers = []string{"hls"}
 	capability.VideoCodecs = []string{"h264"}
+	return capability
+}
 
+// hdrSourceNeedingATranscode is an HDR film the browser profile cannot copy:
+// VP9 video and no audio in a container it does not accept, so the decision is
+// a real re-encode rather than a copy.
+func hdrSourceNeedingATranscode() *MediaInfo {
 	info := hdrFilm()
 	info.VideoCodec = "vp9"
 	info.AudioCodec = "aac"
+	return info
+}
 
-	server := ServerCapability{VideoEncoders: []string{"libx264"}}
+// hostileHDRServer advertises libx264 as a verified 10-bit HDR encoder, which
+// is what this host really reports before the S-6 fix: libx264 does produce
+// yuv420p10le when probed. The old test used a server with an empty
+// HDRVideoEncoders list, which is exactly the condition that hid the bug.
+func hostileHDRServer() ServerCapability {
+	return ServerCapability{
+		VideoEncoders:    []string{"libx264"},
+		AudioEncoders:    []string{"aac"},
+		HDRVideoEncoders: []HDREncoder{{Encoder: "libx264", PixelFormat: "yuv420p10le"}},
+	}
+}
+
+// TestNegotiate_HDRClientWithOnlyH264IsToneMapped is the S-6 regression test at
+// the layer that must not depend on the host.
+//
+// The bug was that pure negotiation kept an HDR range while targeting H.264,
+// and only tone mapped by accident when the server capability list happened to
+// have no HDR encoders. This asserts the rule on the codec alone, with no
+// server in the picture at all.
+func TestNegotiate_HDRClientWithOnlyH264IsToneMapped(t *testing.T) {
+	t.Parallel()
+
+	decision := Negotiate(hdrSourceNeedingATranscode(), hdrClientWithOnlyH264())
+	if decision.VideoAction != ActionTranscode {
+		t.Fatalf("video action = %q, want a transcode", decision.VideoAction)
+	}
+	if decision.TargetVideoCodec != "h264" {
+		t.Fatalf("target codec = %q, want h264", decision.TargetVideoCodec)
+	}
+	if !decision.ToneMap || decision.TargetDynamicRange != RangeSDR {
+		t.Errorf("H.264 cannot carry HDR, so this must be tone mapped to SDR: "+
+			"tonemap=%v range=%q\nreasons: %s",
+			decision.ToneMap, decision.TargetDynamicRange, strings.Join(decision.Reasons, "; "))
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "cannot carry") {
+		t.Errorf("the decision should say why the range changed: %s",
+			strings.Join(decision.Reasons, "; "))
+	}
+}
+
+// TestNegotiate_HDRCapableCodecKeepsTheRange is the control: the rule must not
+// tone map a decode the client can actually use.
+func TestNegotiate_HDRCapableCodecKeepsTheRange(t *testing.T) {
+	t.Parallel()
+
+	capability := hdrClientWithOnlyH264()
+	capability.VideoCodecs = []string{"h264", "hevc"}
+
+	decision := Negotiate(hdrSourceNeedingATranscode(), capability)
+	if decision.TargetVideoCodec != "hevc" {
+		t.Fatalf("target codec = %q, want hevc: the HDR-capable codec should win", decision.TargetVideoCodec)
+	}
+	if decision.ToneMap || decision.TargetDynamicRange != RangeHDR10 {
+		t.Errorf("an HDR-capable target must keep the range: tonemap=%v range=%q",
+			decision.ToneMap, decision.TargetDynamicRange)
+	}
+}
+
+// TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped covers the same dead
+// end once a server is in the picture, and adds the case that used to hide the
+// bug: a server that lists libx264 as a 10-bit HDR encoder.
+func TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped(t *testing.T) {
+	t.Parallel()
+
+	capability := hdrClientWithOnlyH264()
+	info := hdrSourceNeedingATranscode()
+	server := hostileHDRServer()
 
 	decision := NegotiateForServer(info, capability, server)
 	if !decision.Deliverable {
@@ -1762,6 +2009,13 @@ func TestBuildFFmpegArgs_Ladder(t *testing.T) {
 			t.Errorf("ladder command line is missing %q:\n%s", want, joined)
 		}
 	}
+	// libx264 needs no forced-IDR flag: it already produces the frame the muxer
+	// cuts on. Adding one would be passing an option it does not know (S-15).
+	for _, unwanted := range []string{"-forced-idr", "-forced_idr"} {
+		if strings.Contains(joined, unwanted) {
+			t.Errorf("a software ladder must not carry %q:\n%s", unwanted, joined)
+		}
+	}
 	// Each rung maps the source once; two rungs and one audio stream each is
 	// four maps, and any fewer would feed a rung the wrong input.
 	if got := strings.Count(joined, "-map 0:v:0"); got != 2 {
@@ -2081,5 +2335,448 @@ func TestBuildFFmpegArgs_BurnsAnImageSubtitle(t *testing.T) {
 	}
 	if strings.Contains(line, "-vf") {
 		t.Errorf("-vf cannot share an output with -filter_complex:\n%s", line)
+	}
+}
+
+// TestBuildFFmpegArgs_HardwareLadderCarriesTheForcedIDRSpellingPerRendition
+// guards the ladder spelling for S-15.
+//
+// Every encoder option on a ladder needs a stream specifier, or it lands on the
+// first video stream and the remaining rungs keep the native GOP - the exact
+// problem the forced keyframe exists to remove, left in place for every rung but
+// one.
+func TestBuildFFmpegArgs_HardwareLadderCarriesTheForcedIDRSpellingPerRendition(t *testing.T) {
+	t.Parallel()
+
+	args, err := BuildFFmpegArgs("/tmp/session", "/media/movie.mkv", Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+		Renditions: []Rendition{
+			{Height: 1080, BitrateKbps: 5000},
+			{Height: 720, BitrateKbps: 2500},
+		},
+	}, ManagerConfig{
+		SegmentSeconds: 4,
+		Server: ServerCapability{
+			VideoEncoders: []string{"h264_nvenc"},
+			AudioEncoders: []string{"aac"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
+
+	for _, want := range []string{"-forced-idr:0 1", "-forced-idr:1 1"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("a ladder rung is missing the specifier on %q:\n%s", want, joined)
+		}
+	}
+	// The unsuffixed form would apply to the first video stream only, which is
+	// what the specifier exists to avoid.
+	if strings.Contains(joined, "-forced-idr 1") {
+		t.Errorf("the forced-IDR flag was emitted without a specifier on a ladder:\n%s", joined)
+	}
+}
+
+// TestNegotiate_WhichRequestsGetALadder is the regression test for D-5.
+//
+// playback.md contradicted itself and the code. It said an omitted body means
+// "the built-in browser profile", and the profile it described caps at 1920x1080;
+// it also said a request naming neither height adapts into a ladder. But
+// BrowserCapability sets MaxHeight and leaves PreferredHeight unset, and that
+// combination is a *pin* by the page's own rule - "max_height alone gives me
+// exactly this" - so a body-less request never gets a ladder. The UI, which omits
+// the height fields entirely, does.
+//
+// The behaviour is right and is what a body-less caller should want: a stable,
+// cheap answer that adapts to the viewer's quality menu rather than a ladder
+// chosen without knowing the source. The documentation was wrong, and this pins
+// the four cases so the two cannot disagree again.
+func TestNegotiate_WhichRequestsGetALadder(t *testing.T) {
+	t.Parallel()
+
+	// 4K H.264 the browser profile can decode but must downscale to its ceiling,
+	// which is a transcode and therefore a case where a ladder is possible.
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 3840, Height: 2160, BitDepth: 8, DurationSeconds: 600,
+	}
+
+	tests := []struct {
+		name        string
+		capability  ClientCapability
+		wantLadder  bool
+		wantTopRung int
+		description string
+	}{
+		{
+			name:       "the built-in profile pins one rendition",
+			capability: BrowserCapability(),
+			wantLadder: false,
+			description: "a body-less request. max_height alone is a pin, so the answer is " +
+				"one encode at the profile's ceiling rather than a ladder",
+		},
+		{
+			// The source has to need encoding for a ladder to be possible at all: a
+			// source the client can take as-is is direct play or a remux, and a
+			// remux copies the video rather than building rungs. The UI's request
+			// is this shape - no heights, and a source needing work.
+			name: "no heights at all is a ladder",
+			capability: ClientCapability{
+				Containers: []string{"hls"}, VideoCodecs: []string{"h264"},
+				AudioCodecs: []string{"aac"}, SupportsHLS: true,
+			},
+			wantLadder: true,
+			description: "the UI's request: it sends no height, so it adapts as far as the " +
+				"source allows",
+		},
+		{
+			name: "a preferred height is a ladder topped there",
+			capability: ClientCapability{
+				Containers: []string{"hls"}, VideoCodecs: []string{"h264"},
+				AudioCodecs: []string{"aac"}, SupportsHLS: true,
+				MaxHeight: 1080, PreferredHeight: 720,
+			},
+			wantLadder:  true,
+			wantTopRung: 720,
+			description: "what the quality menu sends when a viewer picks a setting",
+		},
+		{
+			name: "a max height alone is a pin",
+			capability: ClientCapability{
+				Containers: []string{"hls"}, VideoCodecs: []string{"h264"},
+				AudioCodecs: []string{"aac"}, SupportsHLS: true,
+				MaxHeight: 720,
+			},
+			wantLadder:  false,
+			wantTopRung: 720,
+			description: "the deterministic request",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// The source is chosen per case: a client that can take the video as-is
+			// is direct play or a remux, and neither builds rungs. HEVC is the codec
+			// the browser profile cannot decode, so it forces the encode that a
+			// ladder needs.
+			info := info
+			if tt.wantLadder && len(tt.capability.VideoCodecs) == 1 &&
+				tt.capability.VideoCodecs[0] == "h264" && tt.capability.MaxHeight == 0 {
+				info = &MediaInfo{
+					Container: "matroska", VideoCodec: "hevc", AudioCodec: "aac",
+					Width: 3840, Height: 2160, BitDepth: 8, DurationSeconds: 600,
+				}
+			}
+
+			decision := Negotiate(info, tt.capability.Normalise())
+			if decision.VideoAction != ActionTranscode {
+				t.Fatalf("video action = %q, want a transcode: %s", decision.VideoAction, tt.description)
+			}
+
+			gotLadder := len(decision.Renditions) > 1
+			if gotLadder != tt.wantLadder {
+				t.Errorf("got %d renditions, want %s: %s",
+					len(decision.Renditions), map[bool]string{true: "a ladder", false: "one"}[tt.wantLadder],
+					tt.description)
+			}
+			if tt.wantTopRung > 0 && decision.TargetHeight != tt.wantTopRung {
+				t.Errorf("target height = %d, want %d", decision.TargetHeight, tt.wantTopRung)
+			}
+		})
+	}
+}
+
+// TestNegotiate_BurnInIsCodecAgnostic is the regression test for D-15.
+//
+// The burn decision takes the default branch for any non-text track, so DVB
+// subtitles are burned like PGS and VobSub — but the 400 message for a *text*
+// track said "only image subtitles (PGS, VobSub) are burned in", and README.md
+// said DVB is "burn-in only" as though that had been shown. Both are claims the
+// project had not verified: the burn integration test uses a PGS fixture, and
+// nothing exercised DVB through this path.
+//
+// What can be verified without a DVB burn fixture is the decision itself, and
+// that is what this pins: the rule is "not text", not a list. A codec the project
+// has no decoder for is still a bitmap that cannot go into copied bits.
+func TestNegotiate_BurnInIsCodecAgnostic(t *testing.T) {
+	t.Parallel()
+
+	for _, codec := range []string{
+		"hdmv_pgs_subtitle",
+		"dvd_subtitle", // VobSub
+		"dvb_subtitle",
+		"xsub", // a codec with no support anywhere in this project
+	} {
+		t.Run(codec, func(t *testing.T) {
+			t.Parallel()
+
+			info := &MediaInfo{
+				Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+				Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+				AudioTracks: []AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+				Subtitles: []SubtitleTrack{
+					{Index: 3, Codec: codec, Text: false, Language: "fr"},
+				},
+			}
+			capability := ClientCapability{
+				Containers: []string{"matroska"}, VideoCodecs: []string{"h264"},
+				AudioCodecs: []string{"aac"}, SupportsHLS: true,
+				BurnSubtitleIndex: 3,
+			}
+
+			decision := Negotiate(info, capability)
+			if decision.BurnedSubtitleIndex != 3 {
+				t.Errorf("burned index = %d, want 3: the burn rule is \"not text\", not a "+
+					"list of codecs", decision.BurnedSubtitleIndex)
+			}
+			if decision.Mode != ModeTranscode {
+				t.Errorf("mode = %q, want a transcode: a bitmap cannot be composited into "+
+					"copied bits", decision.Mode)
+			}
+			// The reason names the codec it is about, so a log reader can tell why.
+			reasons := strings.Join(decision.Reasons, "; ")
+			if !strings.Contains(reasons, codec) {
+				t.Errorf("the reasons do not name %s: %s", codec, reasons)
+			}
+		})
+	}
+}
+
+// TestNegotiate_TextTrackRefusalNamesTheWholeRule pins the message D-15 found to
+// be narrower than the code. It is what a client sees when it asks for a text
+// track to be burned, so it has to describe the actual rule.
+func TestNegotiate_TextTrackRefusalNamesTheWholeRule(t *testing.T) {
+	t.Parallel()
+
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+		Subtitles:   []SubtitleTrack{{Index: 2, Codec: "subrip", Text: true, Language: "en"}},
+	}
+	capability := ClientCapability{
+		Containers: []string{"matroska"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true,
+		BurnSubtitleIndex: 2,
+	}
+
+	decision := Negotiate(info, capability)
+	if decision.BurnedSubtitleIndex != 0 {
+		t.Fatalf("burned index = %d, want 0: a text track is delivered, not burned",
+			decision.BurnedSubtitleIndex)
+	}
+	reasons := strings.Join(decision.Reasons, "; ")
+	// The old message claimed PGS and VobSub were the burnable set, which is not
+	// the rule the default branch implements.
+	if strings.Contains(reasons, "only image subtitles") {
+		t.Errorf("the refusal claims a fixed list of burnable codecs; the rule is that a "+
+			"text track is delivered and a bitmap is burned: %s", reasons)
+	}
+}
+
+// TestNegotiate_BitDepthZeroMeansUnrestricted is the regression test for S-14.
+//
+// The field documents zero as "unrestricted", and the check treated it as "at
+// most 0-bit" - so every source deeper than 8 bits became a transcode, with a
+// reason no client can mean. The browser protection does not depend on the zero
+// value: it comes from the built-in profile setting 8 explicitly, which the test
+// below pins alongside this one.
+func TestNegotiate_BitDepthZeroMeansUnrestricted(t *testing.T) {
+	t.Parallel()
+
+	// 10-bit HEVC, which a browser cannot decode as H.264 High 10 but which a
+	// client that declares no depth limit is saying it can.
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "hevc", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 10, DurationSeconds: 600,
+	}
+
+	// A client that declares a depth is held to it: 10-bit is over its 8.
+	strict := ClientCapability{
+		Containers: []string{"hls"}, VideoCodecs: []string{"hevc"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true,
+		MaxBitDepth: 8,
+	}.Normalise()
+	if !reasonSays(strict, info, "bit") {
+		t.Errorf("a client asking for at most 8-bit was given a 10-bit source without a "+
+			"reason; reasons: %v", Negotiate(info, strict).Reasons)
+	}
+
+	// A client that leaves it zero is not.
+	open := ClientCapability{
+		Containers: []string{"hls"}, VideoCodecs: []string{"hevc"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true,
+	}.Normalise()
+	decision := Negotiate(info, open)
+	for _, reason := range decision.Reasons {
+		if strings.Contains(reason, "bit") && strings.Contains(reason, "0-bit") {
+			t.Errorf("the reason claims a client decodes at most 0-bit, which is not "+
+				"something a client can mean: %s", reason)
+		}
+	}
+}
+
+// TestNegotiate_BuiltInProfileStillRefusesDeepVideo guards the protection the
+// zero value must not be mistaken for.
+func TestNegotiate_BuiltInProfileStillRefusesDeepVideo(t *testing.T) {
+	t.Parallel()
+
+	// mp4 rather than matroska, on purpose: the browser profile does not accept
+	// matroska, so a matroska fixture is refused for its container and this test
+	// would pass without the bit-depth check doing anything. The fixture has to
+	// make bit depth the only obstacle, or it asserts nothing.
+	info := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 10, DurationSeconds: 600,
+	}
+	// The browser profile sets MaxBitDepth to 8 rather than leaving it zero, and
+	// that is what stops a 10-bit H.264 being direct-played into a stalled player.
+	decision := Negotiate(info, BrowserCapability().Normalise())
+	if decision.Mode == ModeDirectPlay {
+		t.Errorf("the built-in profile direct-played a 10-bit source; mode = %q", decision.Mode)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "bit") {
+		t.Errorf("the refusal does not say it is about bit depth: %v", decision.Reasons)
+	}
+}
+
+// reasonSays reports whether a negotiation produced a reason mentioning a word.
+func reasonSays(capability ClientCapability, info *MediaInfo, word string) bool {
+	return strings.Contains(strings.Join(Negotiate(info, capability).Reasons, "; "), word)
+}
+
+// TestNegotiate_DirectPlayRequiresEveryTrackAPlayerMightChoose is the regression
+// test for S-16.
+//
+// A file opened directly is one whose stream selection this server does not
+// control: the player picks. Where the default flag points past the first track,
+// a player that honours the flag and one that takes the first stream disagree -
+// and the review measured the server assuming the former while browsers did the
+// latter. For an MP4 with AC3 first and AAC flagged default, a browser that takes
+// the first track plays AC3 and the viewer gets no sound, while the decision said
+// the client could decode the audio it had checked.
+//
+// Direct play therefore requires every track a player might choose to be
+// decodable. Remux and transcode are unaffected, because there the server maps one
+// stream explicitly and what it decided is what plays.
+func TestNegotiate_DirectPlayRequiresEveryTrackAPlayerMightChoose(t *testing.T) {
+	t.Parallel()
+
+	// AC3 first, AAC second and flagged default - the arrangement that is silent
+	// for a client that takes the first stream.
+	ambiguous := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "ac3", AudioChannels: 6,
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []AudioTrack{
+			{Index: 1, Codec: "ac3", Channels: 6},
+			{Index: 2, Codec: "aac", Channels: 2, Default: true},
+		},
+	}
+
+	// A client that cannot decode AC3 must not be handed the original file: it
+	// might play the track it cannot decode.
+	client := ClientCapability{
+		Containers: []string{"mp4"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, MaxBitDepth: 8, MaxAudioChannels: 6,
+	}.Normalise()
+
+	decision := Negotiate(ambiguous, client)
+	if decision.Mode == ModeDirectPlay {
+		t.Errorf("the original file was handed to a client that cannot decode its first "+
+			"audio track; mode = %q, reasons = %v", decision.Mode, decision.Reasons)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "disagree") {
+		t.Errorf("the decision does not say why the original file was not delivered "+
+			"untouched: %v", decision.Reasons)
+	}
+
+	// A client that can decode both is unaffected: there is nothing to disagree
+	// about if every answer works.
+	both := ClientCapability{
+		Containers: []string{"mp4"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac", "ac3"}, MaxBitDepth: 8, MaxAudioChannels: 6,
+	}.Normalise()
+	if got := Negotiate(ambiguous, both).Mode; got != ModeDirectPlay {
+		t.Errorf("a client that can decode every track was not given the original file; "+
+			"mode = %q", got)
+	}
+
+	// And a client that names the track it wants is not affected either: the
+	// server maps that stream, so what it decided is what plays.
+	named := ClientCapability{
+		Containers: []string{"mp4"}, VideoCodecs: []string{"h264"},
+		AudioCodecs: []string{"aac"}, MaxBitDepth: 8, MaxAudioChannels: 6,
+		AudioTrackIndex: 2,
+	}.Normalise()
+	if named.AudioTrackIndex != 2 {
+		t.Fatalf("the fixture did not keep the requested track: %+v", named)
+	}
+	if got := Negotiate(ambiguous, named).Mode; got == ModeDirectPlay {
+		t.Errorf("a client that named the second track was given the original file, but " +
+			"naming a track is what makes the mapping the server's")
+	}
+
+	// An unambiguous file - one track, or the default is the first - is unaffected.
+	plain := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "ac3", AudioChannels: 6,
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []AudioTrack{
+			{Index: 1, Codec: "ac3", Channels: 6, Default: true},
+			{Index: 2, Codec: "aac", Channels: 2},
+		},
+	}
+	// The chosen track is ac3, which this client cannot decode, so it is not
+	// direct play for that reason - not for ambiguity. The message must be the
+	// codec one rather than the disagreement one.
+	reasons := strings.Join(Negotiate(plain, client).Reasons, "; ")
+	if strings.Contains(reasons, "disagree") {
+		t.Errorf("an unambiguous file was reported as having disagreeing tracks: %s", reasons)
+	}
+}
+
+// TestDirectPlayAudioTracks pins the rule itself, including when it applies.
+func TestDirectPlayAudioTracks(t *testing.T) {
+	t.Parallel()
+
+	first := AudioTrack{Index: 1, Codec: "ac3"}
+	second := AudioTrack{Index: 2, Codec: "aac", Default: true}
+	info := &MediaInfo{AudioTracks: []AudioTrack{first, second}}
+
+	// The default points past the first track, so two players can disagree.
+	got := info.DirectPlayAudioTracks(second, false)
+	if len(got) != 2 {
+		t.Errorf("a file whose default is not its first track reported %d possible "+
+			"tracks, want 2", len(got))
+	}
+
+	// One track: one possible answer.
+	single := &MediaInfo{AudioTracks: []AudioTrack{first}}
+	if got := single.DirectPlayAudioTracks(first, false); len(got) != 1 {
+		t.Errorf("a single-track file reported %d possible tracks, want 1", len(got))
+	}
+
+	// The default is the first track: the two candidates coincide.
+	agreeing := &MediaInfo{AudioTracks: []AudioTrack{
+		{Index: 1, Codec: "aac", Default: true},
+		{Index: 2, Codec: "ac3"},
+	}}
+	if got := agreeing.DirectPlayAudioTracks(agreeing.AudioTracks[0], false); len(got) != 1 {
+		t.Errorf("a file whose default is its first track reported %d possible tracks, "+
+			"want 1", len(got))
+	}
+
+	// A client that named a track gets exactly that one.
+	if got := info.DirectPlayAudioTracks(second, true); len(got) != 1 || got[0].Index != 2 {
+		t.Errorf("a named track produced %+v, want just the named one", got)
+	}
+
+	// No track list, no rule.
+	if got := (&MediaInfo{}).DirectPlayAudioTracks(AudioTrack{}, false); got != nil {
+		t.Errorf("a file with no track list reported %+v", got)
 	}
 }

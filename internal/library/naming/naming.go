@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // This file holds the pure filename/path parsing rules used by the Scanner. It
@@ -12,14 +13,80 @@ import (
 
 var (
 	// episodeRe matches S01E02, s1e2, S01.E02, S01 E02 and similar forms.
-	episodeRe = regexp.MustCompile(`(?i)\bs(\d{1,2})[\s._-]*e(\d{1,3})\b`)
+	//
+	// `\b` is wrong at the left edge. A word boundary is a change between a word
+	// character and a non-word one, and `_` is a word character - so
+	// "Show_S01E01_Pilot" has no boundary before the S and was rejected outright,
+	// which is the shape a great many releases use (L-17 of the 2026-10-09 review).
+	// The lookarounds say what was meant: not part of a longer word.
+	episodeRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])s(\d{1,2})[\s._-]*e(\d{1,3})(?:v\d+)?(?:[^a-z0-9]|$)`)
+	// episodeMultiRe matches the two-episode form, S01E01E02, and captures the last
+	// number because that is the one a season's numbering continues from.
+	episodeMultiRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])s(\d{1,2})[\s._-]*e(\d{1,3})[\s._-]*e(\d{1,3})`)
+	// episodeXRe matches the 1x02 form, which predates the SxxExx convention and is
+	// still what some libraries use. It requires a digit before the x, so a title
+	// like "Malcolm X" is not an episode.
+	episodeXRe = regexp.MustCompile(`(?:^|[^a-z0-9])(\d{1,2})x(\d{2,3})(?:[^a-z0-9]|$)`)
+	// episodeSeasonRe matches S2024E01 - a four-digit year used as the season, which
+	// is how long-running shows and daily programmes number themselves. It is tried
+	// after the two-digit form so a normal S01E02 does not read as S2024E01's
+	// shorter cousin.
+	episodeSeasonRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])s(\d{4})[\s._-]*e(\d{1,3})(?:[^a-z0-9]|$)`)
 	// seasonDirRe matches a directory named "Season 1", "season.01", "S1", ...
 	seasonDirRe = regexp.MustCompile(`(?i)^(?:season|series|s)[\s._-]*(\d{1,2})$`)
-	// yearRe captures a trailing (2020) / .2020. release year.
-	yearRe = regexp.MustCompile(`[\(\[\.\s_-]((?:19|20)\d{2})[\)\]\.\s_-]*$`)
 	// junkRe collapses separators commonly used in release names.
 	junkRe = regexp.MustCompile(`[\s._]+`)
+	// bracketedYearRe finds a year a name *declares*: (2017), [2010], {1995}.
+	//
+	// A declared year is the strongest signal there is, and looking for it first is
+	// what stops "Blade Runner 2049 (2017)" taking 2049 - a number in the title -
+	// when the name says 2017 in brackets.
+	bracketedYearRe = regexp.MustCompile(`[\[(]\s*((?:19|20)\d{2})\s*[\])]`)
+	// releaseHyphenRe matches a hyphen that separates tokens rather than sitting
+	// inside a word: space, hyphen, space. A one-sided test split "WEB-DL" into two
+	// tokens, which the noise list then failed to recognise, and left the second
+	// half in the title.
+	releaseHyphenRe = regexp.MustCompile(`\s+-\s+`)
+	// sampleFileRe matches a file the release marked as a sample. The name is the
+	// title with a word appended, so the test is on the token: "sample" separated
+	// from what precedes it by a separator, and either at the end of the name or in
+	// a form such as "sample-1".
+	sampleFileRe = regexp.MustCompile(`(?i)(?:^|[\s._-])samples?(?:[\s._-]|$)`)
+	// resolutionLikeRe matches a bare channel layout such as "7" left from "7.1".
+	resolutionLikeRe = regexp.MustCompile(`^\d$|^\d\.\d$`)
+	// trailingGroupRe matches a channel count with a release group attached, which
+	// is what "1-DTOne" is: "7.1-DTOne" loses its dot to the separator pass and
+	// arrives as "7" then "1-DTOne". The digits are a channel count and everything
+	// after the hyphen is the group's own name, so neither is a title word.
+	trailingGroupRe = regexp.MustCompile(`^\d+-.+$`)
 )
+
+// releaseNoiseTokens is the vocabulary a release name uses after the title. It is
+// a set rather than a regular expression because the decision is per token: the
+// first version of this matched over the whole string and needed the separators,
+// the surrounding tokens and the brackets to all be right at once.
+var releaseNoiseTokens = map[string]bool{
+	// Resolution and source.
+	"2160p": true, "1080p": true, "720p": true, "576p": true, "480p": true,
+	"4k": true, "uhd": true, "hd": true, "sd": true, "hq": true,
+	"bluray": true, "blu-ray": true, "brrip": true, "bdrip": true, "bdremux": true, "remux": true,
+	"web": true, "webdl": true, "web-dl": true, "webrip": true, "web-rip": true,
+	"hdrip": true, "dvdrip": true,
+	"dvd": true, "hdtv": true, "pdtv": true, "tvrip": true,
+	// Video codecs and bit depths.
+	"x264": true, "x265": true, "h264": true, "h265": true, "hevc": true,
+	"avc": true, "xvid": true, "divx": true, "av1": true, "vp9": true,
+	"10bit": true, "8bit": true, "hi10p": true,
+	// Audio.
+	"aac": true, "ac3": true, "eac3": true, "dd": true, "ddp": true,
+	"dts": true, "dtshd": true, "dtshdma": true, "dts-hd": true, "dts-hdma": true,
+	"truehd": true, "true-hd": true, "atmos": true,
+	"flac": true, "mp3": true, "opus": true, "commentary": true,
+	// Dynamic range and edition.
+	"hdr": true, "hdr10": true, "hdr10+": true, "dv": true, "dolby": true,
+	"vision": true, "sdr": true, "remastered": true, "proper": true,
+	"repack": true, "extended": true, "uncut": true, "imax": true, "multi": true,
+}
 
 // VideoExtensions is the set of file extensions the Scanner treats as media.
 var VideoExtensions = map[string]bool{
@@ -52,18 +119,75 @@ func IsVideoFile(path string) bool {
 	return VideoExtensions[strings.ToLower(filepath.Ext(path))]
 }
 
-// IsIgnored reports whether a path component should be skipped during a scan.
-// Hidden entries, sample folders and metadata sidecar directories are excluded.
+// supplementaryDirNames are directory names that hold material *about* a title
+// rather than the title itself, wherever they appear in the tree.
+var supplementaryDirNames = map[string]bool{
+	// "sample" and "samples" are directories too: a release often ships one beside
+	// the feature, and the files inside it are named for the title rather than
+	// "sample", so the file rule would not catch them.
+	"sample":  true,
+	"samples": true,
+	// The rest are material *about* a title.
+	"featurettes":       true,
+	"behind the scenes": true,
+	"bonus":             true,
+	"deleted scenes":    true,
+	"interviews":        true,
+	// "extras" is deliberately absent. It is a word an actual series has as a name
+	// - Ricky Gervais's - and skipping the directory dropped that series from the
+	// library with no warning (L-17 of the 2026-10-09 review).
+}
+
+// IsIgnored reports whether a directory component should be skipped during a scan.
+//
+// Supplementary directories are skipped at any depth, which is the common layout -
+// "Film (2019)/Extras/interview.mkv". The root itself is never judged, so a library
+// whose root *is* an Extras directory and which holds one series of that name is
+// still scanned; the scanner passes the root through this deliberately.
 func IsIgnored(name string) bool {
-	if strings.HasPrefix(name, ".") {
+	return isHidden(name) || supplementaryDirNames[strings.ToLower(name)]
+}
+
+// IsIgnoredFile reports whether a *file* should be skipped during a scan.
+//
+// This is a separate list from the directories, because the same word means
+// different things at the two levels and one list for both gets one of them wrong.
+// "Extras" is a name an actual series has - Ricky Gervais's - and skipping the
+// directory dropped it from the library silently. A file called "sample.mkv" is a
+// sample wherever it sits, and files named "Extras.mkv" are supplementary material
+// too, so that word still skips a file.
+//
+// A regular expression rather than a list, because samples are named for the title
+// they came from: "Dune.2021.2160p.sample.mkv" and "Dune-sample.mkv" are the same
+// thing, and the old whole-name test matched neither. They were left in the
+// library, which is L-17 of the 2026-10-09 review's other half.
+//
+// The cost of that is a title with "sample" as an ordinary word in it, which this
+// skips. Nothing in the name tells the two apart - "The Sample Maker" and "Dune
+// sample 1080p" have the same token in the same position - so the trade is made
+// deliberately: a release sample being left in the library is the more common
+// irritation, and the alternative signal, the file's size against the feature's, is
+// not available while walking a directory.
+func IsIgnoredFile(name string) bool {
+	if isHidden(name) {
 		return true
 	}
-	switch strings.ToLower(name) {
-	case "sample", "samples", "extras", "featurettes", "behind the scenes":
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	if sampleFileRe.MatchString(base) {
+		return true
+	}
+	switch strings.ToLower(base) {
+	case "extras", "featurette", "featurettes", "behind the scenes", "trailer", "trailers":
 		return true
 	default:
 		return false
 	}
+}
+
+// isHidden reports whether a name is a dotfile or dot-directory.
+func isHidden(name string) bool {
+	return strings.HasPrefix(name, ".") && name != "." && name != ".."
 }
 
 // EpisodeInfo is the result of parsing an episode file name or path.
@@ -79,23 +203,64 @@ type EpisodeInfo struct {
 func ParseEpisodeName(fileName string) (EpisodeInfo, bool) {
 	base := strings.TrimSuffix(fileName, filepath.Ext(fileName))
 
-	m := episodeRe.FindStringSubmatchIndex(base)
-	if m == nil {
-		return EpisodeInfo{}, false
-	}
-
-	season, errS := strconv.Atoi(base[m[2]:m[3]])
-	episode, errE := strconv.Atoi(base[m[4]:m[5]])
-	if errS != nil || errE != nil {
+	season, episode, end, ok := matchEpisode(base)
+	if !ok {
 		return EpisodeInfo{}, false
 	}
 
 	// Only the text after the SxxExx marker is a plausible episode title. The
 	// text before it is the series name, which the caller already has, so an
 	// absent title is returned as empty rather than guessed at.
-	title := cleanTitle(strings.Trim(base[m[1]:], " ._-"))
+	title := cleanTitle(strings.Trim(base[end:], " ._-"))
 
 	return EpisodeInfo{Season: season, Episode: episode, Title: title}, true
+}
+
+// matchEpisode finds a season and episode number in a name, and reports where the
+// marker ended.
+//
+// The forms are tried most specific first, because they overlap: S2024E01 contains
+// S24E01 to a two-digit pattern, and S01E01E02 contains S01E01 to the single form.
+// Taking the two-digit form first would read a year-based season as season 24.
+func matchEpisode(base string) (season, episode, end int, ok bool) {
+	// A four-digit season first.
+	if m := episodeSeasonRe.FindStringSubmatchIndex(base); m != nil {
+		s, errS := strconv.Atoi(base[m[2]:m[3]])
+		e, errE := strconv.Atoi(base[m[4]:m[5]])
+		if errS == nil && errE == nil {
+			return s, e, m[1], true
+		}
+	}
+
+	// A two-episode marker: the season's numbering continues from the *last*
+	// number, which is what a viewer looking for the next episode wants.
+	if m := episodeMultiRe.FindStringSubmatchIndex(base); m != nil {
+		s, errS := strconv.Atoi(base[m[2]:m[3]])
+		e, errE := strconv.Atoi(base[m[6]:m[7]])
+		if errS == nil && errE == nil {
+			return s, e, m[1], true
+		}
+	}
+
+	// The usual form, with an optional "v2" revision suffix the pattern swallows.
+	if m := episodeRe.FindStringSubmatchIndex(base); m != nil {
+		s, errS := strconv.Atoi(base[m[2]:m[3]])
+		e, errE := strconv.Atoi(base[m[4]:m[5]])
+		if errS == nil && errE == nil {
+			return s, e, m[1], true
+		}
+	}
+
+	// And the older 1x02 form.
+	if m := episodeXRe.FindStringSubmatchIndex(base); m != nil {
+		s, errS := strconv.Atoi(base[m[2]:m[3]])
+		e, errE := strconv.Atoi(base[m[4]:m[5]])
+		if errS == nil && errE == nil {
+			return s, e, m[1], true
+		}
+	}
+
+	return 0, 0, 0, false
 }
 
 // ParseEpisodePath derives the full placement of an episode file from its path
@@ -155,17 +320,130 @@ func SeasonDirName(season int) string {
 // ParseMovieName derives a movie title and optional year from a file name or
 // folder name such as "Blade Runner 2049 (2017).mkv".
 func ParseMovieName(name string) (title string, year int) {
-	base := strings.TrimSuffix(name, filepath.Ext(name))
-	base = strings.TrimSpace(base)
+	return parseMovieNameAt(name, time.Now())
+}
 
-	if m := yearRe.FindStringSubmatch(base); m != nil {
-		if y, err := strconv.Atoi(m[1]); err == nil {
+// parseMovieNameAt is ParseMovieName with the clock supplied.
+//
+// The plausibility bound depends on the current year, so a test that used the
+// real clock would change meaning with the calendar - and one of the cases is a
+// title containing 2049, which is implausible now and will be a plausible year
+// later.
+func parseMovieNameAt(name string, now time.Time) (title string, year int) {
+	base := strings.TrimSuffix(name, filepath.Ext(name))
+
+	// A declared year is the name telling us what it means, so it is taken first
+	// and taken out: "The Movie (2010) [1080p]" is 2010, whatever else the name
+	// holds.
+	if m := bracketedYearRe.FindStringSubmatchIndex(base); m != nil {
+		if y, err := strconv.Atoi(base[m[2]:m[3]]); err == nil && plausibleYear(y, now.Year()) {
 			year = y
-			base = strings.TrimSpace(base[:len(base)-len(m[0])])
+			base = base[:m[0]] + " " + base[m[1]:]
 		}
 	}
 
-	return cleanTitle(base), year
+	// Then the name is read as tokens. Splitting first and deciding per token is
+	// what makes the rest of this predictable: a regular expression over the whole
+	// string has to encode the separators, the surrounding tokens and the
+	// brackets at once, and gets them wrong in ways that are hard to see. The
+	// first version of this removed the separators around the year and took the
+	// year with them, which turned "Dune.2021.2160p" into "Dune 2160p".
+	tokens := releaseTokens(base)
+
+	kept := make([]string, 0, len(tokens))
+	for i, token := range tokens {
+		// A bare year counts once something precedes it. "Dune 2021" is 2021;
+		// "2001 A Space Odyssey" is a title whose first word is a number, and
+		// nothing before it means nothing to attach the year to.
+		if year == 0 && i > 0 && isYearToken(token, now.Year()) {
+			year, _ = strconv.Atoi(token)
+			// The year stays in the title. A bare year is part of the name - it is
+			// what tells two films with one title apart - and a declared one has
+			// already been taken out above, so reaching here means the name spells
+			// it as a word.
+		}
+		if isReleaseNoise(token) {
+			continue
+		}
+		// "7.1-DTOne" arrives as one token: the channel layout and the release
+		// group joined by a hyphen the tokeniser keeps, because that same hyphen is
+		// inside "Spider-Man". A token that is a digit, a dot and something after it
+		// is the layout, and the layout is noise.
+		if trailingGroupRe.MatchString(token) {
+			continue
+		}
+		kept = append(kept, token)
+	}
+
+	// Brackets that survived are release tags as well: "The Movie [1080p]" leaves
+	// a token "[1080p]" that the noise list sees as a bare resolution.
+	return cleanTitle(strings.Join(kept, " ")), year
+}
+
+// releaseTokens splits a file name into the words a release name is made of.
+//
+// Separators are the dots, underscores and bracketed spacing that release names
+// use in place of spaces. A hyphen is only a separator when it is not inside a
+// word, because "Spider-Man" and "DTS-HDMA" both contain one and they are not the
+// same kind of hyphen.
+func releaseTokens(base string) []string {
+	// A *video* extension goes first. It survives the separator pass as an ordinary
+	// word - "Dune.2021.2160p.mkv" tokenises to a trailing "mkv" - and a stray
+	// "mkv" in the title is the kind of thing that is obvious only after seeing it.
+	//
+	// Only a known extension, because filepath.Ext is a dot-separator rather than
+	// a file-type test: on a name whose extension has already been removed it
+	// answers ".2016" for "Arrival.2016" and strips the year. The caller removes
+	// the extension first, so this is a second, narrower pass for direct callers.
+	if ext := filepath.Ext(base); VideoExtensions[strings.ToLower(ext)] {
+		base = strings.TrimSuffix(base, ext)
+	}
+	// Brackets become spaces rather than being removed, so "[1080p]" contributes
+	// its own token and can be judged like any other.
+	base = strings.NewReplacer("(", " ", ")", " ", "[", " ", "]", " ", "{", " ", "}", " ").Replace(base)
+	base = strings.ReplaceAll(base, "_", " ")
+	base = strings.ReplaceAll(base, ".", " ")
+	base = releaseHyphenRe.ReplaceAllString(base, " ")
+	return strings.Fields(base)
+}
+
+// isYearToken reports whether a token is a four-digit year that could be one.
+func isYearToken(token string, currentYear int) bool {
+	if len(token) != 4 {
+		return false
+	}
+	y, err := strconv.Atoi(token)
+	if err != nil {
+		return false
+	}
+	return plausibleYear(y, currentYear)
+}
+
+// isReleaseNoise reports whether a token is a release tag rather than a title
+// word. The list is the vocabulary release names actually use; anything else is
+// kept, because a title word wrongly dropped is worse than a tag wrongly kept.
+func isReleaseNoise(token string) bool {
+	lower := strings.ToLower(token)
+	if releaseNoiseTokens[lower] {
+		return true
+	}
+	// A bare "7.1" or "5 1" survived tokenising as digits and a dot.
+	if resolutionLikeRe.MatchString(lower) {
+		return true
+	}
+	// A release group lands as the last hyphen-separated word, which tokenising
+	// leaves attached: "x265-DTOne" contributes "DTOne".
+	return false
+}
+
+// plausibleYear reports whether a four-digit number can be a release year.
+//
+// The upper bound is next year rather than this one, because a film announced for
+// next year is released and named before the year arrives. The lower bound is the
+// start of the twentieth century in the pattern, which is as far back as a film
+// title is worth guessing at.
+func plausibleYear(year, currentYear int) bool {
+	return year >= 1900 && year <= currentYear+1
 }
 
 // TitleFromPath derives a readable display name from a media file path: the

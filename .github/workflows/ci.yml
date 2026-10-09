@@ -83,6 +83,16 @@ jobs:
           node --check web/app.js
           node --check web/core.js
 
+      # The load harness is developer tooling rather than shipped code, but a
+      # syntax error in it is still a broken tool. Nothing here needs an npm
+      # install, and the harness needs a running server, so a parse check is the
+      # whole of what CI can say about it.
+      - name: Parse the load harness
+        run: |
+          for file in scripts/load-verify/*.mjs; do
+            node --check "$file"
+          done
+
       # The pure timeline core is unit-tested with Node's own runner, so this
       # needs no npm install and no lockfile.
       #
@@ -91,6 +101,20 @@ jobs:
       # machine's. Naming them works on every version that has `--test` at all.
       - name: Test the web core
         run: node --test web/*.test.js
+
+      # The manual end-to-end walk-through and its machine-readable twin describe
+      # the same steps. An edit to one that forgets the other would leave the
+      # Playwright conversion building against a document that has moved on, so
+      # the two are checked against each other here, where a drift is cheap.
+      - name: Check the end-to-end walk-through
+        run: node --test scripts/ui-verify/check-e2e-flows.test.mjs
+
+      # The runbook's list of what a release contains is prose, and prose about a
+      # build drifts silently: the build keeps shipping the right files while the
+      # list describes a different archive (DD-14 of the 2026-10-09 review). This
+      # holds the list against the paths build-release.sh asserts.
+      - name: Check the release contents list
+        run: node --test scripts/build-release/check-release-contents.test.mjs
 
       # deploy/README.md's systemd runbook is followed from an extracted release
       # archive: it copies the documents into /usr/local/share/doc and installs
@@ -111,7 +135,8 @@ jobs:
                    CONTEXT.md CONTRIBUTING.md SECURITY.md LICENSE \
                    THIRD_PARTY_NOTICES.md deploy deploy/astraeus.service \
                    docs/index.md docs/playback.md docs/configuration.md \
-                   docs/api.md docs/development.md; do
+                   docs/api.md docs/development.md docs/troubleshooting.md \
+                   assets/astraeus.png; do
             grep -qx "$f" "$layout" || { echo "missing from the release archive: $f"; status=1; }
           done
           # And the project's working documents must not be, or a release starts
@@ -150,6 +175,31 @@ jobs:
         with:
           # The action passes --no-update itself, and repeating a flag is an error.
           extra_args: --results=verified,unknown
+
+  vulnerabilities:
+    name: Scan for reachable vulnerabilities
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # `go-version-file` reads go.mod, and the `toolchain` line there is what
+      # decides the Go that runs. That matters more here than anywhere else:
+      # govulncheck reports the standard library of the toolchain it runs on, so
+      # a scan on an older patch reports vulnerabilities that the released
+      # binary does not have, and a scan on a newer one would hide the fact that
+      # the pinned toolchain is the thing shipping.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Pinned to a commit, not a tag: a tag can be moved under the job.
+      # This is the only gate on the Go standard library itself, which is where
+      # the 18 reachable vulnerabilities the 2026-10-09 review found lived.
+      - uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
+        with:
+          go-package: ./...
 
   image:
     name: Build the container image

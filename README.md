@@ -1,5 +1,9 @@
 # Astraeus Media
 
+<p align="center">
+  <img src="assets/astraeus.png" alt="Astraeus" width="640">
+</p>
+
 [![CI](https://github.com/ykzird/astraeus/actions/workflows/ci.yml/badge.svg)](https://github.com/ykzird/astraeus/actions/workflows/ci.yml)
 
 A self-hosted media server in a single Go binary, with a web UI it serves itself.
@@ -18,8 +22,11 @@ No database server, no front-end build step, three Go dependencies.
 - **Handles real files.** HDR and Dolby Vision reported and tone mapped for
   clients that cannot show them; hardware encoders verified by running them on
   the machine that starts the server; an adaptive bitrate ladder.
-- **Subtitles.** Text tracks served as WebVTT, and PGS image tracks read into
-  text with OCR when `tesseract` is installed — burn-in otherwise.
+- **Subtitles.** Text tracks served as WebVTT, and PGS or VobSub image tracks
+  read into text with OCR when `tesseract` is installed — burn-in for any bitmap
+  track otherwise. Burn-in is decided by whether the track is text, so it is not
+  limited to a list of codecs; PGS is the one it has been exercised with end to
+  end, and DVB burn-in is unverified (see `docs/handoff.md`).
 - **Remembers where you were**, per viewer, with a continue-watching list.
 - **An access gate, rate limiting and tracing** for when it is not just you.
   [More](docs/configuration.md)
@@ -30,7 +37,9 @@ What is missing is listed honestly in [TODO.md](TODO.md).
 ## Requirements
 
 - Linux, macOS or Windows to build; the container image is Linux
-- [ffmpeg](https://ffmpeg.org/) and `ffprobe` — a hard dependency, checked at startup
+- [ffmpeg](https://ffmpeg.org/) and `ffprobe` — needed for playback and checked at
+  startup; without them the server still starts and lists the library, and the
+  media routes answer 503
 - [tesseract](https://github.com/tesseract-ocr/tesseract) — optional, for reading
   image subtitles into text instead of burning them into the picture
 
@@ -72,7 +81,9 @@ docker exec astraeus astraeus-server scan --db /data/astraeus.db \
 
 The image includes ffmpeg and tesseract. Releases are tagged (`:0.18.0`) and
 published on the [releases page](https://github.com/ykzird/astraeus/releases);
-`:latest` follows them. Building the image yourself, running it as a service and
+`:latest` follows them. The package is private by default, so an anonymous pull
+needs it made public first — see [deployment](deploy/README.md) if the pull above
+is refused. Building the image yourself, running it as a service and
 putting TLS in front of it are all in [deployment](deploy/README.md).
 
 ## Documentation

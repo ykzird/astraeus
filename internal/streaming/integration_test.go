@@ -16,9 +16,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ykzird/astraeus/internal/ffmpegprocess"
 	"github.com/ykzird/astraeus/internal/observability"
 )
 
@@ -91,6 +93,209 @@ func TestFFProbe_MissingFile(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error probing a file that does not exist")
 	}
+}
+
+// generateOddDimensionClip renders a source whose height is odd, in a container
+// that carries it unchanged.
+//
+// This is the shape S-4 was reported against: an Xvid or MPEG-4 rip at 640x271.
+// The obvious spelling does not produce one - libx264 refuses it for the very
+// reason the test exists, and even a lossless encoder inside a container that
+// wants even dimensions will quietly nudge it - so the frames go in as raw
+// video, which preserves the geometry exactly.
+func generateOddDimensionClip(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	const width, height, seconds, rate = 640, 271, 2, 10
+	raw := filepath.Join(dir, "odd.raw")
+	if output, err := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=%dx%d:rate=%d", width, height, rate),
+		"-t", fmt.Sprint(seconds),
+		"-pix_fmt", "yuv420p", "-f", "rawvideo", raw,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("rendering the raw frames: %v\n%s", err, output)
+	}
+
+	path := filepath.Join(dir, name)
+	if output, err := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "rawvideo", "-pix_fmt", "yuv420p",
+		"-s", fmt.Sprintf("%dx%d", width, height), "-r", fmt.Sprint(rate),
+		"-i", raw,
+		"-c:v", "ffv1", "-level", "3",
+		path,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("wrapping the odd frames in %s: %v\n%s", name, err, output)
+	}
+
+	// The whole point is the geometry, so refuse to test anything else.
+	info, err := NewFFProbe("ffprobe").Probe(context.Background(), path)
+	if err != nil {
+		t.Fatalf("probing the odd-dimension fixture: %v", err)
+	}
+	if info.Width != width || info.Height != height {
+		t.Fatalf("the fixture is %dx%d, want %dx%d", info.Width, info.Height, width, height)
+	}
+	return path
+}
+
+// TestManager_OddDimensionsEndToEnd covers S-4 through the session manager.
+//
+// The source already fits the client's box, so negotiation asks for no
+// downscale; before the fix that also meant no scale filter, and libx264 failed
+// the attempt with "height not divisible by 2". The session must start and
+// produce an even-dimension segment.
+//
+// Note what this test can and cannot prove. It passes whether or not the
+// even-dimension clamp is present, because a failed attempt is retried through
+// softwareOnlyDecision, and that retry changes the encoder - so on a host whose
+// negotiator picked a hardware encoder, the retry hides the first failure. The
+// load-bearing regression test for the clamp itself is
+// TestVideoFilters_OddSourceGetsAnEvenOutput, which asserts the filter chain
+// directly and fails without it. This one is kept because it is what proves the
+// viewer gets a playable stream, and because on a host with no hardware encoder
+// the first attempt is the only attempt.
+func TestManager_OddDimensionsEndToEnd(t *testing.T) {
+	requireFFmpeg(t)
+
+	root := t.TempDir()
+	source := generateOddDimensionClip(t, root, "odd.mkv")
+
+	info, err := NewFFProbe("ffprobe").Probe(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+
+	// The browser profile accepts h264 but not ffv1, so this is a transcode. Its
+	// height ceiling is above 271, so nothing needs downscaling - which is the
+	// case that used to emit no scale at all.
+	decision := Negotiate(info, BrowserCapability())
+	if decision.VideoAction != ActionTranscode {
+		t.Fatalf("video action = %q, want a transcode of ffv1", decision.VideoAction)
+	}
+	if decision.TargetHeight != 0 {
+		t.Fatalf("target height = %d, want 0: this test is about the no-downscale path",
+			decision.TargetHeight)
+	}
+
+	manager, session, _ := startSession(t, root, source, decision)
+	defer manager.Stop(session.ID)
+
+	segment := waitForSegment(t, session.Dir, 90*time.Second)
+	if segment == "" {
+		t.Fatal("no segment was produced: an odd-dimension re-encode must not fail the session")
+	}
+
+	produced, err := NewFFProbe("ffprobe").Probe(context.Background(), filepath.Join(session.Dir, segment))
+	if err != nil {
+		t.Fatalf("probing the produced segment: %v", err)
+	}
+	if produced.Width%2 != 0 || produced.Height%2 != 0 {
+		t.Errorf("the segment is %dx%d, want both dimensions even",
+			produced.Width, produced.Height)
+	}
+	t.Logf("odd source %dx%d produced a %dx%d segment", info.Width, info.Height, produced.Width, produced.Height)
+}
+
+// generateTSUnfriendlyClip renders a Matroska clip whose codecs MPEG-TS cannot
+// describe: VP9 video and Vorbis audio. Both are codecs a browser may accept, so
+// the interesting failure is not "the client cannot decode it" but "the segment
+// container cannot hold it".
+func generateTSUnfriendlyClip(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc=size=320x240:rate=15:duration=3",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+		"-c:v", "libvpx-vp9", "-b:v", "200k", "-c:a", "libvorbis", "-shortest",
+		path,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generating the VP9/Vorbis fixture: %v\n%s", err, output)
+	}
+
+	info, err := NewFFProbe("ffprobe").Probe(context.Background(), path)
+	if err != nil {
+		t.Fatalf("probing the VP9/Vorbis fixture: %v", err)
+	}
+	if info.VideoCodec != "vp9" || info.AudioCodec != "vorbis" {
+		t.Fatalf("the fixture is %s/%s, want vp9/vorbis", info.VideoCodec, info.AudioCodec)
+	}
+	return path
+}
+
+// TestManager_TSUnfriendlyCodecsAreTranscoded is the regression test for S-3.
+//
+// A client that can decode VP9 and Vorbis still cannot be served them in
+// MPEG-TS. ffmpeg accepts the copy, exits 0, and writes each stream as a
+// private stream of type 6 - bin_data - so the session "starts" and the viewer
+// gets a black or silent picture with nothing in the log. Negotiation now treats
+// a codec the segment container cannot hold as one that has to be re-encoded,
+// and this asserts on the produced segment rather than on the arguments, because
+// the arguments were always accepted.
+func TestManager_TSUnfriendlyCodecsAreTranscoded(t *testing.T) {
+	requireFFmpeg(t)
+
+	root := t.TempDir()
+	source := generateTSUnfriendlyClip(t, root, "vp9-vorbis.mkv")
+
+	info, err := NewFFProbe("ffprobe").Probe(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+
+	// The client accepts both codecs, but not the Matroska container, so the
+	// delivery has to be repackaged. That is the case S-3 is about: the remux
+	// branch is reached, and the only question left is whether the segment
+	// container can hold what is being copied into it.
+	capability := ClientCapability{
+		Containers:  []string{"mp4", "hls"},
+		VideoCodecs: []string{"vp9", "h264"},
+		AudioCodecs: []string{"vorbis", "aac"},
+		SupportsHLS: true,
+	}
+	decision := Negotiate(info, capability)
+	if decision.VideoAction != ActionTranscode {
+		t.Errorf("video action = %q, want a transcode: MPEG-TS cannot carry VP9",
+			decision.VideoAction)
+	}
+	if decision.AudioAction != ActionTranscode {
+		t.Errorf("audio action = %q, want a transcode: MPEG-TS cannot carry Vorbis",
+			decision.AudioAction)
+	}
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want %q", decision.Mode, ModeTranscode)
+	}
+
+	manager, session, _ := startSession(t, root, source, decision)
+	defer manager.Stop(session.ID)
+
+	segment := waitForSegment(t, session.Dir, 90*time.Second)
+	if segment == "" {
+		t.Fatal("no segment was produced")
+	}
+
+	// The decisive assertion: what the segment really contains.
+	produced, err := NewFFProbe("ffprobe").Probe(context.Background(), filepath.Join(session.Dir, segment))
+	if err != nil {
+		t.Fatalf("probing the produced segment: %v", err)
+	}
+	if produced.VideoCodec == "bin_data" {
+		t.Errorf("the segment carries bin_data video: the streams were copied into a container that cannot hold them")
+	}
+	if produced.VideoCodec != "h264" {
+		t.Errorf("segment video codec = %q, want h264", produced.VideoCodec)
+	}
+	if produced.AudioCodec == "bin_data" {
+		t.Errorf("the segment carries bin_data audio: the streams were copied into a container that cannot hold them")
+	}
+	if produced.AudioCodec != "aac" {
+		t.Errorf("segment audio codec = %q, want aac", produced.AudioCodec)
+	}
+	t.Logf("vp9/vorbis source produced a %s/%s segment", produced.VideoCodec, produced.AudioCodec)
 }
 
 func TestManager_RemuxEndToEnd(t *testing.T) {
@@ -279,12 +484,21 @@ func startSession(t *testing.T, root, source string, decision Decision) (*Manage
 	t.Helper()
 
 	metrics := observability.New()
+	// The detected capability is logged because it decides which encoder every
+	// session below actually uses, and a run where the hardware path was not
+	// taken looks identical to one where it was - which is how S-1 stayed
+	// hidden behind software-only CI for as long as it did.
+	server := DetectServerCapability(context.Background(), "ffmpeg", "ffprobe", "")
+	t.Logf("detected capability: encoders=%v hardware=%v render_node=%q rejected=%d",
+		server.VideoEncoders, server.HardwareAcceleration, server.RenderNode,
+		len(server.RejectedEncoders))
+
 	manager, err := NewManager(context.Background(), ManagerConfig{
 		FFmpegBin:      "ffmpeg",
 		RootDir:        filepath.Join(root, "sessions"),
 		SegmentSeconds: 1,
 		SessionTTL:     time.Minute,
-		Server:         DetectServerCapability(context.Background(), "ffmpeg", "ffprobe", ""),
+		Server:         server,
 		Metrics:        metrics,
 		Logger:         discardLogger(),
 	})
@@ -469,6 +683,19 @@ func TestDetectServerCapability_RejectsEncodersThatCannotRun(t *testing.T) {
 	// Whatever else is true, a working software encoder must remain.
 	if !containsFold(capability.VideoEncoders, "libx264") {
 		t.Errorf("libx264 is missing from the capability report: %v", capability.VideoEncoders)
+	}
+
+	// S-6, as a sanity check rather than the proof: no encoder offered as an HDR
+	// one may produce a codec that cannot carry HDR. This cannot fail on a host
+	// whose libx264 10-bit probe never succeeded - there would be nothing to
+	// catch here - so the rule itself is proved by TestEncoderCanCarryHDR,
+	// which is host-independent. This assertion is kept because it is nearly
+	// free and would catch a regression on a host where the probe does succeed.
+	for _, support := range capability.HDRVideoEncoders {
+		if !encoderCanCarryHDR(support.Encoder) {
+			t.Errorf("%q is advertised as a 10-bit HDR encoder, which is not an HDR delivery format",
+				support.Encoder)
+		}
 	}
 
 	// Every claimed family must be backed by an encoder of that family which is
@@ -1028,5 +1255,96 @@ func TestManager_DeliversTheChosenAudioTrack(t *testing.T) {
 		if produced.VideoCodec != "h264" {
 			t.Errorf("video codec = %q, want h264 copied from the source", produced.VideoCodec)
 		}
+	}
+}
+
+// TestProbe_DoesNotFetchAURLInAPlaylist records what could and could not be
+// demonstrated for S-17.
+//
+// A library file whose contents name a URL is the shape the finding describes, and
+// the whitelist is the fix for it. What this test shows is that the *obvious*
+// vector does not reach the network on this build: ffprobe does not HLS-detect a
+// bare .m3u8, so the playlist is simply "Invalid data", and ffmpeg's concat
+// demuxer refuses a remote `file` directive without `-safe 0`. The whitelist is
+// therefore defence in depth here rather than the thing standing between a
+// library file and the server's network.
+//
+// It is kept, and named for what it is, because the alternative was worse: a test
+// asserting "no URL was fetched" passed whether or not the whitelist was applied,
+// which is a test that would go on passing after the protection was removed. The
+// honest version asserts the property that is actually observable - the probe
+// refuses the input and no request is made - and the review records that the
+// stronger claim is unproven.
+func TestProbe_DoesNotFetchAURLInAPlaylist(t *testing.T) {
+	requireFFmpeg(t)
+
+	var hits atomic.Int64
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(target.Close)
+
+	dir := t.TempDir()
+	playlist := filepath.Join(dir, "clip.m3u8")
+	body := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:2.0,\n" + target.URL + "/segment.ts\n#EXT-X-ENDLIST\n"
+	if err := os.WriteFile(playlist, []byte(body), 0o644); err != nil {
+		t.Fatalf("writing the playlist: %v", err)
+	}
+
+	probe := NewFFProbe("ffprobe")
+	if _, err := probe.Probe(context.Background(), playlist); err == nil {
+		t.Log("ffprobe accepted a bare m3u8 on this build, which the review did not " +
+			"expect; the whitelist is what now bounds what it may read")
+	}
+
+	if got := hits.Load(); got != 0 {
+		t.Errorf("the server fetched the URL in a library file %d times", got)
+	}
+}
+
+// TestBuildFFmpegArgs_RestrictsProtocols pins the other invocation, and this one
+// is load-bearing: it fails if the whitelist is dropped from the argument list.
+// The probe is the first thing to meet a library file, but the segment encoder
+// opens it too, and a fix applied to only one of them is a fix that does not hold.
+func TestBuildFFmpegArgs_RestrictsProtocols(t *testing.T) {
+	t.Parallel()
+
+	cfg := ManagerConfig{
+		RootDir:        "/tmp/streams",
+		SegmentSeconds: 2,
+		Server: ServerCapability{
+			VideoEncoders:        []string{"libx264"},
+			HardwareAcceleration: nil,
+		},
+	}
+	args, err := BuildFFmpegArgs("/tmp/streams/one", "/library/film.mkv", Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+	}, cfg)
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgs: %v", err)
+	}
+
+	found := false
+	for i, arg := range args {
+		if arg != "-protocol_whitelist" {
+			continue
+		}
+		found = true
+		if i+1 >= len(args) {
+			t.Fatal("-protocol_whitelist has no value")
+		}
+		if args[i+1] != ffmpegprocess.LocalProtocols {
+			t.Errorf("whitelist = %q, want %q", args[i+1], ffmpegprocess.LocalProtocols)
+		}
+		if strings.Contains(args[i+1], "http") || strings.Contains(args[i+1], "tcp") {
+			t.Errorf("the whitelist contains a network protocol: %q", args[i+1])
+		}
+	}
+	if !found {
+		t.Error("the ffmpeg arguments do not restrict protocols, so a library file shaped " +
+			"like a playlist can make the server fetch whatever it names")
 	}
 }

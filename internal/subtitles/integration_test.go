@@ -7,6 +7,7 @@ package subtitles
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -161,5 +162,62 @@ func TestService_ReportsTrackWithoutCues(t *testing.T) {
 	// There is no subtitle stream at index 0 of this clip.
 	if _, err := service.Convert(context.Background(), clip, 99); err == nil {
 		t.Fatal("expected an error for a subtitle track that does not exist")
+	}
+}
+
+// TestConvertImage_VobSubInANonMatroskaContainer records what L-12's first claim
+// turned out to be.
+//
+// The claim was that `ffprobe -show_entries stream=extradata` without
+// `-show_data` prints nothing, so a container whose palette lives there is
+// wrongly refused. The flag was missing and is now passed: on the Matroska
+// fixture the palette goes from nothing to 669 bytes of hex, which is the fix.
+//
+// What the fixture cannot show is the *consequence*. This .mpg carries no
+// extradata at all - ffprobe reports an empty string for it, with or without the
+// flag, and a remux of the same stream to MP4 reports empty too - so the refusal
+// it produces is correct rather than a symptom. The committed sample therefore
+// proves the flag and not the end-to-end path, and this test asserts what is
+// actually observable: the track is identified as an image format, and the
+// refusal names the missing palette rather than reporting a decoder fault.
+//
+// The remaining two claims in L-12 - framing by the control offset instead of the
+// declared size, and every packet left at time zero - are still open. They are
+// real: `ffprobe -show_packets -show_data` gives size, pts_time and duration for
+// this container, and the extraction does not use it. They cannot be verified
+// end-to-end until a fixture exists whose container carries a palette.
+func TestConvertImage_VobSubInANonMatroskaContainer(t *testing.T) {
+	for _, binary := range []string{"ffmpeg", "ffprobe"} {
+		if _, err := exec.LookPath(binary); err != nil {
+			t.Skipf("%s is not installed", binary)
+		}
+	}
+
+	service, err := New(Config{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const fixture = "testdata/vobsub-caption.mpg"
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("the .mpg fixture is missing: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	// The global ffmpeg stream index, not the subtitle ordinal: this container
+	// also carries a dvd_nav_packet data stream at index 0.
+	_, err = service.ConvertImage(ctx, fixture, 1)
+	if err == nil {
+		t.Fatal("the .mpg was read; this test expected a refusal because the container " +
+			"carries no palette, so the fixture or the extractor changed")
+	}
+	if !errors.Is(err, ErrUnsupportedFormat) {
+		t.Errorf("the refusal is %v, want ErrUnsupportedFormat: an image track this server "+
+			"cannot read is a format refusal, not a fault", err)
+	}
+	if !strings.Contains(err.Error(), "palette") {
+		t.Errorf("the refusal does not name the missing palette: %v", err)
 	}
 }

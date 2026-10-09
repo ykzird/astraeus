@@ -1,11 +1,39 @@
 # Handoff
 
-**As of the round-13 work of 2026-10-09 — the documentation sweep, released as
-`v0.18.0`. 128 tracked files; `v0.17.0` and `v0.18.0` are released, so the
-in-tree version is `dev` and the next tag would be `v0.18.1`.** (`git log` names
-the commits. Round 12 ran the release workflow for real and started the systemd
-unit on a clean VM, finding two defects in the packaging and one in the release
-job, all since fixed (§6). Round 13 removed the point-in-time reviews from the
+**As of the adversarial-review sweep — 88 findings from the 2026-10-09 review
+addressed: 78 fixed, 10 partial. That sweep ran six phases in the review's own
+order (security defaults, the media path on real hardware, subtitle decoders
+against ffmpeg as an oracle, library data integrity, the job runner, and
+documentation), took the findings whose fix exposed a second bug in the fix
+itself, and deliberately left ten partial rather than claiming them closed. Every partial names what it still owes and why in
+its own entry, so "partial" is a claim you can check rather than a shrug. The
+review's own documents are in `docs/review/`, which is deliberately untracked: they
+are a working record, not part of the product, and `scripts/build-release.sh` fails
+the build if any of them reach a release archive.** The review's commits are on
+`main`; `v0.17.0` and `v0.18.0` are released, so the in-tree version is `dev` and
+the next tag would be `v0.18.1`. (`git log` names
+the commits. Round 17 disproved the note that had been blocking the VobSub
+reader for two rounds: ffmpeg cannot *mux* VobSub, but it can *encode* it, so
+the project's PGS fixture re-encodes into a real sample that ffmpeg decodes and
+tesseract reads. Round 18 wrote that decoder and the routing, so a
+`dvd_subtitle` track is offered as text instead of burn-only. Round 19 did the
+same trick one format further: ffmpeg's `dvbsub` encoder takes no text, but its
+PGS decoder can feed it, so a `dvb_subtitle` sample now exists too (§6) — the
+decoder for it is the next increment (§7) — a first attempt was written and
+withdrawn, and §8 says why. The same round added a manual end-to-end
+walk-through of the whole application, built to be run by hand and converted to
+Playwright, with a check in CI that keeps it in step with its data twin (§3). Round 16 added
+`--access-policy`, which turns the gate from "may this request in" into "what may
+it see" (§6). Round 15 added `deploy/tls/` and ran it: Caddy terminating
+TLS, a client certificate as the viewer's identity, and the trust boundary the
+access gate depends on (§6). Round 14 added `scripts/load-verify/` and measured
+the API and the 1080p and 4K transcode paths
+on this host (§6), which turned up one real defect — transcode percentiles were
+interpolations rather than measurements, now fixed with per-metric bucket
+bounds. Round 12 ran the release workflow
+for real and started the systemd unit on a clean VM, finding two defects in the
+packaging and one in the release job, all since fixed (§6). Round 13 removed the
+point-in-time reviews from the
 tree, narrowed the release archive to the pages a user actually needs, and made
 every relative link inside that archive resolve — `docs/development.md` and
 `web/vendor/icons.md` now point at `scripts/` on GitHub, because the archive
@@ -83,11 +111,20 @@ mise exec -- go test -tags=integration -race -count=1 ./...
 # The front end's pure timeline core. Node's own runner; no npm install.
 node --test web/*.test.js
 
-# A demo library (a film plus a three-episode show, one with a real subtitle track).
+# A demo library (two films and a three-episode show: one film carries two audio
+# tracks and one the HEVC codec, and one episode carries a real subtitle track).
 # It needs ./astraeus-server built first. Defaults: media outside the repo, db at ./demo.db.
 mise exec -- go build -o ./astraeus-server ./cmd/astraeus-server
 ./scripts/make-demo-media.sh
 # or: ./scripts/make-demo-media.sh <media-dir> <db-path>
+
+# The manual end-to-end walk-through, and the check that keeps it in step with
+# its machine-readable twin. The walk-through is one ordered pass over the whole
+# application, written to be run by hand and converted to Playwright afterwards;
+# every step says whether a machine can assert it or only a person can. The
+# check is cheap and CI runs it, so the two descriptions cannot drift.
+node --test scripts/ui-verify/check-e2e-flows.test.mjs
+node scripts/ui-verify/check-e2e-flows.mjs
 
 # Browser harnesses: start a server, then a headless Chromium with a CDP port.
 ./astraeus-server serve --db demo.db --web-dir web --addr 127.0.0.1:8910 \
@@ -104,12 +141,19 @@ CDP_PORT=9410 node real-media-verify.mjs    http://127.0.0.1:8910 <realFilmId> 1
 
 `player-chrome-verify.mjs` is the broadest single check: up to 32 assertions
 covering the overlay, icons, fullscreen, audio, quality switching, subtitle
-persistence and auto-hide. **Its score depends on the content**, so compare a run
-against the same fixture: it was **28/28** against the 17 GB film in the round-2
-verification, and it is **20/22** on the bundled three-second demo clips, where
-the two auto-hide checks fail because playback ends during the wait. 20/22 is also
-what the pre-change build scores there, so it is that fixture's baseline rather
-than a regression (§8).
+persistence and auto-hide. **Its score depends on the content, so a number from
+this script means nothing without the fixture it came from.** Three fixtures have
+been used, and each has its own baseline:
+
+| Fixture | Score | Baseline | What the failures are |
+| --- | --- | --- | --- |
+| The 17 GB film (round 2) | **28/28** | 28/28 | none |
+| The bundled three-second demo clips, direct play | **20/22** | 20/22 | the two auto-hide checks, because playback ends during the wait |
+| The demo's HEVC film, reached through a transcode | **22/28** | 22/28 | the six checks after its 600-second seek, which a four-second asset cannot satisfy (§8) |
+
+Quote the row, not the number. Reading 22/28 as a regression against 28/28, or
+20/22 as one against either, is how one baseline's number becomes another's
+problem.
 
 Dynamic range has its own checks, and they are worth re-running after any change
 to negotiation or to the ffmpeg argument builder:
@@ -168,12 +212,17 @@ mise exec -- go test -v -run 'PerViewer|LocalOne|WidensProgress|UngatedServer|Fi
 mise exec -- go test -tags=integration -run BurnIn -v ./internal/streaming/
 mise exec -- go test -run 'BurnsAnImageSubtitle|DoesNotBurnATextSubtitle|BurnIndexThatDoesNotExist' ./internal/streaming/ ./internal/api/
 
-# OCR for PGS. The parser is unit-tested against a generated fixture, pixel for
-# pixel; the OCR path is integration-tagged and asserts the *words*, through real
-# ffmpeg and a real tesseract - it skips when tesseract is absent, and a separate
-# always-run unit test pins the refusal that an install without it keeps. The API
-# routing (image track -> ConvertImage, VobSub stays burn-only) is unit-tested.
-mise exec -- go test -count=1 -run 'ParsePGS|OCR|ConvertImage' ./internal/subtitles/
+# OCR for PGS *and* VobSub. Both parsers are unit-tested against committed
+# fixtures; the VobSub fixture is decoded from a Matroska container, so that test
+# needs no ffmpeg at all. The DVB fixture (scripts/make-dvb-fixture.sh) is
+# committed and its framing is unit-tested, but no decoder reads it yet, so its
+# tests are named separately rather than pretending to be OCR. The OCR path is integration-tagged and asserts the
+# *words*, through real ffmpeg and a real tesseract - it skips when tesseract is
+# absent, and separate always-run unit tests pin the refusal that an install
+# without it keeps and the routing (image track -> ConvertImage, DVB -> 415).
+# The VobSub fixture is regenerated with scripts/make-vobsub-fixture.sh; its
+# decoder was checked against ffmpeg's own decode, pixel for pixel.
+mise exec -- go test -count=1 -run 'ParsePGS|ParseVobSub|DVBFixture|OCR|ConvertImage' ./internal/subtitles/
 mise exec -- go test -tags=integration -run OCR -v ./internal/subtitles/
 mise exec -- go test -run 'SubtitleEndpoint|AdvertisesImageTrack' ./internal/api/
 # And the whole path against a running server: an image track is advertised with
@@ -327,6 +376,29 @@ docker buildx imagetools inspect ghcr.io/ykzird/astraeus:0.18.0
 docker run --rm --entrypoint astraeus-server ghcr.io/ykzird/astraeus:0.18.0 version
 ```
 
+Performance is measured rather than argued about. The harness in
+`scripts/load-verify/` drives the API and concurrent HLS streams and reads
+`/metrics` before and after every phase, so the client's timings and the KPI
+registry can be held against each other:
+
+```sh
+cp demo.db .tmp/load-verify/load.db          # a COPY; never point this at real.db
+node scripts/load-verify/load-verify.mjs all --spawn \
+  --db .tmp/load-verify/load.db --entity <entityId> --streams 1,2,4 --hold 20
+
+# A live session someone drives by hand, recorded as a timeline, then read back.
+node scripts/load-verify/metrics-watch.mjs --out live.jsonl --interval 2
+node scripts/load-verify/metrics-watch.mjs --report live.jsonl
+
+# Or diff two scrapes taken around a session that was driven by hand.
+node scripts/load-verify/analyse.mjs before.prom after.prom
+```
+
+`--spawn` is what makes the CPU numbers possible: on Linux a process is visible
+in `/proc` only inside the PID namespace it was started in, so a sampler in a
+different shell than the server sees nothing at all. The same namespace split
+means `pkill`/`pgrep` cannot reach a server another shell started.
+
 ---
 
 ## 4. Architecture
@@ -338,7 +410,7 @@ internal/library/naming pure filename/path rules — imports nothing
 internal/library/sqlite the SQLite adapter for that port, schema and migrations
 internal/metadata       provider interface, TMDB, mock, enrichment worker
 internal/streaming      capability negotiation, encoder selection, HLS sessions
-internal/subtitles      WebVTT extraction and caching, a PGS decoder and OCR
+internal/subtitles      WebVTT extraction and caching, PGS and VobSub decoders, OCR
 internal/images         artwork proxy and cache
 internal/access         the access gate
 internal/api            HTTP layer
@@ -654,6 +726,129 @@ multi-arch index over `linux/amd64` and `linux/arm64` with an SBOM and a
 provenance attestation per platform, and its labels carry `version=0.18.0` and
 `revision=4603d07`.
 
+**The server was measured, not just tested** (round 14). A harness in
+`scripts/load-verify/` drives the JSON API and concurrent HLS streams and reads
+the server's own `/metrics` before and after each phase, so the KPI registry and
+the client can be held against one another. On this host — a Ryzen 7 9700X, 8
+cores and 16 threads, no GPU — three workloads were measured.
+
+*The JSON API* served **4,895 requests/second** across 8 concurrent clients at
+1.6 ms mean and 3.6 ms p99, using 1.5 cores, with no failed request. The API is
+not a constraint at any concurrency this host can reach.
+
+*1080p H.264, direct play* — what a 1080p library mostly does, because a browser
+decodes it as delivered — costs about **0.1 cores per stream** and never starts
+ffmpeg: 1 stream took 0.15 cores and 8 took 0.78, with negotiation at 2 ms once
+the probe cache was warm (28 ms for the first, cold, request). Aggregate
+throughput flattened at about **2 GB/s**, which is this loopback and HTTP path
+rather than the server, so the ceiling for direct-play viewers is bandwidth and
+not CPU. A note for the beta: the first request against a file pays for a probe
+and the rest do not.
+
+*A 1080p HEVC source* — an x265 library, which a browser cannot decode and so
+must be transcoded — ran at about **20× realtime in total**, and as with 4K that
+total barely moved with concurrency: 19.4×, 21.6×, 20.9× and 18.4× for 1, 2, 4
+and 8 streams. Each stream still had 2.3× realtime in hand at eight, so the host
+serves roughly **20 simultaneous realtime 1080p transcodes**. CPU was 10.0 cores
+for the first stream and 14.6 from four onward — 0.52 cores per realtime stream,
+which is what `-preset veryfast -crf 21` costs rather than a misconfiguration.
+
+*A 17 GB 4K DV/HDR10+ film* tone-mapped to 1080p ran at about **4.5× realtime in
+total**, again nearly invariant with concurrency (0.73, 0.77 and 0.75 segments
+per second at 6 s for 1, 2 and 4 streams), so roughly **four realtime viewers**
+of that workload, with about 12% of headroom at four. Negotiation scaled with
+concurrency — 1.74 s, 3.13 s, 6.10 s — because one stream already uses 11.5 of
+16 threads, so each extra stream waits rather than finding idle capacity. The
+host reached **99.5% busy with 15.9 cores working**, and every phase of every
+run reported zero stream errors and zero probe errors.
+
+The shape is the same in all three cases, and it is the useful result: **total
+output is set by the host, not by the request.** More concurrent streams do not
+produce more video; they divide the same capacity and each waits longer to
+start. Hardware encoding is what would move that ceiling, which is why the
+Intel box in §8 is worth measuring on.
+
+The server's own numbers agreed with the client's throughout (1.71 against
+1.74 s, 3.14 against 3.13 s, 6.11 against 6.10 s, 2.86 against 2.87 s), which is
+the cross-check the harness exists to make — with one disagreement that turned
+out to be real. Every transcode startup was landing inside a single
+`DefaultBuckets` bin, so `astraeus_transcode_startup_seconds` reported
+interpolated percentiles rather than measured ones: a p50 of **7.50 s** where
+the client measured **6.10 s** (4 streams, 4K), and **3.75 s** against **2.87 s**
+(8 streams, 1080p). The mean was right both times, because it comes from `_sum`
+and `_count`.
+
+That is fixed. The registry can now declare per-metric bounds, and both
+transcode KPIs carry `TranscodeBuckets`, which is fine through the seconds a
+transcode actually runs for; the test that pins it failed first at exactly
+7.50 s. Re-running the eight-stream 1080p case moved the reported p50 from
+3.75 s to **2.67 s**, against the client's 2.95 s. The residual difference is
+real and explainable rather than arithmetic: the server measures from ffmpeg
+starting, the client measures the whole round trip.
+
+**Per-viewer library access** landed as of round 16, as `--access-policy`: a file
+mapping each identity to the libraries it may see, plus an admin list. Until now
+the gate decided whether a request was admitted and nothing decided what it could
+read, so every admitted viewer saw the whole library. A policy in use denies by
+default; a hidden library answers `404` rather than `403`, so the API is not a way
+to enumerate what exists; and no policy at all leaves an install exactly as it
+was. Visibility and administration are separate grants — an admin may scan,
+enrich and change libraries without being able to see them — which is why an
+operator who wants both says both.
+
+It is enforced through one seam: a per-request scoped view of the repository that
+every viewer-facing read goes through, so an entity behind a library the viewer
+may not see is indistinguishable from one that does not exist, and a new handler
+that reads through the scoped view cannot forget the check. The playlist and
+segment route re-checks the library its session belongs to, because a session URL
+is a capability that can be passed on or outlive a grant. `DELETE
+/api/streams/{id}` deliberately does not, because stopping is cleanup and
+requiring visibility would leave a transcode running after a revocation. A
+position outliving its grant is filtered out of Continue watching, so revoking a
+library does not leave its titles in the list.
+
+Verified against a running server, not only in tests. With a policy granting one
+of two libraries by name, that viewer listed one library and three entities, was
+refused the other library's series with `404`, and was refused `403` on
+registering a library and on `POST /api/scan`, while the operator identity saw
+both libraries, all eight entities and registered one. A policy file that does not
+parse stops the server with the offending line number rather than starting open.
+
+**Artwork is not scoped.** `/api/images` is a shared cache keyed by the upstream
+path, so a poster can be fetched by anyone who knows its file name, whatever
+library it belongs to. The exposure is limited to artwork of media the requester
+cannot play, and discovery requires guessing a name that only appears in a
+listing they cannot read — but it is a real gap and is recorded rather than
+implied away.
+
+**TLS and the reverse proxy** are documented and verified as of round 15, in
+`deploy/tls/`: a Caddy configuration beside the unit that terminates TLS, sends
+the `Strict-Transport-Security` the server deliberately does not, and
+establishes the identity the gate believes — one client certificate per tester,
+whose subject becomes the viewer. The server has to be told both halves, so the
+runbook's unit change is `--auth-mode proxy --auth-header X-Astraeus-User
+--trusted-proxy 127.0.0.1/32,::1/128`.
+
+It was run rather than read. Against Caddy 2 with `client_auth`: a connection
+with no client certificate fails the handshake before any HTTP request; a valid
+one returns `200` with HSTS and no `Server` header; two testers appear as
+`user="CN=tester1"` and `user="CN=tester2"` on their request log lines; a
+position reported by one is invisible to the other; a client-forged
+`X-Astraeus-User` is overwritten by the proxy and appears nowhere in the log;
+direct play returns a working `206` range response and a transcode returns a
+playlist and a segment. Requests from the LAN address and from the Tailscale
+address, each carrying a well-formed identity header, are refused
+`403 untrusted_source` — the header is worthless without the address.
+`--rate-limit 1 --rate-limit-burst 2` then answered `200, 200, 429` with
+`Retry-After: 1` for one identity and `200` for a second, so the limiter really
+is keyed on the person and not on the connection.
+
+**One trap is worth carrying forward.** `--trusted-proxy 127.0.0.1/32` does not
+cover `::1`, and a proxy that resolves `localhost` may connect over IPv6. The
+symptom is a `403` for every request through a proxy that is plainly running,
+which reads like a fault in the proxy. The runbook lists both loopback families
+and says why.
+
 **A quality choice that caps a ladder** landed as of 0.16.0, which fixes a
 negotiation model that was thinner than its field name. Until now
 `max_height` did two jobs: it clipped the target height *and* it switched the
@@ -713,11 +908,14 @@ dependency, and its absence is not an error**: `OCRReady()` gates it, the track
 keeps its missing URL, the endpoint keeps the `415 subtitle_format_unsupported`
 it always returned, and startup logs "image_subtitles=burned in" with the reason.
 A unit test pins that refusal and the integration test skips when tesseract is
-absent. **Only PGS is read**: VobSub and DVB keep the refusal and the burn,
-because the `sup` muxer the extractor uses takes PGS only and advertising a track
-that then fails inside the extractor would be worse than not offering it. **The
-front end decides from the URL, not from `text`**: `subtitleDeliverable` and
-`subtitleNeedsBurn` are now pure functions in `web/core.js` with Node tests, so
+absent. **Only PGS is read** *as of this release*: VobSub and DVB keep the
+refusal and the burn, because the `sup` muxer the extractor uses takes PGS only
+and advertising a track that then fails inside the extractor would be worse than
+not offering it. (Round 18 added the VobSub reader and round 19 the fixture for
+a DVB one — see below for what changed since, and `TODO.md` for what is still
+missing.) **The front end decides from the URL, not from `text`**:
+`subtitleDeliverable` and `subtitleNeedsBurn` are now pure functions in
+`web/core.js` with Node tests, so
 an image track the server has read is offered as an ordinary `<track>` and one it
 cannot read is still offered as "(burned in)".
 
@@ -733,8 +931,9 @@ it attaches a `<track>` with **zero** playback requests, and the active cue text
 on screen is the caption), and `burn-verify.mjs` is **10/10** on the same entity
 against a server started with `--tesseract-bin /nonexistent/tesseract`, so the
 burn fallback still works. `subtitle-verify.mjs` is **10/10** (text tracks
-unregressed) and `player-chrome-verify.mjs` is 20/21 on the demo clips, its
-documented auto-hide baseline for three-second fixtures.
+unregressed) and `player-chrome-verify.mjs` is **20/22** on the demo clips, its
+documented auto-hide baseline for three-second fixtures. (An earlier draft of this
+line said 20/21, which matches no run and no fixture.)
 
 The fixture side had to grow: `internal/testfixtures/pgs` gained a 5x7 bitmap
 font and a `-text` mode in `scripts/pgsgen`, and its run-length encoder had a
@@ -743,6 +942,66 @@ is not a valid run — found because the new test drove run lengths the rectangl
 fixture never reached. The glyph size is chosen for the recogniser rather than the
 eye (capitals about 28 pixels tall); at twice that the blocky font read "ASTRAEUS"
 as "ASTRAELS".
+
+**The second bitmap-subtitle reader, for VobSub, landed in round 18**, which
+finishes what round 17 unblocked. `internal/subtitles` gained `vobsub.go`: a
+decoder that walks a packet's control sequence (palette selection, display
+rectangle, the two bitmap offsets), expands the run-length data as the two
+interleaved fields the format uses — the first field's runs carry the even lines
+and the second's the odd ones — and applies the container's palette into an
+`*image.RGBA`, which is the same shape the PGS decoder produces and therefore
+feeds the same OCR path. `matroska.go` is a small EBML reader, enough to reach a
+track's codec private and its blocks, so the committed fixture can be proved
+without ffmpeg.
+
+Three things carried the work, and the first is the one worth remembering.
+**The decoder was checked against ffmpeg's own decode, not against reasoning.**
+A tiny C program linked against `libavcodec` decoded the same packet, and the
+Go decoder's output was compared against ffmpeg's rendered frame pixel for
+pixel (3440 ink pixels, 332x28); the RLE nibble order and the rectangle's
+packed coordinates were both got wrong first and corrected from that comparison.
+**The palette is in the container, not the picture stream**, so the extraction
+keeps a container that has one: a Matroska source is copied into a standalone
+Matroska file and its codec private travels with it, while any other source is
+demuxed into raw SPU packets with the codec private read out beside them. A bare
+MPEG-PS sample carries no palette and is refused rather than rendered blank.
+**A single never-cleared cue needs a duration.** A VobSub track clears the screen
+with a separate erase packet, and a one-cue sample has none, so the open cue
+ended at its own start — and an empty cue is dropped as though it had never been
+drawn. It now gets a placeholder duration, which a real rip's erase packet never
+exercises.
+
+Verified at the artefact level. The unit test decodes the committed fixture and
+asserts the geometry and the ink count, and a second pins the field interleave by
+decoding each field on its own and checking the interleaved result row by row.
+An integration test re-encodes the PGS fixture with ffmpeg's `dvdsub` encoder and
+runs the whole pipeline — the extraction, the decoder, the render and a real
+tesseract — asserting the exact caption `"ASTRAEUS MEDIA"`, which the fixture's
+glyph size at its native 640x360 makes reliable. The API routing is pinned both
+ways: a VobSub track is advertised and served with an engine, and keeps its
+`415` refusal and its burn without one; DVB, which still has no decoder, keeps
+the refusal even with an engine.
+
+**The DVB fixture was solved in round 19**, removing the last obstacle to a
+third bitmap reader. The VobSub route did not transfer: ffmpeg's `dvbsub`
+*encoder* accepts only bitmap subtitle input and refuses even its own `dvdsub`
+output. Its PGS *decoder* can feed it, though, so
+`scripts/make-dvb-fixture.sh` decodes this project's own PGS fixture and
+re-encodes it as a real `dvb_subtitle` track. One non-obvious detail decides
+whether the result is usable: the encoder authors against a 720x576 canvas and
+rescales whatever it is given to fit, so the project's 640x360 fixture came out
+with warped glyphs and the recogniser read `"RSTRAELS MEDIA"`. Drawing the
+source at 720x576 — the canvas the encoder actually uses — makes the encode a
+straight copy and tesseract reads `"ASTRAEUS MEDIA"` exactly. The script
+validates itself the same way: it renders the fixture with ffmpeg and refuses to
+leave one behind unless tesseract reads the caption out of it, so the committed
+`.mkv` and `.ts` are vouched for by that check rather than by inspection. An
+always-run unit test pins the framing (sync byte, then type, *segment id*, then
+length — the id first, the reverse of the VobSub framing and the one field easy
+to read backwards) and that the track carries no codec private, which is the
+difference that matters: a DVB colour table lives in the stream, not the
+container, so there is no extraction step beyond demuxing. The decoder itself is
+the next increment (§7).
 
 **Front-end unit tests** landed as of 0.14.0, which closes the largest remaining
 untested surface. The player's timeline arithmetic — the source↔media time
@@ -974,30 +1233,89 @@ cover.
 
 ## 7. Open work
 
-Priority order, with the reasoning. Take it top-down.
+Priority order, with the reasoning. Take it top-down. `TODO.md` carries the
+complete list; this section is the reasoning behind the top of it.
 
-The two claims that used to head this list — the release run and the systemd unit
-— are done, and observed rather than reasoned about. §6 records what running them
-found, including the two defects that only a real run could surface. What is
-left:
+### What the review left partial
 
-1. **A TLS example.** Release automation landed in round 10 (see §6), so a tag
-   now builds and publishes the archives and the image; what is still missing is
-   the reverse-proxy configuration beside the unit, and the runbook for the
-   access-gate interaction a proxy creates.
-2. **A second image-subtitle reader, for VobSub.** OCR now covers PGS only; a
-   VobSub (or DVB) track keeps its refusal and its burn because it lives in a
-   different container with a different palette, and no such sample exists here.
-   This is the natural continuation of round 8 and is smaller than it was: the
-   pipeline, the routing and the fixture font all exist, so the work is one more
-   decoder plus a fixture. See the OCR bullet in §8 for what is unverified.
-3. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
-   the gate remains instance-wide: it admits a request, it does not decide what
-   the request may see, so every admitted viewer sees the whole library.
-4. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
+The 2026-10-09 review's ten partial findings are the largest single block of known
+work, because each one is a place where a fix landed and something behind it did
+not. They live in `docs/review/` — untracked, so read them in a working tree rather
+than a clone — and every entry says what it still owes. In rough value order:
+
+1. **A-8 — the image cache is unbounded.** No negative caching, no eviction, no
+   singleflight, and any viewer can fill it with up to 8 MiB × 11 sizes per
+   filename. The forgery and the mislabelled-cache half is fixed; this half is the
+   one with a resource ceiling, and it is the largest remaining item that is not
+   blocked on anything.
+2. **L-18 — enrichment has no backoff, and a wrong answer is permanent.** A
+   permanent miss is retried every pass forever, and an entity completed from
+   derived data while the provider was down is invisible to later passes, because
+   the pass only looks at `StatusIncomplete`. When TMDB comes back, those Seasons
+   and Episodes are never revisited.
+3. **L-12 — VobSub framing and timing.** Blocked, not deferred: records are still
+   cut at the control offset and every packet still lands at time zero, and neither
+   can be verified end to end until a fixture exists whose *container* carries a
+   palette. Do not start this without that fixture.
+4. **A-6 — the limiter sits inside the gate.** A refused request is not counted, so
+   a token-guessing client is not throttled. Moving it needs the middleware order
+   changed, which is why it was not smuggled into the token-length fix. Token mode
+   also keys every client as one `token` identity, which is deliberate and
+   conservative.
+5. **L-17 — series years and absolute numbering.** `Show (2005)` keeps the year in
+   the series name and sends no `first_air_date_year`; absolute numbering and
+   date-based names are unsupported. The movie half, the episode forms and both
+   ignore rules are done.
+6. **L-3 — the PGS memory bound is unverified.** The allocation is fixed; the
+   review's claim that peak memory is bounded was **not** reproduced, and no memory
+   improvement is claimed. Measuring it needs a controlled benchmark, not the
+   sampling that gave contradictory readings.
+7. **A-10, A-5, L-19, W-10** — the smaller remainders: `/metrics` admin scoping, a
+   non-zero `DSN(":memory:")` pragma gap, and the WebVTT `end < start` and
+   cache-temp-file cases. Each entry names its own.
+
+### The rest
+
+The claims that used to head this list — the release run, the systemd unit and
+the TLS example — are done, and observed rather than reasoned about. §6 records
+what running them found, including the defects that only a real run could
+surface. What is left:
+
+1. **A DVB image-subtitle decoder.** The fixture half is done, which was the
+   blocker: round 19 found that ffmpeg's `dvbsub` encoder takes only bitmap
+   subtitle input (so the VobSub trick does not transfer) but that ffmpeg's PGS
+   *decoder* can feed it, and `scripts/make-dvb-fixture.sh` now decodes this
+   project's own PGS fixture into a real `dvb_subtitle` track that ffmpeg
+   re-decodes and tesseract reads. A decoder was then written and **withdrawn**:
+   it produced a correctly sized crop and a plausible colour table but drew only
+   696 of ffmpeg's 3440 ink pixels, so it was not working and shipping it would
+   have been worse than not having it. `TODO.md` now carries the verified
+   segment layouts, the pixel-string grammars and the exact point the attempt
+   stopped, so the next one starts from evidence. What is left is that decoder
+   and the routing, which is the same shape the VobSub reader uses; a DVB track
+   keeps its colour table in the stream rather than the container, so there is
+   no extraction step beyond demuxing. **Budget note: this is a bigger increment
+   than the VobSub reader was, and the fixture's framing is the only part that
+   is already pinned.**
+2. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
+3. **Validating an identity-aware proxy's assertion, if one is ever put in
+   front.** In `proxy` mode the gate believes `Tailscale-User-Login` or
+   `Cf-Access-Authenticated-User-Email` from a trusted address, and neither is
+   signed — so the whole control is that the proxy is the only path to the port
+   (which is why the backend stays on loopback). Cloudflare Access signs
+   `Cf-Access-Jwt-Assertion` (RS256 against the team's JWKS, with `iss` and
+   `aud`) precisely so an origin can verify the claim instead of trusting it, and
+   Go's `crypto/rsa` and `crypto/x509` would let that be done here without a
+   dependency. Not needed for the Caddy + client-certificate arrangement, whose
+   verification is the TLS handshake — but it is the missing control the moment
+   an Access path is added. Round 15 evaluated consolidating the whole ingress on
+   `tailscale serve` instead and did not take it: Serve's identity headers are an
+   assertion too, its HTTPS mode under Headscale needs `dns.https_certs` plus an
+   authoritative DNS server for the ACME challenge (PR #3300), Headscale does not
+   ship Funnel, and a header is not populated for traffic from tagged devices.
 
 `TODO.md` carries the complete list with detail.
 
@@ -1005,7 +1323,7 @@ left:
 
 ## 8. Known-unverified — treat with suspicion
 
-- **NVENC, AMF and VideoToolbox have never run on real hardware.** They are
+- **QuickSync, NVENC, AMF and VideoToolbox have never run on real hardware.** They are
   implemented, unit-tested for their arguments, and covered by a test that drives
   detection through a stub ffmpeg standing in for an NVIDIA host. The startup
   probe validates the actual options on the machine that runs it.
@@ -1064,13 +1382,17 @@ left:
   implemented, and scans, metadata lookups and individual segments are not
   spanned — so the specification's "from API call to media segment delivery" is
   covered up to the session starting, not to each segment.
-- **Rate limiting is verified by unit tests and one manual run, not by a real
-  proxy or a load test.** The identity-keyed path is exercised through the gate's
-  context in a test, not by Tailscale or Cloudflare Access forwarding headers on a
-  real network; `token` mode puts every API client in one bucket; and the limiter
-  is per process, so several replicas behind one proxy limit as a sum. The idle
-  sweep that bounds bucket memory is unit-tested with a two-key threshold, but has
-  not been observed under a flood of distinct addresses.
+- **Rate limiting is verified by unit tests, one manual run and now one real
+  proxy, but not by a load test.** The identity-keyed path was exercised for real
+  in round 15 through Caddy with client certificates: a burst of two at one per
+  second answers `200, 200, 429` with `Retry-After: 1` for one identity, and a
+  second identity gets its own bucket. What that still does not cover: Tailscale
+  and Cloudflare Access set their *own* header names, which the gate believes by
+  default but which no run has actually seen arrive; `token` mode puts every API
+  client in one bucket; and the limiter is per process, so several replicas
+  behind one proxy limit as a sum. The idle sweep that bounds bucket memory is
+  unit-tested with a two-key threshold, but has not been observed under a flood
+  of distinct addresses.
 - **One transport assertion is timing-sensitive on a 4K transcode.** A harness
   run against the 17 GB film reported 31/32 once, with the failing check outside
   the captured tail, and two immediate re-runs passed 32/32 on the same code.
@@ -1078,11 +1400,14 @@ left:
   capture the whole output, because `tail` is what lost the name of the check.
 - **Image subtitles are verified for PGS, for software encoders, at one
   rendition.** The fixture is hand-written by `internal/testfixtures/pgs` because
-  no real PGS or VobSub sample exists on this host, so what was exercised is
+  no real Blu-ray or DVD sample exists on this host, so what was exercised is
   ffmpeg's PGS decoder on a synthetic rectangle — not a real Blu-ray subtitle with
   its palette, cropping and partial object updates. VobSub shares the track
-  classification and the same overlay path but has never been decoded here at
-  all. `scale2ref`/`overlay` has only been run with libx264: a hardware encoder's
+  classification and the same overlay path, and since round 18 it has a decoder of
+  its own (`vobsub.go`); what it does **not** have is a real DVD sample, so that
+  decoder has only been exercised against synthesised fixtures - the same gap as
+  PGS, for the same reason. `scale2ref`/`overlay` has only been run with
+  libx264: a hardware encoder's
   upload filter has never been combined with the burn graph, and a ladder is
   refused for a burn rather than composited per rung. A real PGS sample would be
   the cheapest way to strengthen all of this.
@@ -1104,6 +1429,17 @@ left:
   display set with no composition objects as a clear unless it is a palette
   update; that is right for the fixture and probably right for a disc, but it is
   reasoning rather than observation.
+- **A DVB decoder was attempted and withdrawn.** The fixture is committed
+  (`internal/subtitles/testdata/dvb-caption.{mkv,ts}`) and its framing is
+  unit-tested, but the first decoder drew a correctly sized crop and a plausible
+  colour table and only 696 of ffmpeg's 3440 ink pixels, so it was removed
+  rather than left in the tree looking finished. `TODO.md` carries the verified
+  segment layouts, the pixel-string grammars and the exact point the attempt
+  stopped. Nothing in the server reads a DVB track: it still keeps the `415`
+  refusal and the burn.
+- **A DVB track's colour is BT.601, not the BT.709 the PGS reader uses.** The
+  two are close but not identical, so a DVB decoder built by copying the PGS
+  colour conversion would be subtly wrong rather than obviously broken.
 - **Recognition can be wrong, and the fixture was tuned until it was not.** The
   integration test asserts the exact caption because the fixture's glyph size was
   chosen so tesseract reads it; at a different size the same font read
@@ -1111,13 +1447,19 @@ left:
   guarantee. A bitmap that is not text can be read as some — a solid rectangle
   came back as a mark — which means a PGS track of a shape may yield a spurious
   cue rather than none. The words OCR produces should be treated as approximate.
-- **OCR covers PGS only**, and the extraction step is PGS-specific: it copies the
+- **OCR covers PGS and VobSub; DVB has no decoder.** The PGS extraction copies the
   stream with `-f sup`, which the `sup` muxer accepts only for
-  `hdmv_pgs_subtitle`. VobSub (`dvd_subtitle`) and DVB subtitles therefore keep
-  the `415` refusal and the burn, even with an engine installed, and no VobSub
-  sample exists on this host to change that. `--ocr-language` is passed through
+  `hdmv_pgs_subtitle`; the VobSub extraction keeps a container that carries the
+  palette, so a bare MPEG-PS track with no palette is refused rather than
+  rendered blank. DVB (`dvb_subtitle`) therefore still keeps the `415` refusal
+  and the burn even with an engine installed. `--ocr-language` is passed through
   to tesseract but only `eng` is installed here, and no non-English caption has
   been recognised.
+- **The VobSub reader is verified against a synthetic sample.** Its input is the
+  codec private a container carries, and a real disc rip's palette arrives in an
+  `.idx` sidecar, which the same parser reads -- but nothing here has tried a real
+  one. The reader decodes the two-field run-length form ffmpeg's encoder emits
+  and the eight-bit form the format allows; the eight-bit branch has no sample.
 - **The OCR path has not been exercised with a hardware encoder or a ladder**,
   for the same reason the burn path has not: the burn and the OCR path both apply
   to the single-rendition case, and only software encoders exist on this host.
@@ -1184,7 +1526,8 @@ left:
   container and now the systemd unit have both been run for real — the unit on a
   clean VM (§6, §10) — and the release workflow has run end to end, so the GitHub
   Release and the GHCR push are observed rather than assumed. What is still
-  reasoned about is VAAPI, NVENC, AMF and VideoToolbox inside either shape. The
+  reasoned about is VAAPI, QuickSync, NVENC, AMF and VideoToolbox inside either
+  shape. The
   guest has no GPU and no render node, so it rejected all six hardware encoders at
   startup and transcoded on the CPU: that is a statement about the guest, not
   about the unit. The arm64 image needed QEMU for the runtime layer's `apt-get`;

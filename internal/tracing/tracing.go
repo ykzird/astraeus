@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/ykzird/astraeus/internal/httplabel"
 	"github.com/ykzird/astraeus/internal/observability"
 )
 
@@ -330,9 +331,20 @@ func (t *Tracer) Middleware(next http.Handler) http.Handler {
 			ctx = contextWithRemoteParent(ctx, parent)
 		}
 
-		ctx, span := t.Start(ctx, r.Method+" "+r.URL.Path, SpanKindServer,
-			String("http.request.method", r.Method),
-			String("url.path", r.URL.Path),
+		// The method and the path are the client's to choose, so both are bounded
+		// before they reach a span name or an attribute. A span name is indexed by
+		// backends, and one name per invented URL is the same unbounded series the
+		// metric labels had (A-4 of the 2026-10-09 review).
+		//
+		// The route pattern would be better than the path - `/api/entities/{id}`
+		// rather than one name per entity - but net/http assigns r.Pattern during
+		// dispatch, which happens after this middleware runs, so it is empty here
+		// and the truncated path is what is available.
+		method := httplabel.Method(r.Method)
+		path := httplabel.Path(r.URL.Path)
+		ctx, span := t.Start(ctx, httplabel.SpanName(r.Method, "", r.URL.Path), SpanKindServer,
+			String("http.request.method", method),
+			String("url.path", path),
 			String("client.address", peerAddress(r)))
 		defer span.End()
 

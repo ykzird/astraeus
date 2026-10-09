@@ -45,26 +45,63 @@ rather than here:
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--addr` | `127.0.0.1:8642` | Listen address |
+| `--addr` | `127.0.0.1:8642` | Listen address; loopback, so publishing it is an explicit choice |
+| `--device-dir` | `/dev/dri` | Directory holding the transcoding devices the encoder probe uses |
+| `--allowed-hosts` | loopback, this host's name, `--addr`'s host | Host names the server answers for; anything else is `421` |
+| `--cross-origin-protection` | on | Refuse state-changing requests a browser made from another origin |
 | `--web-dir` | `web` | Static UI directory |
-| `--ffmpeg`, `--ffprobe` | `ffmpeg`, `ffprobe` | Binaries to run (both are hard dependencies) |
+| `--ffmpeg`, `--ffprobe` | `ffmpeg`, `ffprobe` | Binaries to run. Without them the server starts and lists the library; the media routes answer `503 streaming_unavailable` |
 | `--stream-root` | temp | HLS session directories |
+| `--session-ttl` | `30m` | How long an idle streaming session is kept before its encoder stops. An idle session is one no client has asked for, which includes a viewer who paused — hls.js stops polling once a playlist is complete |
 | `--segment-seconds` | 6 | HLS target segment duration |
 | `--max-sessions` | 8 | Concurrent segmented streams |
 | `--image-cache`, `--subtitle-cache` | temp | Artwork and WebVTT caches |
-| `--tesseract-bin`, `--ocr-language` | `tesseract`, tesseract's own | OCR of image subtitles; a missing binary leaves them burn-only |
+| `--ocr-timeout` | `30m` | How long one image-subtitle recognition pass may take. It runs tesseract once per cue, so a feature-length track needs far more than a demux does |
+| `--tesseract-bin`, `--ocr-language` | `tesseract`, tesseract's own | OCR of image subtitles (PGS, VobSub); a missing binary leaves them burn-only. Changing the language re-reads every track: it is part of the recognition cache key, so the old text is not served |
 | `--tmdb-image-base` | TMDB's own root | Upstream artwork root |
-| `--enrich-interval`, `--scan-interval` | — | Background passes; `0` disables |
-| `--auth-mode`, `--auth-header`, `--trusted-proxy`, `--auth-token`, `--auth-exempt` | see [Access gate](#access-gate) | Gate configuration |
+| `--enrich-interval`, `--scan-interval` | `6h` | Background passes; `0` disables |
+| `--auth-mode`, `--auth-header`, `--auth-provider`, `--trusted-proxy`, `--auth-token`, `--auth-exempt` | see [Access gate](#access-gate) | Gate configuration |
 | `--rate-limit`, `--rate-limit-burst` | `0` (off) | API limit |
 | `--otel-endpoint`, `--otel-service-name` | off | Trace export |
 
+The listen address is loopback by default. Serving the LAN, the tailnet or a
+container network is `--addr 0.0.0.0:8642` or a named interface, and that choice
+belongs with the gate: `none` mode plus a published port is an unauthenticated
+library on that network. The container image passes `0.0.0.0` explicitly for
+exactly this reason.
+
+`--allowed-hosts` closes DNS rebinding, which is what a browser does when a page
+it loaded from `attacker.example` re-resolves that name to this server: the page
+becomes same-origin with the API and can read it with no credential of its own.
+A Host the operator did not list is answered `421 Misdirected Request`. The
+default covers loopback, this machine's hostname and whatever `--addr` names; a
+reverse proxy in front needs its public name added, and a wildcard `--addr` adds
+nothing, because every name resolves to a wildcard bind.
+
+Cross-origin protection refuses `POST`, `PUT`, `PATCH` and `DELETE` requests a
+browser made from another origin, which is the other half of the CSRF defence
+described under [Access gate](#access-gate). State-changing endpoints also
+require `Content-Type: application/json`, so the shapes a cross-origin form can
+actually produce (`text/plain`, form encoding) are refused before the body is
+read. Disable it only for a scripted client that cannot send the headers it
+checks.
+
 ## Security headers
 
-Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy:
-no-referrer`, `X-Frame-Options: DENY`, `Cross-Origin-Resource-Policy:
-same-origin` and a `Permissions-Policy` that refuses the features this app has no
-use for. Documents additionally carry a content security policy:
+Every response the API produces carries `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`,
+`Cross-Origin-Resource-Policy: same-origin` and a `Permissions-Policy` that
+refuses the features this app has no use for.
+
+The two outermost checks answer before those headers are applied, because they
+exist to refuse a request before it reaches any of this: the Host allowlist
+(`421`) and the access gate (`401`/`403`). A refusal therefore carries only its
+own status, a JSON body and, for an authentication failure, `WWW-Authenticate`.
+That is deliberate rather than an oversight - the point of both checks is to
+answer as early as possible - and a refusal is also absent from the request log,
+so `astraeus_http_requests_total` does not count it. The gate's own counters
+(`astraeus_auth_granted_total`, `astraeus_auth_denied_total{reason}`) are what
+record it instead. Documents additionally carry a content security policy:
 
 ```
 default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';
@@ -93,7 +130,15 @@ harness passes with no console errors under the policy.
 
 `Strict-Transport-Security` is deliberately absent: this server speaks plain
 HTTP, where browsers ignore it. A reverse proxy that terminates TLS is where it
-belongs — see [`deploy/README.md`](../deploy/README.md).
+belongs — [`deploy/tls/README.md`](../deploy/tls/README.md) is the runbook for
+that, and for the identity the gate needs a proxy to assert.
+
+Response headers are the last layer, not the only one. A request has to pass the
+[Host allowlist](#top) and, if it changes state, cross-origin protection; a JSON
+body has to be declared as JSON. Those refusals are `421` and `415` with the same
+error envelope as the rest of the API, and they are why a page on another origin
+cannot add a library, scan, enrich or start a transcode through this server, and
+why a hostname that rebinds to it cannot read the library.
 
 ## Access gate
 
@@ -103,41 +148,142 @@ rather than a built-in user database. `--auth-mode` selects the policy:
 | Mode | Behaviour |
 | --- | --- |
 | `none` (default) | No gate. Correct for a trusted LAN; **never** expose this to the internet |
-| `proxy` | Believe an identity header — but only when the request arrives from a configured trusted address |
+| `proxy` | Believe one named identity header — but only when the request arrives from a configured trusted address |
 | `token` | Require `Authorization: Bearer <token>`, compared in constant time |
 
 ```sh
-# Behind Tailscale (tailscale serve sets Tailscale-User-Login) or Cloudflare Access
-./astraeus-server serve --auth-mode proxy --trusted-proxy 100.64.0.0/10,127.0.0.1/32
+# Behind Tailscale (tailscale serve sets Tailscale-User-Login)
+./astraeus-server serve --auth-mode proxy --auth-provider tailscale \
+  --trusted-proxy 127.0.0.1/32,::1/128
 
-# For API clients and scripts
+# Behind Cloudflare Access (sets Cf-Access-Authenticated-User-Email)
+./astraeus-server serve --auth-mode proxy --auth-provider cloudflare \
+  --trusted-proxy 127.0.0.1/32,::1/128
+
+# For API clients and scripts. This leaves the web UI unusable: a browser cannot
+# send an Authorization header on a navigation, so every request it makes is
+# refused with 401. Use proxy mode for a UI.
 ASTRAEUS_AUTH_TOKEN=$(openssl rand -hex 32) ./astraeus-server serve --auth-mode token
 ```
+
+Proxy mode names **exactly one** header, and there is no default: an install
+that has not said which proxy is in front refuses to start. This is deliberate.
+The gate believes a configured header whenever it is non-empty, and each proxy
+overwrites only its own header, so a deployment that accepted both
+`Tailscale-User-Login` and `Cf-Access-Authenticated-User-Email` would let a user
+of whichever proxy is actually deployed supply the other header and be believed
+as any identity, an administrator included. For a proxy that is not one of the
+two known names, `--auth-header X-Your-Header` sets it directly. A request
+carrying a known identity header the deployment does not accept is refused with
+`403 competing_identity_header` rather than ignored.
 
 The security property that matters: **an identity header is only believed from a
 trusted address.** Headers are trivially forgeable by anyone who can reach the
 port, so trusting them without that check would be worse than no gate at all.
 `X-Forwarded-For` is deliberately ignored for the same reason — the address the
-connection actually came from is the only trustworthy one. Configuration fails
-closed: `proxy` mode without `--trusted-proxy`, or `token` mode without a token,
-refuses to start.
+connection actually came from is the only trustworthy one. Name one address or a
+narrow range, never a whole VPN range: every host in it can forge a header.
+Configuration fails closed: `proxy` mode without `--trusted-proxy`, or `token`
+mode without a token, refuses to start.
 
 `--auth-exempt` (default `/api/health`) lists exact paths that bypass the gate,
 so liveness probes keep working. `/metrics` is **not** exempt: point Prometheus
 at it with a token or let it through the proxy.
 
-Identity is recorded on every request log line, so the gate is auditable, and
+The token must be at least 16 characters, and the server refuses to start with a
+shorter one. The comparison is exact and constant-time, so the token's length is
+the whole of an attacker's problem: generate it with `openssl rand -hex 32`.
+
+Identity is recorded on every request log line the API serves, so the gate is
+auditable for everything it admits - a request it refuses is counted by
+`astraeus_auth_denied_total{reason}` instead, because the gate answers before
+the log is reached.
 `astraeus_auth_granted_total` / `astraeus_auth_denied_total{reason}` show what
 the gate is doing.
 
 A browser cannot attach a bearer token to a plain navigation, so browser access
 belongs behind `proxy` mode; `token` mode suits clients and automation.
 
+### Which libraries a viewer may see
+
+The gate decides whether a request is admitted. `--access-policy` decides what an
+admitted viewer may see and change, which is what makes more than one person
+share an install:
+
+```
+# /etc/astraeus/access-policy.conf
+default: none            # an unlisted viewer sees nothing (the default)
+admin: jok@example.com   # may scan, enrich, add and remove libraries
+
+jok@example.com: *       # "*" is every library, including ones added later
+alice@example.com: Movies, Documentaries
+bob@example.com: Kids    # a name, matched case-insensitively
+
+# A client-certificate proxy forwards the whole subject, which contains commas.
+# Backslash escapes the next character, so the subject stays one identity:
+admin: CN=alice\,O=Acme
+CN=alice\,O=Acme: Movies
+```
+
+The grammar, in full:
+
+- **One directive or grant per line**, `key: value`.
+- **Comments** run from a `#` that starts a line or follows whitespace to the end
+  of that line, so a note may sit beside a grant. A `#` with no whitespace before
+  it is part of the value, which is what lets a library or identity containing one
+  be named.
+- **Values are comma-separated** (`Movies, Documentaries`), and **a backslash
+  escapes the next character**. That is the only way to name an identity or a
+  library that contains a comma, and it is required rather than optional: the
+  identity `deploy/tls/README.md` produces is a whole certificate subject such as
+  `CN=alice,O=Acme`, so it is written `CN=alice\,O=Acme` on both the `admin:` line
+  and the grant. Without the escape the line is split at the comma and the install
+  ends up with two identities that match nobody.
+- **A key appears more than once** and its grants are combined. `default` may
+  appear only once.
+
+`deploy/tls/README.md` shows the same escape in the identity its proxy forwards.
+
+```sh
+./astraeus-server serve --auth-mode proxy --trusted-proxy 127.0.0.1/32 \
+  --access-policy /etc/astraeus/access-policy.conf
+```
+
+Four things are worth knowing:
+
+- **Without a file, nothing changes.** Every admitted viewer sees and may change
+  every library, which is what an install has always done. A file that cannot be
+  read or parsed is an error and the server refuses to start, because starting
+  open when the operator asked for restricted is the one failure that matters.
+- **A grant is a name or an id.** A name is matched case-insensitively, an id
+  exactly, and a name that does not exist yet is not an error — it matches
+  nothing until the library is added. `*` means every library, present and future.
+- **Visibility and administration are separate.** An admin may scan, enrich and
+  change libraries; that grants nothing to look at. The operator above is granted
+  both deliberately. A hidden library is reported as **404, not 403**, so the API
+  is not a way to discover which libraries exist.
+- **Changing the file needs a restart.** The policy is read once at startup and
+  the loaded policy is named on the startup line (`viewers=2 admins=1
+  default=none`), so a typo in a path is visible rather than silent.
+
+Only the visibility of a library is enforced per viewer. What a viewer may do
+*inside* a library it can see — play anything in it, report progress on it — is
+not restricted further, and there is no per-library administration.
+
 ## Rate limiting
 
 `--rate-limit` (requests per second per client, default `0` = off) bounds how
 often the API may be called, and `--rate-limit-burst` sets how many requests a
-client may make at once (default: the rate rounded up, which is the smallest
+client may make at once. A client is keyed by the gate identity when there is one
+and by the peer address otherwise; an **IPv6 client is keyed by its /64**, because
+a host is routinely given a whole /64 and limiting each address in it separately
+would hand one machine 2^64 buckets. IPv4 is keyed by the address, since it is not
+allocated in blocks that size to one client.
+
+Note that the limiter sits inside the gate, so a request that is **refused** for a
+bad token is not counted - a client guessing tokens can try faster than the limit.
+Where that matters, put the limit at the reverse proxy instead, which sees the
+traffic before the server does (default: the rate rounded up, which is the smallest
 bucket a normal page load still fits in).
 
 ```sh

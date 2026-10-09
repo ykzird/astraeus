@@ -45,7 +45,18 @@ type Decision struct {
 
 	TargetVideoCodec string `json:"target_video_codec,omitempty"`
 	TargetAudioCodec string `json:"target_audio_codec,omitempty"`
-	TargetHeight     int    `json:"target_height,omitempty"`
+	// TargetAudioEncoder is the ffmpeg encoder that produces TargetAudioCodec,
+	// and it is what the session command line passes to -c:a.
+	//
+	// The two are not the same string, and conflating them is S-7 of the
+	// 2026-10-09 review: ffmpeg's "opus" is its native experimental encoder,
+	// which refuses to run without -strict -2, while the encoder that works is
+	// "libopus". A session built with -c:a opus failed on the client that asked
+	// for Opus. Negotiate is pure and cannot resolve this, so
+	// NegotiateForServer fills it in; an empty value means "no server was
+	// consulted", which is what the pure unit tests produce.
+	TargetAudioEncoder string `json:"target_audio_encoder,omitempty"`
+	TargetHeight       int    `json:"target_height,omitempty"`
 	// TargetAudioChannels is set when the source carries more channels than the
 	// client accepts and the audio is being re-encoded anyway.
 	TargetAudioChannels int `json:"target_audio_channels,omitempty"`
@@ -131,6 +142,30 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 			fmt.Sprintf("client cannot decode audio codec %q", audioTrack.Codec))
 	}
 
+	// A file opened directly is a file whose stream selection this server does not
+	// control, so every track a player might pick has to be decodable. Where the
+	// default flag points past the first track, a player that honours the flag and
+	// one that takes the first stream disagree - and the disagreement is silent
+	// (S-16). The client has named a track when AudioTrackIndex is set and the file
+	// has it, which is the same condition the mode switch spells as trackChosen
+	// further down; it is repeated here because the audio check comes first.
+	clientNamedATrack := hasAudio && capability.AudioTrackIndex > 0 && !trackRequestIgnored
+	ambiguousAudio := false
+	for _, candidate := range info.DirectPlayAudioTracks(audioTrack, clientNamedATrack) {
+		// The chosen track has already been checked above; this loop is about the
+		// *other* track a player might pick instead.
+		if candidate.Index == audioTrack.Index {
+			continue
+		}
+		if !capability.SupportsAudio(candidate.Codec) {
+			ambiguousAudio = true
+			decision.Reasons = append(decision.Reasons,
+				fmt.Sprintf("this file's tracks disagree about which audio stream is first, and the client cannot decode %q, so the original file is not delivered untouched",
+					candidate.Codec))
+			break
+		}
+	}
+
 	containerCompatible := capability.SupportsContainer(info.Container)
 	if !containerCompatible {
 		decision.Reasons = append(decision.Reasons,
@@ -153,9 +188,18 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	}
 
 	// A codec name the client accepts does not mean it can decode this stream:
-	// 10-bit H.264 ("High 10") is refused by every browser's media pipeline.
-	tooDeep := info.BitDepth > 8 &&
-		(capability.MaxBitDepth == 0 || info.BitDepth > capability.MaxBitDepth)
+	// 10-bit H.264 ("High 10") is refused by every browser's media pipeline. A
+	// client that declares a depth is held to it.
+	//
+	// Zero means unrestricted, which is what the field documents and what every
+	// other limit here means. It did not: zero made every deeper-than-8-bit source
+	// a transcode, and the reason said "the client decodes at most 0-bit", which
+	// is not something a client can mean. The browser protection is unaffected,
+	// because it comes from the built-in profile setting 8 explicitly rather than
+	// from the zero value - so a client that sends no capability at all is still
+	// held to 8, and only one that sends a partial manifest is trusted (S-14 of
+	// the 2026-10-09 review).
+	tooDeep := capability.MaxBitDepth > 0 && info.BitDepth > capability.MaxBitDepth
 	if tooDeep {
 		decision.Reasons = append(decision.Reasons,
 			fmt.Sprintf("source is %d-bit but the client decodes at most %d-bit",
@@ -226,19 +270,34 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		}
 	}
 
+	// The segmented modes mux MPEG-TS, so a codec the client is happy to decode
+	// can still be one the container cannot describe. Asking only the client -
+	// which is what this did - produced segments ffmpeg wrote without complaint
+	// and every player read as bin_data, so the session "started" and played
+	// nothing (S-3 of the 2026-10-09 review).
+	segmentCarriesVideo := segmentContainerCanCarry(info.VideoCodec)
+	segmentCarriesAudio := !hasAudio || segmentContainerCanCarry(audioTrack.Codec)
+
 	switch {
-	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany || hdrMismatch || bitrateTooHigh || burning:
+	case !videoCompatible || !audioCompatible || ambiguousAudio || needsDownscale || tooDeep || channelsTooMany || hdrMismatch || bitrateTooHigh || burning:
 		decision.Mode = ModeTranscode
 	case trackChosen:
 		decision.Mode = ModeRemux
 	case containerCompatible:
 		decision.Mode = ModeDirectPlay
+	case !segmentCarriesVideo || !segmentCarriesAudio:
+		decision.Mode = ModeTranscode
+		decision.Reasons = append(decision.Reasons,
+			fmt.Sprintf("the segment container cannot carry %s, so this is re-encoded rather than copied",
+				uncarriableCodecs(info, hasAudio, audioTrack.Codec)))
 	default:
 		decision.Mode = ModeRemux
 	}
 
-	// Video action.
-	if !videoCompatible || needsDownscale || tooDeep || hdrMismatch || bitrateTooHigh || burning {
+	// Video action. A codec the segment container cannot carry counts as one
+	// that has to be re-encoded, for the same reason a codec the client cannot
+	// decode does: copying it produces a stream nobody can play.
+	if !videoCompatible || !segmentCarriesVideo || needsDownscale || tooDeep || hdrMismatch || bitrateTooHigh || burning {
 		decision.VideoAction = ActionTranscode
 		decision.TargetVideoCodec = capability.PreferredVideoCodec()
 		// An HDR source that has to be re-encoded should land in a codec that can
@@ -266,6 +325,31 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 			decision.Reasons = append(decision.Reasons,
 				fmt.Sprintf("%s is tone mapped to SDR for this client", dynamicRangeLabel(info)))
 		}
+	}
+
+	// An HDR source stays HDR only when the thing being delivered can carry it.
+	//
+	// The codec preference above puts HEVC, AV1 and VP9 first for an HDR client,
+	// but a client that lists none of them - one that advertises HDR and only
+	// H.264, which Chromium does - keeps the H.264 target, and H.264 cannot
+	// carry the range. Leaving it there is S-6: the session delivered 10-bit
+	// H.264 tagged PQ, which the code's own comment calls wrong, and the
+	// existing test passed only because its fake server happened to list no HDR
+	// encoders at all.
+	//
+	// Only a re-encode is judged by this. A copy delivers the source's own
+	// codec whatever TargetVideoCodec says, and direct play of an HDR file to
+	// an HDR client is exactly the case that must not be touched.
+	//
+	// The encoder question - does this host have a verified 10-bit encoder for
+	// the codec we chose - is a separate one and is answered in
+	// NegotiateForServer, which is the function that knows.
+	if !hdrMismatch && info.IsHDR() &&
+		decision.VideoAction == ActionTranscode && !codecCanCarryHDR(decision.TargetVideoCodec) {
+		decision.ToneMap = true
+		decision.Reasons = append(decision.Reasons,
+			fmt.Sprintf("%q cannot carry %s, so it is tone mapped to SDR instead",
+				decision.TargetVideoCodec, dynamicRangeLabel(info)))
 	}
 	decision.TargetDynamicRange = deliveryRangeFor(info.DynamicRange, decision.ToneMap)
 
@@ -308,7 +392,10 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	switch {
 	case !hasAudio:
 		decision.AudioAction = ActionNone
-	case !audioCompatible || channelsTooMany:
+	case !audioCompatible || !segmentCarriesAudio || channelsTooMany:
+		// The container check is the audio half of S-3: Vorbis and FLAC are
+		// codecs a browser may well accept and MPEG-TS cannot describe, so
+		// copying them produced a silent bin_data track.
 		decision.AudioAction = ActionTranscode
 		decision.TargetAudioCodec = capability.PreferredAudioCodec()
 		if decision.TargetAudioCodec == "" {
@@ -786,8 +873,18 @@ func DetectServerCapability(ctx context.Context, ffmpegBin, ffprobeBin, deviceDi
 		// An encoder that works at 8 bits is a candidate for HDR, not proof of
 		// it: 10-bit surfaces are a separate capability, and on one host the
 		// hardware encoder lacks it while the software one has it.
-		if support, err := probeHDRSupport(ctx, ffmpegBin, encoder, device); err == nil {
-			capability.HDRVideoEncoders = append(capability.HDRVideoEncoders, support)
+		//
+		// H.264 is excluded, and that is not a quality judgement. A 10-bit
+		// H.264 stream is not an HDR delivery format - no browser or television
+		// treats it as one - so listing libx264 here let negotiation keep an HDR
+		// range while targeting H.264 and deliver High-10 frames tagged PQ
+		// (S-6 of the 2026-10-09 review). The code went on to tone map only
+		// because this list had no HDR encoders, which is a host-dependent
+		// accident rather than a rule.
+		if encoderCanCarryHDR(encoder) {
+			if support, err := probeHDRSupport(ctx, ffmpegBin, encoder, device); err == nil {
+				capability.HDRVideoEncoders = append(capability.HDRVideoEncoders, support)
+			}
 		}
 	}
 
@@ -831,6 +928,25 @@ func AudioEncoderFor(codec string, server ServerCapability) string {
 		}
 	}
 	return ""
+}
+
+// audioEncoderOrDefault is AudioEncoderFor without a server to check against: it
+// returns the most portable encoder for a codec, ignoring whether this host has
+// it.
+//
+// It exists for the one case where no server was consulted - a Decision built by
+// hand, as the pure negotiation tests do - so the session builder still gets an
+// encoder name rather than a codec name. An unknown codec is returned unchanged,
+// which is the best that can be said about it and preserves the old behaviour
+// for anything not in the table.
+func audioEncoderOrDefault(codec string) string {
+	if codec == "" {
+		return "aac"
+	}
+	if candidates := audioEncoderPreference[NormaliseAudioCodec(codec)]; len(candidates) > 0 {
+		return candidates[0]
+	}
+	return codec
 }
 
 // NegotiateForServer narrows a negotiation to what this server can actually
@@ -888,6 +1004,12 @@ func NegotiateForServer(info *MediaInfo, capability ClientCapability, server Ser
 			decision.Reasons = append(decision.Reasons,
 				"this server has no encoder for any audio codec the client accepts")
 		}
+	}
+
+	// Resolve the encoder once here, where the server is known, so the session
+	// builder never has to guess that a codec name is also an encoder name.
+	if decision.AudioAction == ActionTranscode {
+		decision.TargetAudioEncoder = AudioEncoderFor(decision.TargetAudioCodec, server)
 	}
 
 	return decision

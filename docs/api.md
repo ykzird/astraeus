@@ -13,13 +13,14 @@ route below is also listed where it is implemented, in `internal/api`.
 | POST | `/api/libraries` | Register `{name, path, kind}` |
 | GET | `/api/libraries/{id}` | One library |
 | DELETE | `/api/libraries/{id}` | Remove a library and its entities |
-| POST | `/api/libraries/{id}/scan` | Scan, returns a `ScanResult` |
-| POST | `/api/scan` | Re-scan every library, returns a `ScanOutcome` each |
+| POST | `/api/libraries/{id}/scan` | Scan. Answers `202` with a job to poll; `200` with a `ScanResult` when the server has no job runner |
+| POST | `/api/scan` | Re-scan every library, `202` with a job (see above) |
 | DELETE | `/api/streams/{id}` | Stop a streaming session now, `204` |
 | GET | `/api/libraries/{id}/entities` | Entities, optionally `?status=Incomplete` |
 | GET | `/api/entities` | All entities, optionally `?status=` |
 | GET | `/api/entities/{id}` | Entity with its objects, children and parent |
-| POST | `/api/metadata/enrich` | Run one enrichment pass |
+| POST | `/api/metadata/enrich` | Run one enrichment pass, `202` with a job (see above) |
+| GET | `/api/jobs/{id}` | A job's state, and its result once it has finished |
 | POST | `/api/entities/{id}/playback` | Negotiate playback, returns a URL and subtitle tracks |
 | GET | `/api/progress` | This viewer's resumable positions, most recently watched first |
 | PUT | `/api/entities/{id}/progress` | Record where the viewer got to (resumable playback) |
@@ -29,6 +30,71 @@ route below is also listed where it is implemented, in `internal/api`.
 | GET | `/api/images/{size}/{file}` | Poster/backdrop artwork, proxied and cached |
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/hls/{session}/{file}` | Playlist and segments of a live session |
+
+Two rules apply to those routes once an operator configures `--access-policy`
+(see [configuration.md](configuration.md)):
+
+- a library the calling viewer may not see answers **`404`**, exactly as an
+  unknown id does, so the API is not a way to discover which libraries exist.
+  That covers everything reachable through one: the library, its entities, their
+  media files, subtitle tracks, playback negotiation, progress, and the playlist
+  and segment URLs of a session belonging to it.
+
+  The one exception is `DELETE /api/entities/{id}/progress`, which answers
+  **`204`** whether or not the entity exists and whether or not the viewer can
+  see it. Forgetting a position is idempotent cleanup: there is nothing to
+  disclose in the answer, and a client clearing a position should not have to
+  distinguish "cleared" from "there was nothing there" or from "that entity is
+  not yours" - the first two are the same outcome, and telling a viewer the third
+  would answer a question the 404 rule exists to refuse. `PUT` on the same path
+  answers `404`, because it reveals nothing new to say a position cannot be
+  stored for an entity this viewer cannot see;
+- the routes that change the library — registering, removing or scanning one, and
+  `POST /api/metadata/enrich` — answer **`403 admin_required`** for a viewer the
+  policy does not list as an admin. Stopping a stream is not one of them: it is
+  cleanup, and requiring visibility would leave a transcode running after a
+  revocation.
+
+With no policy configured, every authenticated caller sees and may change
+everything, which is what the rest of this page assumes.
+
+### Long work is accepted, not performed
+
+Scanning and enriching answer **`202 Accepted`** rather than holding the request
+open until the work finishes. The response body is:
+
+```json
+{"job_id": "job-7", "key": "scan:lib-1", "state": "queued", "new": true,
+ "status_url": "/api/jobs/job-7"}
+```
+
+`Location` carries the same path as `status_url`. Poll it until `state` is
+`"done"`, which is when `result` (the `ScanResult` or `EnrichResult` the
+synchronous form used to return) or `error` is present:
+
+```json
+{"job_id": "job-7", "key": "scan:lib-1", "state": "done",
+ "started_at": "2026-10-09T10:00:00Z", "ended_at": "2026-10-09T10:00:04Z",
+ "result": {"files_seen": 214, "entities_created": 3}}
+```
+
+Three things about this are worth knowing:
+
+- **The work is not tied to your connection.** It runs on the server's own
+  context, so a client that gives up - a browser timing out, a script killed -
+  does not cancel the scan. Reconnecting and polling finds the same job.
+- **One key is one job.** `key` is what the work is about (`scan:<library id>`,
+  `scan:all`, `enrich:all`). A second request for a key that is still queued or
+  running returns that same job with `"new": false` rather than starting another,
+  which is how two viewers pressing Scan get one scan.
+- **A full queue is `503 jobs_busy` with `Retry-After`.** It is a refusal, not a
+  failure: the work was not started and the request may be repeated.
+
+`GET /api/jobs/{id}` answers `404 job_not_found` for a job the server no longer
+remembers - finished jobs are forgotten, and a restart forgets all of them. That
+is not an error condition to handle: the thing a client wanted is the new state of
+the library, which is in the library. A server built without a runner answers
+`503 jobs_unavailable`, and the endpoints above run synchronously with `200`.
 
 ## Resume and watch state
 

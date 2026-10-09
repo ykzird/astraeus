@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,7 @@ import (
 type testEnv struct {
 	server *Server
 	repo   library.Repository
+
 	// gate is nil by default. A test that needs to tell viewers apart installs
 	// the same middleware the binary uses, because identity lives in the gate
 	// and not in the API server.
@@ -128,17 +130,34 @@ func (e *testEnv) do(t *testing.T, method, path, body string) *httptest.Response
 // empty one sends no header, which is the ungated single-viewer case.
 func (e *testEnv) doAs(t *testing.T, identity, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	return e.doWithContentTypeAs(t, identity, method, path, body, "application/json")
+}
+
+// doWithContentType is doAs with an explicit Content-Type, so a test can check
+// what the server does with a body that is not declared as JSON. An empty
+// contentType sends no header at all.
+func (e *testEnv) doWithContentType(t *testing.T, method, path, body, contentType string) *httptest.ResponseRecorder {
+	t.Helper()
+	identity := ""
+	if e.gate != nil {
+		identity = defaultTestIdentity
+	}
+	return e.doWithContentTypeAs(t, identity, method, path, body, contentType)
+}
+
+func (e *testEnv) doWithContentTypeAs(t *testing.T, identity, method, path, body, contentType string) *httptest.ResponseRecorder {
+	t.Helper()
 
 	var reader io.Reader
 	if body != "" {
 		reader = strings.NewReader(body)
 	}
 	req := httptest.NewRequest(method, path, reader)
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	if identity != "" {
-		req.Header.Set(access.DefaultIdentityHeaders[0], identity)
+		req.Header.Set(access.HeaderTailscaleLogin, identity)
 	}
 	recorder := httptest.NewRecorder()
 
@@ -203,24 +222,68 @@ func TestCreateLibrary_Validation(t *testing.T) {
 	missingDir := filepath.Join(t.TempDir(), "nope")
 
 	tests := []struct {
-		name       string
-		body       string
-		wantStatus int
+		name        string
+		body        string
+		contentType string
+		wantStatus  int
 	}{
-		{name: "missing name", body: `{"path":"` + validDir + `","kind":"movies"}`, wantStatus: http.StatusBadRequest},
-		{name: "missing path", body: `{"name":"Movies","kind":"movies"}`, wantStatus: http.StatusBadRequest},
-		{name: "unknown kind", body: `{"name":"Movies","path":"` + validDir + `","kind":"music"}`, wantStatus: http.StatusBadRequest},
-		{name: "path does not exist", body: `{"name":"Movies","path":"` + missingDir + `","kind":"movies"}`, wantStatus: http.StatusBadRequest},
-		{name: "unknown field", body: `{"name":"Movies","path":"` + validDir + `","kind":"movies","extra":1}`, wantStatus: http.StatusBadRequest},
-		{name: "malformed json", body: `{"name":`, wantStatus: http.StatusBadRequest},
-		{name: "empty body", body: "", wantStatus: http.StatusBadRequest},
+		{
+			name:        "missing name",
+			body:        `{"path":"` + validDir + `","kind":"movies"}`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "missing path",
+			body:        `{"name":"Movies","kind":"movies"}`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "unknown kind",
+			body:        `{"name":"Movies","path":"` + validDir + `","kind":"music"}`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "path does not exist",
+			body:        `{"name":"Movies","path":"` + missingDir + `","kind":"movies"}`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "unknown field",
+			body:        `{"name":"Movies","path":"` + validDir + `","kind":"movies","extra":1}`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "malformed json",
+			body:        `{"name":`,
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "empty body",
+			contentType: "application/json",
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			// A body is present but is not declared as JSON. This is the
+			// shape a cross-origin form can produce, which is why it is
+			// refused before the body is read at all.
+			name:        "not declared as json",
+			body:        `{"name":"Movies","path":"` + validDir + `","kind":"movies"}`,
+			contentType: "text/plain",
+			wantStatus:  http.StatusUnsupportedMediaType,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			recorder := env.do(t, http.MethodPost, "/api/libraries", tt.body)
+			recorder := env.doWithContentType(t, http.MethodPost, "/api/libraries", tt.body, tt.contentType)
 			if recorder.Code != tt.wantStatus {
 				t.Errorf("status = %d, want %d (body %s)", recorder.Code, tt.wantStatus, recorder.Body.String())
 			}
@@ -566,4 +629,74 @@ func TestEntitiesOfShowsLibraryExposeHierarchy(t *testing.T) {
 	if episode.Name != "S01E01 - Pilot" {
 		t.Errorf("episode name = %q, want S01E01 - Pilot", episode.Name)
 	}
+}
+
+// TestMetrics_MethodCardinalityIsBounded is the end-to-end version of A-4, and it
+// is the shape the review measured.
+//
+// Three hundred requests with invented methods took /metrics from a few lines to
+// 5,441, and five raw-socket requests with 100 KB methods took it to 9.3 MB.
+// Neither series is ever freed, so the cost is permanent for the life of the
+// process. The test drives the real handler and reads the real exposition.
+func TestMetrics_MethodCardinalityIsBounded(t *testing.T) {
+	t.Parallel()
+
+	env := newTestEnv(t)
+
+	// Distinct invented verbs, the same shape the review used.
+	for i := 0; i < 300; i++ {
+		method := "M" + strconv.Itoa(i)
+		request := httptest.NewRequest(method, "/api/libraries", nil)
+		env.server.Handler().ServeHTTP(httptest.NewRecorder(), request)
+	}
+
+	body := scrapeMetrics(t, env)
+
+	// One series for every invented verb, or none: the request counter must not
+	// carry their names.
+	for i := 0; i < 300; i++ {
+		if strings.Contains(body, `method="M`+strconv.Itoa(i)+`"`) {
+			t.Fatalf("the metrics carry a series for the invented method M%d, so a client "+
+				"can create series at will", i)
+		}
+	}
+	if !strings.Contains(body, `method="other"`) {
+		t.Error("no request was recorded as `other`, so the invented verbs were dropped " +
+			"rather than labelled")
+	}
+}
+
+// TestMetrics_LongMethodDoesNotBlowUpTheScrape covers the second measurement: a
+// hundred-kilobyte method must not become a hundred-kilobyte label.
+func TestMetrics_LongMethodDoesNotBlowUpTheScrape(t *testing.T) {
+	t.Parallel()
+
+	env := newTestEnv(t)
+
+	// Before: a scrape of the baseline.
+	baseline := len(scrapeMetrics(t, env))
+
+	request := httptest.NewRequest(strings.Repeat("A", 100_000), "/api/libraries", nil)
+	env.server.Handler().ServeHTTP(httptest.NewRecorder(), request)
+
+	body := scrapeMetrics(t, env)
+	growth := len(body) - baseline
+	// The label is bounded, so the growth is a line or two - not 100 KB per
+	// request. A generous ceiling still catches the failure by three orders of
+	// magnitude.
+	if growth > 4096 {
+		t.Errorf("one request with a 100 KB method grew the scrape by %d bytes; the method "+
+			"became a label", growth)
+	}
+}
+
+// scrapeMetrics reads the exposition the server serves.
+func scrapeMetrics(t *testing.T, env *testEnv) string {
+	t.Helper()
+
+	recorder := env.do(t, http.MethodGet, "/metrics", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET /metrics = %d, want 200", recorder.Code)
+	}
+	return recorder.Body.String()
 }
