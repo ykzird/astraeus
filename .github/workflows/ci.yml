@@ -135,7 +135,8 @@ jobs:
                    CONTEXT.md CONTRIBUTING.md SECURITY.md LICENSE \
                    THIRD_PARTY_NOTICES.md deploy deploy/astraeus.service \
                    docs/index.md docs/playback.md docs/configuration.md \
-                   docs/api.md docs/development.md assets/astraeus.png; do
+                   docs/api.md docs/development.md docs/troubleshooting.md \
+                   assets/astraeus.png; do
             grep -qx "$f" "$layout" || { echo "missing from the release archive: $f"; status=1; }
           done
           # And the project's working documents must not be, or a release starts

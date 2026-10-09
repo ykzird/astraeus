@@ -264,7 +264,7 @@ per platform — `linux/amd64` and `linux/arm64` by default — each holding:
   and would otherwise be broken in the first document a new user opens;
 - the `deploy` directory with the systemd unit;
 - the user-facing pages of `docs/`: `index.md`, `playback.md`,
-  `configuration.md`, `api.md` and `development.md`;
+  `configuration.md`, `api.md`, `development.md` and `troubleshooting.md`;
 - the top-level documents a reader of the installed tree needs: `README.md`,
   `SPECIFICATION.md`, `TODO.md`, `CONTEXT.md`, `CONTRIBUTING.md` and
   `SECURITY.md`;

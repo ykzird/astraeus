@@ -93,7 +93,7 @@ for platform in "${platforms[@]}"; do
 	# audit onto a user's host is noise they did not ask for.
 	mkdir -p "$stage/docs"
 	cp docs/index.md docs/playback.md docs/configuration.md docs/api.md \
-		docs/development.md "$stage/docs/"
+		docs/development.md docs/troubleshooting.md "$stage/docs/"
 
 	# That runbook is this layout's acceptance test, so run it here. A missing
 	# file is a broken release, and this is the last point at which the build
@@ -102,6 +102,7 @@ for platform in "${platforms[@]}"; do
 		CONTRIBUTING.md SECURITY.md LICENSE THIRD_PARTY_NOTICES.md deploy \
 		deploy/astraeus.service docs/index.md docs/playback.md \
 		docs/configuration.md docs/api.md docs/development.md \
+		docs/troubleshooting.md \
 		assets/astraeus.png; do
 		[[ -e "$stage/$f" ]] || {
 			echo "build-release: $f is missing from $name, so the runbook in deploy/README.md cannot be followed from this archive" >&2
