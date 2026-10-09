@@ -1,9 +1,10 @@
 // Package pgs writes the Blu-ray Presentation Graphic Stream (.sup) format.
 //
-// It exists because nothing else can produce an image-subtitle sample here:
-// no PGS or VobSub file ships with this project, and ffmpeg cannot encode a
-// bitmap subtitle from text ("only possible from text to text or bitmap to
-// bitmap"). Without a fixture, image-subtitle handling could only be asserted
+// It exists because nothing else can produce an image-subtitle sample here.
+// ffmpeg cannot encode a bitmap subtitle from text ("only possible from text to
+// text or bitmap to bitmap"), and while a bitmap-to-bitmap transcode does
+// produce VobSub (scripts/make-vobsub-fixture.sh), no PGS file ships with this
+// project. Without a fixture, image-subtitle handling could only be asserted
 // against its own command line, which is exactly the evidence this project does
 // not accept. The package is used by integration tests and by scripts/pgsgen,
 // which builds a fixture for the browser harnesses.

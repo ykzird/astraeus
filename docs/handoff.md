@@ -1292,8 +1292,10 @@ surface. What is left:
 - **OCR covers PGS only**, and the extraction step is PGS-specific: it copies the
   stream with `-f sup`, which the `sup` muxer accepts only for
   `hdmv_pgs_subtitle`. VobSub (`dvd_subtitle`) and DVB subtitles therefore keep
-  the `415` refusal and the burn, even with an engine installed, and no VobSub
-  sample exists on this host to change that. `--ocr-language` is passed through
+  the `415` refusal and the burn, even with an engine installed. Round 17 removed
+  the fixture half of that obstacle — a VobSub sample can be synthesised now (§7)
+  — so what is missing is the decoder rather than something to test it against.
+  `--ocr-language` is passed through
   to tesseract but only `eng` is installed here, and no non-English caption has
   been recognised.
 - **The OCR path has not been exercised with a hardware encoder or a ladder**,

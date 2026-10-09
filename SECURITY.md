@@ -35,11 +35,12 @@ that have had the most thought:
 ## What is not a vulnerability
 
 - **No TLS.** The server speaks plain HTTP by design and is meant to sit behind a
-  reverse proxy; `deploy/` covers that. An exposed plaintext port is a
-  configuration problem, not a defect.
-- **No per-user access control.** The gate decides whether a request is admitted,
-  not what it may see: every admitted viewer sees the whole library. That is a
-  documented limitation (`TODO.md`), not a bug.
+  reverse proxy; [`deploy/tls/`](deploy/tls/README.md) is the runbook for that. An
+  exposed plaintext port is a configuration problem, not a defect.
+- **No per-entity access control.** `--access-policy` decides which libraries a
+  viewer may see and who may change the library, but a viewer that can see a
+  library can see everything in it, and nothing decides what is permitted inside
+  one. That is a documented limitation (`TODO.md`), not a bug.
 - **A progress position the client made up.** The server validates the range and
   clears a finished position; it cannot tell a real position from a plausible
   wrong one, and the worst case is a resume in the wrong place.

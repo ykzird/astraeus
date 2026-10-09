@@ -294,14 +294,17 @@ Status as of the current build. Evidence for each claim is the test suite
 - OCR covers **PGS** and only PGS. VobSub (`dvd_subtitle`) and DVB subtitles are
   bitmaps in different containers with different palettes; they keep the `415`
   refusal and are offered as a burn rather than advertised and then failing inside
-  the extractor. A second decoder is the work that would change that.
+  the extractor. A second decoder is the work that would change that, and the
+  fixture it was waiting on now exists — `scripts/make-vobsub-fixture.sh`
+  synthesises one with ffmpeg's `dvdsub` encoder (see the Phase 2 item).
 - OCR is verified against **handwritten fixtures**, not real disc subtitles. The
   fixture font is sized so the recogniser reads it exactly; a real Blu-ray track
   brings anti-aliased edges, a black outline and a palette, none of which has been
   tried here. Recognition can misread a word, and a bitmap that is not text can be
   read as some (a solid rectangle comes back as a mark), so the recognised text
-  should be treated as approximate. No real PGS or VobSub sample exists on this
-  host; a real disc would strengthen this more than anything else.
+  should be treated as approximate. No real Blu-ray or DVD sample exists on this
+  host — a VobSub one can now be synthesised, which is still synthetic; a real
+  disc would strengthen this more than anything else.
 - OCR reads the composition and the palette but ignores window definitions, and
   treats a display set as a clear unless it is a palette update. A stream that
   reuses an object across an epoch in a way the fixture does not would be decoded

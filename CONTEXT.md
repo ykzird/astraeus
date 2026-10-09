@@ -31,5 +31,5 @@ This document defines the ubiquitous language for the Spatial Media Environment 
 
 ### Access
 * **User**: An authenticated individual with access to the application.
-* **AccessPolicy**: The set of rules governing access to the application. Currently implemented as a global gate for the entire instance, determining whether a `User` can access the `Library`.
+* **AccessPolicy**: The set of rules governing access to the application: the gate, which decides whether a request is admitted at all, and the per-Viewer grants, which decide which `Library`s a Viewer may see and who may change them. With no policy configured every admitted Viewer sees and may change everything; with one, a Viewer the policy does not name sees nothing.
 * **Viewer**: The identity a `PlaybackProgress` belongs to. It is the identity the `AccessPolicy` attaches to a request; when the gate is disabled the instance has a single Viewer, named by the domain as the local viewer.

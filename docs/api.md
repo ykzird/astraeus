@@ -30,6 +30,23 @@ route below is also listed where it is implemented, in `internal/api`.
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/hls/{session}/{file}` | Playlist and segments of a live session |
 
+Two rules apply to those routes once an operator configures `--access-policy`
+(see [configuration.md](configuration.md)):
+
+- a library the calling viewer may not see answers **`404`**, exactly as an
+  unknown id does, so the API is not a way to discover which libraries exist.
+  That covers everything reachable through one: the library, its entities, their
+  media files, subtitle tracks, playback negotiation, progress, and the playlist
+  and segment URLs of a session belonging to it;
+- the routes that change the library — registering, removing or scanning one, and
+  `POST /api/metadata/enrich` — answer **`403 admin_required`** for a viewer the
+  policy does not list as an admin. Stopping a stream is not one of them: it is
+  cleanup, and requiring visibility would leave a transcode running after a
+  revocation.
+
+With no policy configured, every authenticated caller sees and may change
+everything, which is what the rest of this page assumes.
+
 ## Resume and watch state
 
 Where a viewer got to is stored per viewer and entity and reported by `PUT
