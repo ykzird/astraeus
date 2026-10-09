@@ -1,13 +1,16 @@
 # Handoff
 
-**As of the round-18 work of 2026-10-09 — the VobSub reader. 149 tracked files;
-`v0.17.0` and `v0.18.0` are released, so the in-tree version is `dev` and the
-next tag would be `v0.18.1`.** (`git log` names the commits. Round 17 disproved
-the note that had been blocking the VobSub reader for two rounds: ffmpeg cannot
-*mux* VobSub, but it can *encode* it, so the project's PGS fixture re-encodes
-into a real sample that ffmpeg decodes and tesseract reads. Round 18 wrote the
-decoder and the routing, so a `dvd_subtitle` track is now offered as text
-instead of burn-only (§6). Round 16 added
+**As of the round-19 work of 2026-10-09 — a DVB fixture, and the last subtitle
+blocker gone. 154 tracked files; `v0.17.0` and `v0.18.0` are released, so the
+in-tree version is `dev` and the next tag would be `v0.18.1`.** (`git log` names
+the commits. Round 17 disproved the note that had been blocking the VobSub
+reader for two rounds: ffmpeg cannot *mux* VobSub, but it can *encode* it, so
+the project's PGS fixture re-encodes into a real sample that ffmpeg decodes and
+tesseract reads. Round 18 wrote that decoder and the routing, so a
+`dvd_subtitle` track is offered as text instead of burn-only. Round 19 did the
+same trick one format further: ffmpeg's `dvbsub` encoder takes no text, but its
+PGS decoder can feed it, so a `dvb_subtitle` sample now exists too (§6) — the
+decoder for it is the next increment (§7). Round 16 added
 `--access-policy`, which turns the gate from "may this request in" into "what may
 it see" (§6). Round 15 added `deploy/tls/` and ran it: Caddy terminating
 TLS, a client certificate as the viewer's identity, and the trust boundary the
