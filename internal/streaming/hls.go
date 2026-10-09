@@ -326,7 +326,10 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	}
 
 	manager := &Manager{cfg: cfg, baseCtx: ctx, sessions: make(map[string]*Session)}
-	manager.sweepStaleDirectories(cfg.RootDir, cfg.SessionTTL)
+	// At startup nothing is in the map, so every marked directory is an orphan and
+	// the grace alone decides. Using the session TTL here skipped exactly the
+	// directories a fast restart leaves (S-13).
+	manager.SweepOrphans()
 	return manager, nil
 }
 
@@ -337,12 +340,13 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 // Only directories older than the TTL are removed, so a second instance sharing
 // the same root does not lose its live sessions. Running more than one instance
 // against one root is therefore discouraged.
-func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration) {
+func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration, live map[string]bool) int {
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return
+		return 0
 	}
 
+	removed := 0
 	cutoff := time.Now().Add(-olderThan)
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -350,6 +354,12 @@ func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration) {
 		}
 		info, err := entry.Info()
 		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		// A directory a live session owns, whatever its age. The map is the
+		// authority, not the modification time: a session that has produced nothing
+		// yet still has a directory, and removing it stops playback.
+		if live[entry.Name()] {
 			continue
 		}
 		path := filepath.Join(root, entry.Name())
@@ -364,7 +374,9 @@ func (m *Manager) sweepStaleDirectories(root string, olderThan time.Duration) {
 			continue
 		}
 		m.cfg.Logger.Info("removed stale session directory", "path", path)
+		removed++
 	}
+	return removed
 }
 
 // Config exposes the manager configuration for callers that need to build URLs
@@ -745,6 +757,52 @@ func (m *Manager) SessionTTL() time.Duration {
 	return m.cfg.SessionTTL
 }
 
+// SweepOrphans removes session directories no live session owns.
+//
+// It exists because the startup sweep alone cannot cover the case that matters: a
+// process killed outright leaves its directories, and a restart *within* the TTL
+// leaves them younger than the age check - so the one sweep that would have seen
+// them skipped them, and no later sweep ever runs. On a long-lived server the
+// result was directories that were never revisited, potentially many gigabytes of
+// them, in a directory that defaults to a temporary filesystem (S-13 of the
+// 2026-10-09 review).
+//
+// Called on every reap tick, where "not in m.sessions" is evidence rather than an
+// inference from age: a directory from *this* run belongs to a session in the map
+// until it is stopped, and anything else with our marker is left over.
+func (m *Manager) SweepOrphans() int {
+	// A session's directory is named after it, so the live ones can be excluded by
+	// name. This is not a refinement - the first version of this sweep removed a
+	// running session's output during a test, because the short grace period that
+	// makes the sweep useful also made it reach the live directory before the TTL
+	// would have. Age cannot distinguish them; membership can.
+	m.mu.Lock()
+	live := make(map[string]bool, len(m.sessions))
+	for id := range m.sessions {
+		live[id] = true
+	}
+	m.mu.Unlock()
+
+	return m.sweepStaleDirectories(m.cfg.RootDir, m.orphanAge(), live)
+}
+
+// orphanAge is how old a marked directory must be before the sweep will touch it.
+//
+// A short grace period rather than the session TTL, because the evidence is
+// different: the TTL has to guess whether a viewer is coming back, while the sweep
+// knows the directory is not any live session's. The grace is only there to avoid
+// racing a session that has created its directory but not yet published itself -
+// which reserveSlot's pending count covers, but a directory on disk is not the
+// same thing as a count in memory.
+const orphanGrace = time.Minute
+
+func (m *Manager) orphanAge() time.Duration {
+	if m.cfg.SessionTTL < orphanGrace {
+		return m.cfg.SessionTTL
+	}
+	return orphanGrace
+}
+
 // ReapLoop reaps idle sessions until the context is cancelled.
 func (m *Manager) ReapLoop(ctx context.Context) {
 	interval := m.cfg.SessionTTL / 2
@@ -762,6 +820,10 @@ func (m *Manager) ReapLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			m.Reap(time.Now())
+			// Every tick, not only at startup: a directory left by a process that
+			// was killed is younger than any age check at the moment the next run
+			// starts, and would otherwise never be looked at again (S-13).
+			m.SweepOrphans()
 		}
 	}
 }

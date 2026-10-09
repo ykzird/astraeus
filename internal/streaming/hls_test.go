@@ -930,3 +930,185 @@ func TestReap_KeepsASessionWithinItsTTL(t *testing.T) {
 		t.Errorf("reaped %d sessions, want 1: the TTL bound must still hold", reaped)
 	}
 }
+
+// TestSweepOrphans_RemovesADirectoryAQuickRestartLeft is the regression test for
+// S-13.
+//
+// The sweep ran once at startup and only removed directories older than the
+// session TTL. A process killed outright leaves its directories; a restart within
+// the TTL leaves them younger than that check, so the one sweep that would have
+// seen them skipped them and no later sweep ever ran. On a long-lived server the
+// result was directories never revisited - many gigabytes of them, in a root that
+// defaults to a temporary filesystem.
+func TestSweepOrphans_RemovesADirectoryAQuickRestartLeft(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		RootDir:    root,
+		SessionTTL: 30 * time.Minute,
+		Logger:     newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	// What a killed process leaves: a marked directory, freshly written, owned by
+	// no session in the map. It is younger than the TTL - which is the case the
+	// old sweep walked past.
+	orphan := filepath.Join(root, "session-left-by-a-crash")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
+		t.Fatalf("creating the orphan: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(orphan, sessionMarkerFile), []byte("gone\n"), 0o644); err != nil {
+		t.Fatalf("marking the orphan: %v", err)
+	}
+
+	// A directory that is not ours must survive, however old: a mistyped or shared
+	// --stream-root must not turn this into deleting somebody else's data.
+	stranger := filepath.Join(root, "not-ours")
+	if err := os.MkdirAll(stranger, 0o755); err != nil {
+		t.Fatalf("creating the stranger: %v", err)
+	}
+
+	// The grace period is what stops the sweep racing a session that has made its
+	// directory but not yet published itself, so an orphan inside it is left - and
+	// is taken on a later tick, which is what the second call asserts.
+	//
+	// The age is simulated by setting the modification time back past the grace,
+	// which is what a restart does to the wall clock as far as the sweep is
+	// concerned.
+	past := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(orphan, past, past); err != nil {
+		t.Fatalf("ageing the orphan: %v", err)
+	}
+
+	if removed := manager.SweepOrphans(); removed != 1 {
+		t.Errorf("the sweep removed %d directories, want 1: a directory no session owns "+
+			"and left by an earlier run is an orphan whatever its age", removed)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Error("the orphan is still there")
+	}
+	if _, err := os.Stat(stranger); err != nil {
+		t.Error("the sweep removed a directory it did not create")
+	}
+
+	// And it is idempotent: a second sweep has nothing to do.
+	if removed := manager.SweepOrphans(); removed != 0 {
+		t.Errorf("a second sweep removed %d directories, want 0", removed)
+	}
+}
+
+// TestSweepOrphans_KeepsALiveSessionsDirectory guards the other direction, which
+// is the one that would be a serious bug: the sweep must not remove the output of
+// a session that is running.
+func TestSweepOrphans_KeepsALiveSessionsDirectory(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		RootDir:    root,
+		SessionTTL: 30 * time.Minute,
+		Logger:     newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	// A session in the map, with its directory on disk and old enough that age
+	// alone would condemn it.
+	dir := filepath.Join(root, "live-session")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("creating the session directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, sessionMarkerFile), []byte("live\n"), 0o644); err != nil {
+		t.Fatalf("marking the session directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte("#EXTM3U\n"), 0o644); err != nil {
+		t.Fatalf("writing the playlist: %v", err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(dir, old, old); err != nil {
+		t.Fatalf("ageing the session directory: %v", err)
+	}
+
+	done := make(chan struct{})
+	session := &Session{
+		ID:         "live-session",
+		Dir:        dir,
+		done:       done,
+		cancel:     func() {},
+		startedAt:  time.Now(),
+		lastAccess: time.Now(),
+	}
+	manager.mu.Lock()
+	manager.sessions["live-session"] = session
+	manager.mu.Unlock()
+
+	if removed := manager.SweepOrphans(); removed != 0 {
+		t.Errorf("the sweep removed %d directories including a live session's output, "+
+			"which would stop playback mid-film", removed)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "index.m3u8")); err != nil {
+		t.Errorf("a live session's playlist was removed: %v", err)
+	}
+	close(done)
+}
+
+// TestReapLoop_SweepsOrphansOnItsTick is the other half of S-13.
+//
+// The sweep existing is not enough; something has to call it after startup. The
+// loop's tick reaps idle sessions and sweeps orphans, and this runs the loop
+// rather than calling the sweep directly, because "the sweep is correct" and "the
+// sweep is reached" are different claims and only the second one fixes the
+// finding.
+func TestReapLoop_SweepsOrphansOnItsTick(t *testing.T) {
+	// Not parallel: it waits on a real ticker.
+	root := t.TempDir()
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		RootDir:    root,
+		SessionTTL: 10 * time.Second, // the loop's shortest interval
+		Logger:     newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	// An orphan older than the grace, as a restart would find.
+	orphan := filepath.Join(root, "left-by-an-earlier-run")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
+		t.Fatalf("creating the orphan: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(orphan, sessionMarkerFile), []byte("gone\n"), 0o644); err != nil {
+		t.Fatalf("marking the orphan: %v", err)
+	}
+	past := time.Now().Add(-5 * time.Minute)
+	if err := os.Chtimes(orphan, past, past); err != nil {
+		t.Fatalf("ageing the orphan: %v", err)
+	}
+
+	// The startup sweep already ran in NewManager and should have taken this one.
+	// Creating it after means only the tick can remove it, which is the claim.
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatalf("the startup sweep removed it, so this test cannot show that the tick does: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go manager.ReapLoop(ctx)
+
+	// The loop's interval is half the TTL, floored at ten seconds.
+	deadline := time.Now().Add(25 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(orphan); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Error("the reap loop never swept an orphan left by an earlier run, so nothing but " +
+		"a restart would ever remove it")
+}
