@@ -1,5 +1,9 @@
 # Astraeus Media
 
+<p align="center">
+  <img src="assets/astraeus.png" alt="Astraeus" width="640">
+</p>
+
 [![CI](https://github.com/ykzird/astraeus/actions/workflows/ci.yml/badge.svg)](https://github.com/ykzird/astraeus/actions/workflows/ci.yml)
 
 A self-hosted media server in a single Go binary, with a web UI it serves itself.
