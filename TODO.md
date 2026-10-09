@@ -252,7 +252,7 @@ Status as of the current build. Evidence for each claim is the test suite
       viewer starts over or finishes, and the navigation lists what is worth
       continuing
 
-## Phase 5: Packaging — released (v0.17.0, v0.18.0)
+## Phase 5: Packaging — released (v0.17.0, v0.18.0, v0.19.0)
 
 - [x] Multi-stage `Dockerfile`: static binary, ffmpeg and ffprobe in the runtime
       image, fixed non-root uid, one writable volume, health check
@@ -272,9 +272,12 @@ Status as of the current build. Evidence for each claim is the test suite
       `/api/health` answers, the real `systemd-analyze security` score is 1.6 (OK),
       and the ffmpeg child carries the filter itself — `Seccomp: 2`, empty
       capabilities, no `EPERM` — while producing a correct downscaled segment
-- [x] Release automation run for real: `v0.17.0` and `v0.18.0` tagged, a GitHub
-      Release published with both archives and `checksums.txt`, and a multi-arch
-      image on GHCR with provenance and SBOM attestations. The first run found and
+- [x] Release automation run for real: `v0.17.0`, `v0.18.0` and `v0.19.0` tagged, a
+      GitHub Release published with both archives and `checksums.txt`, and a
+      multi-arch image on GHCR with provenance and SBOM attestations.
+      `v0.19.0` carries the adversarial-review work; its notes state the one
+      upgrade-affecting change in that body of work, the listen default moving to
+      loopback, with the `--addr :8642` escape hatch. The first run found and
       fixed the defects only a real run could: the archive was missing `deploy/`
       and the documents the runbook installs, and the publish job had no
       repository context for `gh`
