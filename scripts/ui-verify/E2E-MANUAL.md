@@ -177,9 +177,14 @@ thing.
       ```sh
       curl -s -X POST localhost:8910/api/entities/<id>/playback \
         -H 'Content-Type: application/json' \
-        -d '{"video_codecs":["h264"],"audio_codecs":["aac"],"supports_hls":true}' \
+        -d '{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],"supports_hls":true}' \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["mode"]); print(d["decision"]["reasons"])'
       ```
+
+      `containers` is not optional. A body that is present has to name at least
+      one container, one video codec and one audio codec, or the server answers
+      `400 invalid_capability` — the request above used to omit it, so the step
+      could not produce the outcome it described.
       **[auto]** assert the mode badge/decision says transcode and that a
       quality control exists. On a direct-play entity, assert the quality control
       is *absent* — a missing control must not pass by accident.

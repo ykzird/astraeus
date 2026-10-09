@@ -48,6 +48,12 @@ earlier than requested.
 }
 ```
 
+A body that is present must name **at least one container, one video codec and
+one audio codec**. Any of the three missing is `400 invalid_capability`, which is
+why `start_seconds` cannot be sent on its own: prefer starting from the built-in
+profile and overriding what you need, rather than sending a body that names only
+an offset.
+
 The body may also carry `start_seconds`, the offset into the source at which the
 session should begin; the response echoes it back as `start_seconds` so a client
 can keep a continuous timeline across a seek or a quality change. A negative

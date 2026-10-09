@@ -860,13 +860,23 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	if !decision.Deliverable {
 		span.SetStatus(tracing.StatusError, strings.Join(decision.Reasons, "; "))
 	}
+	// A client that declared it cannot render subtitle tracks is not sent any.
+	// The field was read nowhere but its own normalisation (D-7 of the
+	// 2026-10-09 review), so a manifest could say `"subtitles": false` and still
+	// be handed WebVTT URLs it had just said it could not use. The tracks are
+	// omitted rather than the request refused: a client that cannot render them
+	// loses nothing, and this is information it already gave.
+	subtitles := s.subtitleResources(object.ID, info.Subtitles)
+	if !capability.Subtitles {
+		subtitles = nil
+	}
 	response := playbackResponse{
 		EntityID:     entity.ID,
 		ObjectID:     object.ID,
 		Mode:         decision.Mode,
 		Decision:     decision,
 		MediaInfo:    info,
-		Subtitles:    s.subtitleResources(object.ID, info.Subtitles),
+		Subtitles:    subtitles,
 		StartSeconds: startSeconds,
 	}
 

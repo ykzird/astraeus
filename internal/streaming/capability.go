@@ -75,7 +75,15 @@ type ClientCapability struct {
 	BurnSubtitleIndex int `json:"burn_subtitle_index"`
 	// SupportsHLS enables the segmented delivery modes.
 	SupportsHLS bool `json:"supports_hls"`
-	// Subtitles indicates the client can render subtitle tracks.
+	// Subtitles indicates the client can render subtitle tracks. A client that
+	// says false is not sent any: the tracks are omitted from the playback
+	// response rather than the request refused, because a client that cannot
+	// render them loses nothing and this is information it already gave.
+	//
+	// The zero value is false, and the built-in profile sets it true, so a client
+	// that sends no body is offered subtitles as a browser would expect. A client
+	// that sends a body must say so - which is why every documented example
+	// includes it.
 	Subtitles bool `json:"subtitles"`
 }
 

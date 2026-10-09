@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -773,5 +774,81 @@ func TestPlayback_BurnsAnImageSubtitle(t *testing.T) {
 			`"supports_hls":true,"burn_subtitle_index":-1}`)
 	if recorder.Code != http.StatusBadRequest {
 		t.Errorf("negative index status = %d, want 400 (body %s)", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestPlayback_SubtitlesFieldIsHonoured is the regression test for D-7.
+//
+// ClientCapability.Subtitles was read nowhere but its own Normalise, yet it was
+// documented and appeared in every example: a manifest could say
+// `"subtitles": false` and still be handed WebVTT URLs it had just said it could
+// not use. A dead field in a request body is worse than an absent one, because a
+// client that sets it believes it has been heard.
+func TestPlayback_SubtitlesFieldIsHonoured(t *testing.T) {
+	t.Parallel()
+
+	info := &streaming.MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []streaming.AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+		Subtitles: []streaming.SubtitleTrack{
+			{Index: 2, Codec: "subrip", Text: true, Language: "en"},
+			{Index: 3, Codec: "subrip", Text: true, Language: "fr"},
+		},
+	}
+	env := newTestEnv(t, withProber(stubProber{info: info}), withStreams(&fakeStreams{}))
+	entity, _ := seedPlayableEntity(t, env, "Arrival (2016).mkv", "matroska bytes")
+
+	play := func(subtitles bool) playbackResponse {
+		t.Helper()
+		body := `{"containers":["hls"],"video_codecs":["h264"],"audio_codecs":["aac"],` +
+			`"supports_hls":true,"subtitles":` + strconv.FormatBool(subtitles) + `}`
+		recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback", body)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+		}
+		return decodeBody[playbackResponse](t, recorder)
+	}
+
+	// A client that can render them is offered both tracks.
+	if got := play(true); len(got.Subtitles) != 2 {
+		t.Errorf("a client that declared subtitle support was offered %d tracks, want 2", len(got.Subtitles))
+	}
+
+	// And a client that said it cannot is offered none, rather than being handed
+	// URLs it cannot use.
+	if got := play(false); len(got.Subtitles) != 0 {
+		t.Errorf("a client that declared no subtitle support was offered %d tracks, want 0",
+			len(got.Subtitles))
+	}
+}
+
+// TestPlayback_OmittedSubtitlesFollowsTheBuiltInProfile guards the other
+// direction: the field defaults to false in Go, so a body that omits it must not
+// silently behave like a client without subtitle support.
+func TestPlayback_OmittedSubtitlesFollowsTheBuiltInProfile(t *testing.T) {
+	t.Parallel()
+
+	info := &streaming.MediaInfo{
+		Container: "matroska", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 8, DurationSeconds: 600,
+		AudioTracks: []streaming.AudioTrack{{Index: 1, Codec: "aac", Channels: 2}},
+		Subtitles: []streaming.SubtitleTrack{
+			{Index: 2, Codec: "subrip", Text: true, Language: "en"},
+		},
+	}
+	env := newTestEnv(t, withProber(stubProber{info: info}), withStreams(&fakeStreams{}))
+	entity, _ := seedPlayableEntity(t, env, "Arrival (2016).mkv", "matroska bytes")
+
+	// No body at all: the server's own browser profile, which supports subtitles.
+	recorder := env.do(t, http.MethodPost, "/api/entities/"+entity.ID+"/playback", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	response := decodeBody[playbackResponse](t, recorder)
+	if len(response.Subtitles) != 1 {
+		t.Errorf("the built-in profile was offered %d subtitle tracks, want 1: the zero "+
+			"value of the field must not be read as a client refusing subtitles",
+			len(response.Subtitles))
 	}
 }

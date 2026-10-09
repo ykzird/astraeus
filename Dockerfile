@@ -110,6 +110,21 @@ EXPOSE 8642
 # without repeating the path: `docker run astraeus-media scan --path /media`.
 # Without an ENTRYPOINT, "serve" would be looked up in $PATH and the container
 # would exit before logging anything.
+#
+# --addr is 0.0.0.0 here and the gate is off, which together mean the container
+# serves its library to anything that can reach the port. That is the right
+# default for a container - bind loopback and a published port reaches nothing -
+# and it puts the decision where it belongs, in the `-p` argument:
+#
+#   -p 127.0.0.1:8642:8642   publishes on the host's loopback only, which is the
+#                            shape deploy/README.md recommends, paired with a
+#                            TLS-terminating proxy for viewers
+#   -p 8642:8642             publishes on every interface
+#
+# Inside the container the port is always reachable, so a gate is not what makes
+# this safe; the published address and the proxy in front of it are. The systemd
+# unit takes the other route - loopback plus the mode the operator chooses - so
+# the two shapes differ here on purpose.
 ENTRYPOINT ["/usr/local/bin/astraeus-server"]
 CMD ["serve", \
      "--addr", "0.0.0.0:8642", \

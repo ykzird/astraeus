@@ -33,8 +33,19 @@ adds ffmpeg as its one external dependency. Without it the server still starts
 and lists a library, and the routes that need to probe or transcode a file answer
 503. The container runs as a fixed non-root uid
 with every writable path inside a single volume, and the unit binds loopback with
-the access gate on, so neither shape publishes an unauthenticated library by
-default. Deployment is where the server's own honesty matters most: the startup
+the access gate on. The two shapes differ in what they publish by default, and the
+difference is worth stating rather than smoothing over:
+
+- **The systemd unit binds `127.0.0.1:8642`**, so nothing off-host reaches it
+  until a reverse proxy is put in front - which is also where the identity comes
+  from, since token mode is unusable from a browser.
+- **The container binds `0.0.0.0:8642` with the gate off.** Inside a container a
+  loopback bind reaches nothing, so the default is to listen on every interface
+  and leave the decision to the published address: `-p 127.0.0.1:8642:8642` is
+  the recommended shape, and `-p 8642:8642` hands the library to anyone who can
+  reach the port. A gate is not what makes the container safe; the `-p` argument
+  and the proxy in front of it are. `deploy/README.md` says so where it shows
+  both. Deployment is where the server's own honesty matters most: the startup
 probe reports which encoders this host can actually use, so a container that
 cannot see a GPU says so instead of transcoding badly.
 
