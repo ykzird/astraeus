@@ -102,6 +102,13 @@ jobs:
       - name: Test the web core
         run: node --test web/*.test.js
 
+      # The manual end-to-end walk-through and its machine-readable twin describe
+      # the same steps. An edit to one that forgets the other would leave the
+      # Playwright conversion building against a document that has moved on, so
+      # the two are checked against each other here, where a drift is cheap.
+      - name: Check the end-to-end walk-through
+        run: node --test scripts/ui-verify/check-e2e-flows.test.mjs
+
       # deploy/README.md's systemd runbook is followed from an extracted release
       # archive: it copies the documents into /usr/local/share/doc and installs
       # the unit out of deploy/. That makes the archive's layout part of the

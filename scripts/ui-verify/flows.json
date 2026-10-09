@@ -1,0 +1,368 @@
+{
+  "$comment": "The machine-readable twin of E2E-MANUAL.md. One entry per phase, one entry per checkbox, in document order. Keep in step with the prose: check-e2e-flows.mjs fails if the phase or step counts disagree, or if a step's kind is missing. 'kind' is 'auto' (Playwright can assert it), 'human' (a person must judge it), or 'auto+human' (assert the state, judge the look).",
+  "server": {
+    "command": "./astraeus-server serve --db demo.db --web-dir web --addr 127.0.0.1:8910 --enrich-interval 0 --scan-interval 0 --stream-root \"$PWD/.tmp/e2e-streams\"",
+    "baseUrl": "http://127.0.0.1:8910",
+    "readySignal": "listening addr="
+  },
+  "fixtures": {
+    "demo": "./scripts/make-demo-media.sh",
+    "longClip": {
+      "why": "seek and resume need a clip longer than the position sought; the demo clips are three seconds",
+      "path": "/tmp/astraeus-e2e/long.mp4",
+      "command": "ffmpeg -hide_banner -loglevel error -y -f lavfi -i \"testsrc2=size=640x360:rate=15:duration=180\" -f lavfi -i \"sine=frequency=440:duration=180\" -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -shortest /tmp/astraeus-e2e/long.mp4"
+    },
+    "ocrClip": {
+      "why": "to exercise the image-subtitle OCR and burn paths, the committed VobSub fixture has to be muxed onto a video track",
+      "path": "/tmp/astraeus-e2e/ocr.mkv",
+      "command": "ffmpeg -hide_banner -loglevel error -y -f lavfi -i \"color=c=0x202020:s=640x360:r=15\" -t 6 -i internal/subtitles/testdata/vobsub-caption.mkv -map 0:v -map 1:s -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:s copy /tmp/astraeus-e2e/ocr.mkv"
+    }
+  },
+  "phases": [
+    {
+      "id": "server-boot",
+      "title": "The server comes up",
+      "requires": [],
+      "steps": [
+        {
+          "id": "boot-log",
+          "kind": "auto",
+          "expect": "the log names the ffmpeg, the accepted and rejected encoder families with reasons, the image-subtitle mode, and finally the listening line",
+          "assert": "wait for the readySignal rather than sleeping; fail if it never appears"
+        },
+        {
+          "id": "health-pill",
+          "kind": "auto",
+          "expect": "the shell renders and the health pill leaves its connecting state",
+          "assert": "the pill is not 'Connecting\u2026' and carries no error class",
+          "api": "GET /api/health"
+        },
+        {
+          "id": "no-console-errors",
+          "kind": "auto",
+          "expect": "no console errors",
+          "assert": "collect console messages and fail on error"
+        },
+        {
+          "id": "metrics",
+          "kind": "auto",
+          "expect": "the Prometheus exposition is served",
+          "assert": "a known metric name is present",
+          "api": "GET /metrics"
+        }
+      ]
+    },
+    {
+      "id": "library",
+      "title": "The library lists and navigates",
+      "requires": [
+        "server-boot"
+      ],
+      "steps": [
+        {
+          "id": "fresh-continue-hidden",
+          "kind": "auto",
+          "expect": "Continue watching is hidden on a fresh database",
+          "assert": "#continue-section is hidden",
+          "selector": "#continue-section"
+        },
+        {
+          "id": "select-library",
+          "kind": "auto",
+          "expect": "the library becomes the breadcrumb and the canvas fills",
+          "assert": "the breadcrumb text matches the clicked library and the canvas is not empty",
+          "selector": "#breadcrumbs"
+        },
+        {
+          "id": "incomplete-filter",
+          "kind": "auto",
+          "expect": "the list narrows and the badge agrees with the visible count",
+          "assert": "the entity count matches the badge",
+          "selector": "#filter-toggle"
+        },
+        {
+          "id": "entity-detail",
+          "kind": "auto",
+          "expect": "the canvas shows the entity and the context panel populates",
+          "assert": "the heading is the entity's title"
+        },
+        {
+          "id": "browser-back",
+          "kind": "auto",
+          "expect": "Back returns to the list rather than leaving the app, and restores the selection",
+          "assert": "the canvas is a list again after history.back()"
+        }
+      ]
+    },
+    {
+      "id": "playback-decision",
+      "title": "Playback, and the decision behind it",
+      "requires": [
+        "library"
+      ],
+      "steps": [
+        {
+          "id": "direct-play",
+          "kind": "auto",
+          "expect": "a direct-playable H.264 clip negotiates direct_play and starts",
+          "assert": "capture POST playback and assert the mode and reasons",
+          "api": "POST /api/entities/{id}/playback"
+        },
+        {
+          "id": "transcode-makes-quality-menu",
+          "kind": "auto",
+          "expect": "an HEVC entity transcodes and a quality control appears; a direct-play entity has none",
+          "assert": "assert presence for the transcode and absence for direct play"
+        },
+        {
+          "id": "quality-choice",
+          "kind": "auto",
+          "expect": "choosing 'Up to Np' re-negotiates with preferred_height and no max_height",
+          "assert": "the request fields and a ladder topped at the choice",
+          "existingHarness": "quality-verify.mjs"
+        },
+        {
+          "id": "audio-menu",
+          "kind": "auto",
+          "expect": "both tracks are offered and the file's default is current",
+          "assert": "the menu has as many entries as the server reports, and switching re-negotiates with the matching index"
+        },
+        {
+          "id": "segmented-lazy-hls",
+          "kind": "auto",
+          "expect": "a segmented play loads hls.js lazily; direct play does not",
+          "assert": "window.Hls is undefined before and defined after",
+          "existingHarness": "player-verify.mjs"
+        }
+      ]
+    },
+    {
+      "id": "player-controls",
+      "title": "The player's own controls",
+      "requires": [
+        "playback-decision"
+      ],
+      "steps": [
+        {
+          "id": "auto-hide",
+          "kind": "human",
+          "expect": "the bar auto-hides while playing and returns on pointer movement",
+          "why": "a judgement about feel, and three-second clips end during the wait"
+        },
+        {
+          "id": "play-pause",
+          "kind": "auto",
+          "expect": "Space and the bar control both toggle playback and the glyph follows",
+          "assert": "paused flips and the control state changes"
+        },
+        {
+          "id": "seek",
+          "kind": "auto+human",
+          "expect": "seeking re-negotiates at the offset rather than buffering from zero",
+          "assert": "the new request carries an offset near where the seek landed",
+          "existingHarness": "player-chrome-verify.mjs"
+        },
+        {
+          "id": "volume-remembered",
+          "kind": "auto",
+          "expect": "the volume choice survives a reload",
+          "assert": "the stored value survives page.reload()"
+        },
+        {
+          "id": "fullscreen",
+          "kind": "auto+human",
+          "expect": "the player container goes fullscreen, not the bare video, and the control follows",
+          "assert": "document.fullscreenElement is the player container"
+        }
+      ],
+      "fixture": "longClip",
+      "needsRealMedia": true
+    },
+    {
+      "id": "subtitles",
+      "title": "Subtitles",
+      "requires": [
+        "player-controls"
+      ],
+      "steps": [
+        {
+          "id": "text-track",
+          "kind": "auto",
+          "expect": "Off plus every deliverable track; choosing one attaches a track with real cues",
+          "assert": "a <track> is attached, its TextTrack produces cues, Off disables them",
+          "existingHarness": "subtitle-verify.mjs"
+        },
+        {
+          "id": "cue-boundary-escaping",
+          "kind": "human",
+          "expect": "the caption changes at the cue boundary and the fixture's ampersands render as text",
+          "why": "a person can see that & did not become &amp; on screen"
+        },
+        {
+          "id": "ocr-track",
+          "kind": "auto",
+          "expect": "with tesseract, the image track is offered without '(burned in)' and choosing it makes no playback request",
+          "assert": "no playback request, and the cue text is the fixture's caption",
+          "existingHarness": "ocr-verify.mjs",
+          "fixture": "ocrClip"
+        },
+        {
+          "id": "burn-fallback",
+          "kind": "auto",
+          "expect": "without tesseract the same track is '(burned in)' and choosing it re-negotiates with burn_subtitle_index",
+          "assert": "the request carries burn_subtitle_index and the decision carries burned_subtitle_index",
+          "existingHarness": "burn-verify.mjs",
+          "fixture": "ocrClip",
+          "serverFlag": "--tesseract-bin /nonexistent/tesseract"
+        }
+      ]
+    },
+    {
+      "id": "resume",
+      "title": "Resume and continue watching",
+      "requires": [
+        "playback-decision"
+      ],
+      "needsRealMedia": true,
+      "steps": [
+        {
+          "id": "resumes",
+          "kind": "auto",
+          "expect": "a paused position appears in Continue watching and resumes near it",
+          "assert": "read the transport's source clock, not the element's",
+          "api": "GET /api/progress",
+          "existingHarness": "resume-verify.mjs",
+          "fixture": "longClip"
+        },
+        {
+          "id": "start-over",
+          "kind": "auto",
+          "expect": "start-over clears the position and the row leaves Continue watching",
+          "assert": "the row is gone from /api/progress",
+          "api": "GET /api/progress"
+        },
+        {
+          "id": "watched-through",
+          "kind": "auto",
+          "expect": "running into the closing percent clears the row rather than offering it again",
+          "assert": "absence from /api/progress"
+        },
+        {
+          "id": "per-viewer",
+          "kind": "auto",
+          "expect": "two identities keep separate positions",
+          "assert": "each identity reads back its own place",
+          "note": "needs --auth-mode proxy behind the deploy/tls example"
+        }
+      ],
+      "fixture": "longClip"
+    },
+    {
+      "id": "api",
+      "title": "The API as a client sees it",
+      "requires": [
+        "server-boot"
+      ],
+      "steps": [
+        {
+          "id": "scan-idempotent",
+          "kind": "auto",
+          "expect": "a scan returns 200 and a second scan does not change the entity count",
+          "assert": "status and a stable count",
+          "api": "POST /api/scan"
+        },
+        {
+          "id": "unsatisfiable-codec",
+          "kind": "auto",
+          "expect": "a manifest no encoder can satisfy is a 409 naming what it cannot do",
+          "assert": "the status and the error code",
+          "api": "POST /api/entities/{id}/playback"
+        },
+        {
+          "id": "unknown-codec",
+          "kind": "auto",
+          "expect": "a codec name that does not exist is a 400 before ffmpeg",
+          "assert": "the status",
+          "api": "POST /api/entities/{id}/playback"
+        },
+        {
+          "id": "capabilities-agree",
+          "kind": "auto",
+          "expect": "capabilities report accepted and rejected families and subtitle_ocr_enabled agrees with the subtitle phase",
+          "assert": "the shape, and that subtitle_ocr_enabled matches what Phase 4 observed",
+          "api": "GET /api/system/capabilities"
+        },
+        {
+          "id": "rate-limit",
+          "kind": "auto",
+          "expect": "a burst is 200, 200, 429 with Retry-After, health untouched, and the counter increments",
+          "assert": "the three statuses, the header, and astraeus_rate_limited_total",
+          "serverFlag": "--rate-limit 1 --rate-limit-burst 2"
+        }
+      ]
+    },
+    {
+      "id": "access",
+      "title": "Access, when a gate is configured",
+      "requires": [
+        "server-boot"
+      ],
+      "optional": true,
+      "steps": [
+        {
+          "id": "token-mode",
+          "kind": "auto",
+          "expect": "no token is a 401 and the right token is a 200; health needs no token",
+          "assert": "both statuses and an unauthenticated /api/health",
+          "serverFlag": "--auth-mode token"
+        },
+        {
+          "id": "scoped-visibility",
+          "kind": "auto",
+          "expect": "a granted identity sees one library and the other answers 404, not 403",
+          "assert": "the counts and the 404",
+          "serverFlag": "--access-policy"
+        },
+        {
+          "id": "admin-separate",
+          "kind": "auto",
+          "expect": "a non-admin gets 403 registering a library and on scan; an admin without visibility can still scan",
+          "assert": "both statuses, both directions",
+          "serverFlag": "--access-policy"
+        },
+        {
+          "id": "revocation-rechecked",
+          "kind": "auto",
+          "expect": "revoking a library stops its session URLs being served",
+          "assert": "the status changes after revocation"
+        }
+      ]
+    },
+    {
+      "id": "deployment",
+      "title": "Deployment, if you are checking a release",
+      "requires": [],
+      "optional": true,
+      "steps": [
+        {
+          "id": "image-or-unit",
+          "kind": "auto+human",
+          "expect": "health answers and one entity plays against the built image or the installed unit",
+          "assert": "health and a successful playback"
+        },
+        {
+          "id": "hardening-score",
+          "kind": "human",
+          "expect": "systemd-analyze security reports the score the runbook quotes",
+          "why": "provisioning a VM is outside what this walk-through drives"
+        }
+      ],
+      "note": "the transcode half needs real media, but the point of this phase is the deployed artefact; it is marked human rather than given a fixture"
+    }
+  ],
+  "notCovered": [
+    "what is composited into a frame after a burn or an OCR pass - a browser cannot be asked, and the Go integration tests assert pixels instead",
+    "hardware encoders - no GPU on this host, so the walk-through asserts the reported reasons rather than the encoders",
+    "Firefox and Safari - not installed; the harnesses are Chromium-only and native HLS has never been observed firing"
+  ]
+}

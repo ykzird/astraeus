@@ -1,7 +1,7 @@
 # Handoff
 
-**As of the round-19 work of 2026-10-09 — a DVB fixture, and the last subtitle
-blocker gone. 154 tracked files; `v0.17.0` and `v0.18.0` are released, so the
+**As of the round-19 work of 2026-10-09 — a DVB fixture, a manual end-to-end
+walk-through, and the last subtitle blocker gone. 158 tracked files; `v0.17.0` and `v0.18.0` are released, so the
 in-tree version is `dev` and the next tag would be `v0.18.1`.** (`git log` names
 the commits. Round 17 disproved the note that had been blocking the VobSub
 reader for two rounds: ffmpeg cannot *mux* VobSub, but it can *encode* it, so
@@ -10,7 +10,10 @@ tesseract reads. Round 18 wrote that decoder and the routing, so a
 `dvd_subtitle` track is offered as text instead of burn-only. Round 19 did the
 same trick one format further: ffmpeg's `dvbsub` encoder takes no text, but its
 PGS decoder can feed it, so a `dvb_subtitle` sample now exists too (§6) — the
-decoder for it is the next increment (§7). Round 16 added
+decoder for it is the next increment (§7) — a first attempt was written and
+withdrawn, and §8 says why. The same round added a manual end-to-end
+walk-through of the whole application, built to be run by hand and converted to
+Playwright, with a check in CI that keeps it in step with its data twin (§3). Round 16 added
 `--access-policy`, which turns the gate from "may this request in" into "what may
 it see" (§6). Round 15 added `deploy/tls/` and ran it: Caddy terminating
 TLS, a client certificate as the viewer's identity, and the trust boundary the
@@ -104,6 +107,14 @@ node --test web/*.test.js
 mise exec -- go build -o ./astraeus-server ./cmd/astraeus-server
 ./scripts/make-demo-media.sh
 # or: ./scripts/make-demo-media.sh <media-dir> <db-path>
+
+# The manual end-to-end walk-through, and the check that keeps it in step with
+# its machine-readable twin. The walk-through is one ordered pass over the whole
+# application, written to be run by hand and converted to Playwright afterwards;
+# every step says whether a machine can assert it or only a person can. The
+# check is cheap and CI runs it, so the two descriptions cannot drift.
+node --test scripts/ui-verify/check-e2e-flows.test.mjs
+node scripts/ui-verify/check-e2e-flows.mjs
 
 # Browser harnesses: start a server, then a headless Chromium with a CDP port.
 ./astraeus-server serve --db demo.db --web-dir web --addr 127.0.0.1:8910 \
@@ -1355,6 +1366,17 @@ surface. What is left:
   display set with no composition objects as a clear unless it is a palette
   update; that is right for the fixture and probably right for a disc, but it is
   reasoning rather than observation.
+- **A DVB decoder was attempted and withdrawn.** The fixture is committed
+  (`internal/subtitles/testdata/dvb-caption.{mkv,ts}`) and its framing is
+  unit-tested, but the first decoder drew a correctly sized crop and a plausible
+  colour table and only 696 of ffmpeg's 3440 ink pixels, so it was removed
+  rather than left in the tree looking finished. `TODO.md` carries the verified
+  segment layouts, the pixel-string grammars and the exact point the attempt
+  stopped. Nothing in the server reads a DVB track: it still keeps the `415`
+  refusal and the burn.
+- **A DVB track's colour is BT.601, not the BT.709 the PGS reader uses.** The
+  two are close but not identical, so a DVB decoder built by copying the PGS
+  colour conversion would be subtly wrong rather than obviously broken.
 - **Recognition can be wrong, and the fixture was tuned until it was not.** The
   integration test asserts the exact caption because the fixture's glyph size was
   chosen so tesseract reads it; at a different size the same font read
