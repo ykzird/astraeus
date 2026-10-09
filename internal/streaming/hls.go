@@ -140,6 +140,21 @@ func (s *Session) PlaylistPath() string {
 // Done is closed once the underlying ffmpeg process has exited.
 func (s *Session) Done() <-chan struct{} { return s.done }
 
+// Failed reports whether the session's encoder exited with an error.
+//
+// It is false while the session runs and false when it finishes successfully,
+// which is what lets a caller tell "this stream is broken" from "this stream is
+// over" - the first is worth ending early, the second must keep serving its last
+// segments.
+func (s *Session) Failed() bool {
+	select {
+	case <-s.done:
+		return s.Err() != nil
+	default:
+		return false
+	}
+}
+
 // Err reports why the session ended, if it failed.
 func (s *Session) Err() error {
 	s.mu.Lock()
@@ -680,13 +695,28 @@ func (m *Manager) Reap(now time.Time) int {
 	var stale []string
 	for id, session := range m.sessions {
 		if now.Sub(session.LastAccess()) > m.cfg.SessionTTL {
+			m.cfg.Logger.Info("reaping idle streaming session", "session_id", id)
+			stale = append(stale, id)
+			continue
+		}
+		// A session whose ffmpeg died is also finished with, however recently a
+		// client touched it. hls.js keeps polling a playlist that will never be
+		// completed, and every poll is a touch, so the idle rule never fires and
+		// the slot is held while the viewer watches a stalled player (S-9 of the
+		// 2026-10-09 review).
+		//
+		// Only a *failed* session is reaped here. A session that finished
+		// successfully has a complete playlist with #EXT-X-ENDLIST, and a client
+		// still fetching its last segments must keep being served.
+		if session.Failed() {
+			m.cfg.Logger.Warn("reaping a streaming session whose encoder died",
+				"session_id", id, "error", session.Err())
 			stale = append(stale, id)
 		}
 	}
 	m.mu.Unlock()
 
 	for _, id := range stale {
-		m.cfg.Logger.Info("reaping idle streaming session", "session_id", id)
 		m.Stop(id)
 	}
 	return len(stale)
@@ -724,6 +754,16 @@ func (m *Manager) ServeFile(w http.ResponseWriter, r *http.Request, sessionID, n
 	session, ok := m.Session(sessionID)
 	if !ok {
 		http.Error(w, "streaming session not found", http.StatusNotFound)
+		return
+	}
+
+	// A failed session is Gone rather than 404: the client had a session and it
+	// broke, and it needs to know that so it can renegotiate instead of retrying a
+	// playlist that will never grow. The check is before touch(), because a poll
+	// for a dead session is not evidence that anybody is watching it.
+	if session.Failed() {
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "the stream failed: "+session.Err().Error(), http.StatusGone)
 		return
 	}
 	session.touch()

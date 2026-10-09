@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -702,5 +704,146 @@ exit 1
 			t.Fatalf("one failed session should count exactly once; metrics were:\n%s", rendered)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestManager_ReapsASessionWhoseEncoderDied is the regression test for S-9.
+//
+// Reap looked only at lastAccess. When ffmpeg dies mid-film it never writes
+// #EXT-X-ENDLIST, so hls.js keeps polling the playlist - and every poll calls
+// touch(), which made the session look busy forever. The slot stayed held and the
+// viewer watched a player that would never advance.
+//
+// The session here is touched *now* and has a minute of TTL, so the idle rule
+// cannot fire. Only the failure rule can.
+func TestManager_ReapsASessionWhoseEncoderDied(t *testing.T) {
+	t.Parallel()
+
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		RootDir:    t.TempDir(),
+		SessionTTL: time.Minute,
+		Logger:     newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	done := make(chan struct{})
+	close(done)
+	session := &Session{
+		ID:         "died",
+		Dir:        t.TempDir(),
+		done:       done,
+		cancel:     func() {},
+		startedAt:  time.Now().Add(-time.Minute),
+		lastAccess: time.Now(), // touched just now, by the poll that keeps it alive
+		runErr:     errors.New("ffmpeg exited with status 1"),
+	}
+
+	manager.mu.Lock()
+	manager.sessions["died"] = session
+	manager.mu.Unlock()
+
+	if !session.Failed() {
+		t.Fatal("a session whose process exited with an error does not report Failed")
+	}
+	if reaped := manager.Reap(time.Now()); reaped != 1 {
+		t.Fatalf("reaped %d sessions, want 1: a session whose encoder died is finished "+
+			"with however recently it was touched", reaped)
+	}
+	if _, ok := manager.Session("died"); ok {
+		t.Error("the failed session is still registered")
+	}
+}
+
+// TestManager_KeepsASessionThatFinishedCleanly guards the other direction. A
+// session that produced a complete playlist must keep serving its last segments
+// to a client that is still fetching them, so it is not reaped for being done.
+func TestManager_KeepsASessionThatFinishedCleanly(t *testing.T) {
+	t.Parallel()
+
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		RootDir:    t.TempDir(),
+		SessionTTL: time.Minute,
+		Logger:     newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	done := make(chan struct{})
+	close(done)
+	session := &Session{
+		ID:         "finished",
+		Dir:        t.TempDir(),
+		done:       done,
+		cancel:     func() {},
+		startedAt:  time.Now().Add(-time.Minute),
+		lastAccess: time.Now(),
+		runErr:     nil, // a clean exit
+	}
+
+	manager.mu.Lock()
+	manager.sessions["finished"] = session
+	manager.mu.Unlock()
+
+	if session.Failed() {
+		t.Error("a session that finished successfully reports Failed")
+	}
+	if reaped := manager.Reap(time.Now()); reaped != 0 {
+		t.Errorf("reaped %d sessions, want 0: a completed playlist must keep serving "+
+			"until the client stops asking for it", reaped)
+	}
+	if _, ok := manager.Session("finished"); !ok {
+		t.Error("a session that finished successfully was removed while it was still in use")
+	}
+}
+
+// TestManager_FailedSessionIsGoneNotNotFound pins what a client is told. A failed
+// stream answers 410 so the client renegotiates, rather than 404 which reads as "no
+// such session" or a 200 with a playlist that will never grow.
+func TestManager_FailedSessionIsGoneNotNotFound(t *testing.T) {
+	t.Parallel()
+
+	manager, err := NewManager(context.Background(), ManagerConfig{
+		RootDir:    t.TempDir(),
+		SessionTTL: time.Minute,
+		Logger:     newTestLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	t.Cleanup(manager.Close)
+
+	done := make(chan struct{})
+	close(done)
+	session := &Session{
+		ID:         "died",
+		Dir:        t.TempDir(),
+		done:       done,
+		cancel:     func() {},
+		startedAt:  time.Now(),
+		lastAccess: time.Now(),
+		runErr:     errors.New("ffmpeg exited with status 1"),
+	}
+	manager.mu.Lock()
+	manager.sessions["died"] = session
+	manager.mu.Unlock()
+
+	recorder := httptest.NewRecorder()
+	// A name the route accepts: the handler rejects anything outside its own
+	// pattern with a 404 before it looks at the session, so a made-up file name
+	// would test the pattern rather than the failure.
+	request := httptest.NewRequest(http.MethodGet, "/hls/died/master.m3u8", nil)
+	manager.ServeFile(recorder, request, "died", "master.m3u8")
+
+	if recorder.Code != http.StatusGone {
+		t.Errorf("status = %d, want 410: a session whose encoder died is gone, and the "+
+			"client has to know that to renegotiate", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "ffmpeg exited") {
+		t.Errorf("the 410 does not say why the stream failed: %q", recorder.Body.String())
 	}
 }
