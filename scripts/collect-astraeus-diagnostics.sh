@@ -427,12 +427,21 @@ run inside/ffmpeg-version.txt "$DOCKER" exec "$CONTAINER_ID" ffmpeg -version
 run inside/ffmpeg-encoders.txt "$DOCKER" exec "$CONTAINER_ID" ffmpeg -hide_banner -encoders
 run inside/ffmpeg-hwaccels.txt "$DOCKER" exec "$CONTAINER_ID" ffmpeg -hide_banner -hwaccels
 run inside/ffmpeg-devices.txt "$DOCKER" exec "$CONTAINER_ID" sh -c \
-    'echo "== /dev/dri =="; ls -l /dev/dri 2>&1; echo "== /dev/dri/by-path =="; ls -l /dev/dri/by-path 2>&1; echo "== /dev/nvidia* =="; ls -l /dev/nvidia* 2>&1; echo "== render nodes =="; ls /dev/dri/renderD* 2>&1; echo "== nvidia nodes =="; ls /dev/nvidia[0-9]* 2>&1'
+    'echo "== /dev/dri =="; /usr/bin/ls -l /dev/dri 2>&1; echo "== /dev/dri/by-path =="; /usr/bin/ls -l /dev/dri/by-path 2>&1; echo "== /dev/nvidia* =="; /usr/bin/ls -l /dev/nvidia* 2>&1; echo "== render nodes =="; /usr/bin/ls /dev/dri/renderD* 2>&1; echo "== nvidia nodes =="; /usr/bin/ls /dev/nvidia[0-9]* 2>&1'
 run inside/tesseract-version.txt "$DOCKER" exec "$CONTAINER_ID" tesseract --version
 run inside/identity-and-data.txt "$DOCKER" exec "$CONTAINER_ID" sh -c \
-    'id; echo "== /data =="; ls -la /data; echo "== /data/streams =="; ls -la /data/streams 2>/dev/null | head -50; echo "== /data/subtitles =="; ls -la /data/subtitles 2>/dev/null | head -50; echo "== processes =="; if command -v ps >/dev/null 2>&1; then ps -eo pid,ppid,etime,pcpu,pmem,args; else echo "ps is not installed; reading /proc instead"; for d in /proc/[0-9]*; do [ -r "$d/cmdline" ] || continue; printf "%s " "${d#/proc/}"; tr "\0" " " <"$d/cmdline"; echo; done; fi'
+    'id; echo "== /data =="; /usr/bin/ls -la /data; echo "== /data/streams =="; /usr/bin/ls -la /data/streams 2>/dev/null | head -50; echo "== /data/subtitles =="; /usr/bin/ls -la /data/subtitles 2>/dev/null | head -50; echo "== processes =="; if command -v ps >/dev/null 2>&1; then ps -eo pid,ppid,etime,pcpu,pmem,args; else echo "ps is not installed; reading /proc instead"; for d in /proc/[0-9]*; do [ -r "$d/cmdline" ] || continue; printf "%s " "${d#/proc/}"; tr "\0" " " <"$d/cmdline"; echo; done; fi'
 run inside/cgroup-memory.txt "$DOCKER" exec "$CONTAINER_ID" sh -c \
     'cat /sys/fs/cgroup/memory.max 2>/dev/null; cat /sys/fs/cgroup/memory.current 2>/dev/null; cat /sys/fs/cgroup/cpu.max 2>/dev/null; nproc'
+# Which userspace drivers the image actually carries. A statement about the
+# device is not enough for a hardware diagnosis: `--device /dev/dri` alone still
+# needs a VAAPI backend, and NVENC needs the libraries the NVIDIA container
+# toolkit injects. This is the difference between "not passed in" and "not
+# installed", and it is asked of the container rather than assumed.
+run inside/vaapi-drivers.txt "$DOCKER" exec "$CONTAINER_ID" sh -c \
+    'echo "== libva =="; /usr/bin/ls -l /usr/lib/x86_64-linux-gnu/libva*.so* 2>&1 | head; echo "== vaapi backends =="; /usr/bin/ls -l /usr/lib/x86_64-linux-gnu/dri/*_drv_video.so 2>&1; echo "== vainfo =="; command -v vainfo >/dev/null && vainfo 2>&1 | head -30 || echo "vainfo not installed"'
+run inside/nvidia-libs.txt "$DOCKER" exec "$CONTAINER_ID" sh -c \
+    'echo "== libnvidia-encode/libcuda =="; for d in /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/local/nvidia/lib64; do echo "-- $d"; /usr/bin/ls -l "$d"/libnvidia* "$d"/libcuda* 2>&1 | head -20; done; echo "== nvidia-smi =="; command -v nvidia-smi >/dev/null && nvidia-smi 2>&1 | head -20 || echo "nvidia-smi not in the image"'
 
 # --- 6. database and stream state -------------------------------------------
 say "[4/7] database snapshot"
@@ -445,7 +454,7 @@ if [ "$COPY_DB" = "1" ]; then
     # SQLite in WAL mode: copy all three files together, in one exec, so the
     # snapshot is not a torn read.
     if $DOCKER exec "$CONTAINER_ID" sh -c \
-        'rm -rf /tmp/astraeus-diag-db && mkdir -p /tmp/astraeus-diag-db && cp "$1" /tmp/astraeus-diag-db/ && for s in -wal -shm; do [ -f "$1$s" ] && cp "$1$s" /tmp/astraeus-diag-db/; done; ls -la /tmp/astraeus-diag-db' \
+        'rm -rf /tmp/astraeus-diag-db && mkdir -p /tmp/astraeus-diag-db && cp "$1" /tmp/astraeus-diag-db/ && for s in -wal -shm; do [ -f "$1$s" ] && cp "$1$s" /tmp/astraeus-diag-db/; done; /usr/bin/ls -la /tmp/astraeus-diag-db' \
         sh "$DB_PATH" \
         >"$STAGE/database/copy.log" 2>&1; then
         if $DOCKER cp "$CONTAINER_ID:/tmp/astraeus-diag-db/." "$STAGE/database/" >/dev/null 2>&1; then
@@ -516,7 +525,7 @@ mkdir -p "$STAGE/host"
     printf 'driver_nvidia_loaded=%s\n' "$(lsmod 2>/dev/null | grep -c '^nvidia')"
 } >"$STAGE/host/host.txt"
 run host/lspci-vga.txt sh -c "lspci -nnk 2>/dev/null | grep -A3 -iE 'vga|3d|display' || true"
-run host/dri-nodes.txt sh -c "ls -l /dev/dri 2>&1; echo '---'; for d in /dev/dri/renderD*; do [ -e \"\$d\" ] || continue; echo \"== \$d\"; (command -v vainfo >/dev/null && vainfo --display drm --device \"\$d\" 2>&1 | head -40) || echo 'vainfo not installed'; done"
+run host/dri-nodes.txt sh -c "/usr/bin/ls -l /dev/dri 2>&1; echo '---'; for d in /dev/dri/renderD*; do [ -e \"\$d\" ] || continue; echo \"== \$d\"; (command -v vainfo >/dev/null && vainfo --display drm --device \"\$d\" 2>&1 | head -40) || echo 'vainfo not installed'; done"
 run host/nvidia-smi.txt sh -c "command -v nvidia-smi >/dev/null && nvidia-smi 2>&1 || echo 'nvidia-smi not installed (no NVIDIA driver userspace on this host)'"
 run host/nvidia-container-toolkit.txt sh -c "command -v nvidia-ctk >/dev/null && nvidia-ctk --version 2>&1 || echo 'nvidia-ctk not installed'; echo '---'; cat /etc/nvidia-container-runtime/config.toml 2>/dev/null || echo 'no /etc/nvidia-container-runtime/config.toml'"
 run host/docker-info.txt sh -c "$DOCKER info 2>&1 | grep -iE 'runtime|nvidia|driver|server version|storage driver|cgroup|kernel|operating system|architecture' || true"
@@ -526,8 +535,8 @@ run host/docker-runtimes.txt sh -c "$DOCKER info --format '{{json .Runtimes}}' 2
 # most likely explanation for "the GPU is not being used", so put both answers
 # side by side where a reader cannot miss the disagreement.
 {
-    printf 'host render nodes: %s\n' "$(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
-    printf 'host nvidia devices: %s\n' "$(ls /dev/nvidia* 2>/dev/null | tr '\n' ' ')"
+    printf 'host render nodes: %s\n' "$(/usr/bin/ls /dev/dri 2>/dev/null | tr '\n' ' ')"
+    printf 'host nvidia devices: %s\n' "$(/usr/bin/ls /dev/nvidia* 2>/dev/null | tr '\n' ' ')"
     printf 'host nvidia-smi: %s\n' "$(command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | tr '\n' '; ' || printf 'absent')"
     printf 'host docker runtimes: %s\n' "$($DOCKER info --format '{{json .Runtimes}}' 2>/dev/null)"
     printf 'container devices (HostConfig.Devices): %s\n' "$(container_field "$CONTAINER_ID" '{{json .HostConfig.Devices}}')"

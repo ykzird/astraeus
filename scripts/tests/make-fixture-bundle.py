@@ -81,6 +81,25 @@ w("inside/ffmpeg-encoders.txt", """# command: docker exec abc123 ffmpeg -hide_ba
  V....D h264_qsv             H.264/AVC (Intel Quick Sync Video)
  V....D libx264              libx264 H.264
 """)
+w("inside/vaapi-drivers.txt", """# command: docker exec abc123 sh -c ...
+# exit: 0
+== libva ==
+lrwxrwxrwx 1 root root 17 Dec 29  2022 /usr/lib/x86_64-linux-gnu/libva.so.2 -> libva.so.2.1700.0
+== vaapi backends ==
+/usr/bin/ls: cannot access '/usr/lib/x86_64-linux-gnu/dri/*_drv_video.so': No such file or directory
+== vainfo ==
+vainfo not installed
+""")
+w("inside/nvidia-libs.txt", """# command: docker exec abc123 sh -c ...
+# exit: 0
+== libnvidia-encode/libcuda ==
+-- /usr/lib/x86_64-linux-gnu
+/usr/bin/ls: cannot access '/usr/lib/x86_64-linux-gnu/libnvidia*': No such file or directory
+-- /usr/local/nvidia/lib64
+/usr/bin/ls: cannot access '/usr/local/nvidia/lib64/libnvidia*': No such file or directory
+== nvidia-smi ==
+nvidia-smi not in the image
+""")
 w("api/capabilities.json", json.dumps({
     "ffmpeg": True, "ffprobe": True, "image_subtitles": "read as text",
     "subtitle_ocr_enabled": True, "render_node": "/dev/dri/renderD128",
@@ -120,8 +139,8 @@ log = "\n".join([
     '2026-10-09T21:00:02.000000000Z level=INFO msg="probing hardware encoders" families=5',
     '2026-10-09T21:00:03.000000000Z level=WARN msg="hardware encoder rejected" encoder=h264_nvenc reason="Cannot load libnvidia-encode.so.1"',
     '2026-10-09T21:00:04.000000000Z level=WARN msg="hardware encoder rejected" encoder=h264_qsv reason="Device creation failed: -2"',
-    '2026-10-09T21:00:05.000000000Z level=INFO msg="hardware encoder accepted" encoder=h264_vaapi',
-    '2026-10-09T21:00:05.500000000Z level=INFO msg="hardware encoder accepted" encoder=hevc_vaapi',
+    '2026-10-09T21:00:05.000000000Z level=INFO msg="hardware encoder verified" encoder=h264_vaapi',
+    '2026-10-09T21:00:05.500000000Z level=INFO msg="hardware encoder verified" encoder=hevc_vaapi',
     '2026-10-09T21:00:06.000000000Z level=INFO msg="image_subtitles=\\"read as text\\" subtitle_ocr_enabled=true"',
     '2026-10-09T21:05:00.000000000Z level=INFO msg="http request" method=GET path=/api/health status=200',
     '2026-10-09T21:06:00.000000000Z level=ERROR msg="stream start failed" code=stream_start_failed error="Impossible to convert between the formats supported by the filter \'Parsed_scale2ref_3\'"',
