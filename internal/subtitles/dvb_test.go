@@ -67,7 +67,7 @@ func readDVBSubtitlePackets(t *testing.T) [][]byte {
 			if block == nil || block.id != matroskaBlock {
 				continue
 			}
-			track, _, payload, err := readMatroskaBlock(block.body, false)
+			track, _, payload, err := readMatroskaBlock(block.body, block.id)
 			if err != nil {
 				t.Fatalf("reading a block: %v", err)
 			}

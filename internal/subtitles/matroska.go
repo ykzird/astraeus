@@ -132,7 +132,7 @@ func demuxMatroskaVobSub(r io.Reader) (matroskaSubtitleTrack, []vobsubCue, error
 			if block == nil || (block.id != matroskaSimpleBlk && block.id != matroskaBlock) {
 				continue
 			}
-			number, relative, payload, err := readMatroskaBlock(block.body, block.id == matroskaSimpleBlk)
+			number, relative, payload, err := readMatroskaBlock(block.body, block.id)
 			if err != nil {
 				return matroskaSubtitleTrack{}, nil, err
 			}
@@ -149,24 +149,69 @@ func demuxMatroskaVobSub(r io.Reader) (matroskaSubtitleTrack, []vobsubCue, error
 }
 
 // readMatroskaBlock splits a block into its track number, its timestamp
-// relative to the cluster and its payload. A block header is a variable-length
-// track number and a signed 16-bit relative timestamp; a SimpleBlock carries a
-// flags byte after them, which this reader does not need but does skip so the
-// payload starts in the right place.
-func readMatroskaBlock(body []byte, simple bool) (uint64, int64, []byte, error) {
-	number, n := binary.Uvarint(body)
-	if n <= 0 || len(body) < n+2 {
+// relative to the cluster and its payload.
+//
+// A block header is an EBML variable-length integer for the track number, a
+// signed 16-bit timestamp relative to the cluster, and a flags byte. Both
+// element types carry the flags byte - a SimpleBlock and the Block inside a
+// BlockGroup are the same structure - and both parts were wrong here (L-2 of the
+// 2026-10-09 review):
+//
+//   - the track number was read with binary.Uvarint, which decodes the
+//     protobuf/LEB128 varint and not the EBML vint. EBML marks a vint's length
+//     with the position of its first set bit and includes that marker in the
+//     value, so 0x81 is one byte meaning 1 (not 129), and 0x40 0x02 is two bytes
+//     meaning 2 (not 64, with a stray 0x02 left over);
+//   - the flags byte was skipped only for a SimpleBlock, so a Block was read two
+//     bytes short and its payload started inside the timestamp.
+//
+// The two errors cancelled each other out only while the cluster-relative
+// timestamp stayed under 256 ms, which is why a five-cue fixture came back with
+// two cues.
+func readMatroskaBlock(body []byte, id uint64) (uint64, int64, []byte, error) {
+	number, n, err := readEBMLVint(body)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	if len(body) < n+3 {
 		return 0, 0, nil, fmt.Errorf("%w: a %d-byte Matroska block is too short", ErrInvalidVobSub, len(body))
 	}
 	relative := int64(int16(binary.BigEndian.Uint16(body[n : n+2])))
-	payloadAt := n + 2
-	if simple {
-		payloadAt++
-	}
-	if payloadAt > len(body) {
-		return 0, 0, nil, fmt.Errorf("%w: a %d-byte Matroska block has no payload", ErrInvalidVobSub, len(body))
-	}
+	payloadAt := n + 3 // the timestamp, then the flags byte both types carry
 	return number, relative, body[payloadAt:], nil
+}
+
+// readEBMLVint decodes an EBML variable-length integer and reports how many
+// bytes it occupied.
+//
+// The first byte's leading zero bits say how long the integer is - one to eight
+// bytes, marked by the first set bit. That marker is part of the stored value
+// and is masked off, which is what makes 0x81 mean 1 and 0x40 0x02 mean 2.
+func readEBMLVint(body []byte) (uint64, int, error) {
+	if len(body) == 0 {
+		return 0, 0, fmt.Errorf("%w: a Matroska block has no track number", ErrInvalidVobSub)
+	}
+
+	first := body[0]
+	if first == 0 {
+		// 0x00 would announce a nine-byte integer, which the format does not have.
+		return 0, 0, fmt.Errorf("%w: a Matroska track number starts with a zero byte", ErrInvalidVobSub)
+	}
+
+	length := 1
+	for mask := byte(0x80); mask != 0 && first&mask == 0; mask >>= 1 {
+		length++
+	}
+	if len(body) < length {
+		return 0, 0, fmt.Errorf("%w: a %d-byte Matroska block holds a %d-byte track number",
+			ErrInvalidVobSub, len(body), length)
+	}
+
+	value := uint64(first &^ (0x80 >> (length - 1)))
+	for i := 1; i < length; i++ {
+		value = value<<8 | uint64(body[i])
+	}
+	return value, length, nil
 }
 
 func decodeUint(body []byte) uint64 {
