@@ -679,6 +679,36 @@ func hdrPixelFormatCandidates(encoder string) []string {
 	}
 }
 
+// forcedIDRFlag returns the per-family option that makes a forced keyframe an
+// actual IDR frame, or nil for encoders that need none.
+//
+// The two are not the same thing, and only an IDR frame is a key the HLS muxer
+// will cut at. NVENC spells it -forced-idr and QSV and AMF spell it -forced_idr;
+// all three default to false, so a forced keyframe that is not an IDR frame is
+// simply not a key, and the muxer falls back to the encoder's native GOP - which
+// is the slow-first-segment problem -force_key_frames exists to remove (S-15 of
+// the 2026-10-09 review).
+//
+// Software encoders and VAAPI are deliberately absent: their forced keyframes
+// are already the frame the muxer cuts on, and on this host both cut at exactly
+// 2.000 s with no flag at all. Passing a flag an encoder does not know is an
+// error rather than a no-op, which is why this is a table of spellings and not a
+// single unconditional option.
+//
+// The spellings for NVENC, QSV and AMF are reasoned from their documented option
+// sets rather than measured, because this project has run none of them on
+// hardware.
+func forcedIDRFlag(encoder string) []string {
+	switch {
+	case strings.HasSuffix(encoder, "_nvenc"):
+		return []string{"-forced-idr", "1"}
+	case strings.HasSuffix(encoder, "_qsv"), strings.HasSuffix(encoder, "_amf"):
+		return []string{"-forced_idr", "1"}
+	default:
+		return nil
+	}
+}
+
 // encoderCanCarryHDR reports whether an ffmpeg encoder produces a codec that
 // can deliver high dynamic range.
 //

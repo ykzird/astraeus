@@ -368,6 +368,45 @@ func TestBuildFFmpegArgs(t *testing.T) {
 			wantParts: []string{"-c:v libx264", "-crf 21", "-vf scale=-2:720", "-c:a aac", "-b:a 192k"},
 		},
 		{
+			// S-15: a forced keyframe on NVENC is not an IDR frame unless the
+			// family's own flag says so, and only an IDR frame is a key the HLS
+			// muxer cuts at. NVENC spells it with a hyphen.
+			name: "nvenc gets its forced-idr spelling",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+			},
+			cfg:       ManagerConfig{SegmentSeconds: 6, Server: ServerCapability{VideoEncoders: []string{"h264_nvenc"}, AudioEncoders: []string{"aac"}}},
+			wantParts: []string{"-c:v h264_nvenc", "-forced-idr 1", "-force_key_frames expr:gte(t,n_forced*6)"},
+		},
+		{
+			// QSV and AMF spell the same option with an underscore.
+			name: "qsv gets its forced_idr spelling",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+			},
+			cfg:       ManagerConfig{SegmentSeconds: 6, Server: ServerCapability{VideoEncoders: []string{"h264_qsv"}, AudioEncoders: []string{"aac"}}},
+			wantParts: []string{"-c:v h264_qsv", "-forced_idr 1"},
+			denyParts: []string{"-forced-idr"},
+		},
+		{
+			// The encoders that already cut where they are told must not be
+			// given an option they do not know: ffmpeg treats an unknown
+			// option as an error, not a no-op.
+			name: "software and vaapi get no forced-IDR flag",
+			decision: Decision{
+				Mode: ModeTranscode, Deliverable: true,
+				VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+				TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+			},
+			cfg:       ManagerConfig{SegmentSeconds: 6, Server: ServerCapability{VideoEncoders: []string{"libx264", "h264_vaapi"}, AudioEncoders: []string{"aac"}}},
+			wantParts: []string{"-force_key_frames expr:gte(t,n_forced*6)"},
+			denyParts: []string{"-forced-idr", "-forced_idr"},
+		},
+		{
 			// S-7 of the 2026-10-09 review. ffmpeg's "opus" is its native
 			// experimental encoder, which refuses to run without -strict -2;
 			// the encoder that works is "libopus". NegotiatorForServer now
@@ -1970,6 +2009,13 @@ func TestBuildFFmpegArgs_Ladder(t *testing.T) {
 			t.Errorf("ladder command line is missing %q:\n%s", want, joined)
 		}
 	}
+	// libx264 needs no forced-IDR flag: it already produces the frame the muxer
+	// cuts on. Adding one would be passing an option it does not know (S-15).
+	for _, unwanted := range []string{"-forced-idr", "-forced_idr"} {
+		if strings.Contains(joined, unwanted) {
+			t.Errorf("a software ladder must not carry %q:\n%s", unwanted, joined)
+		}
+	}
 	// Each rung maps the source once; two rungs and one audio stream each is
 	// four maps, and any fewer would feed a rung the wrong input.
 	if got := strings.Count(joined, "-map 0:v:0"); got != 2 {
@@ -2289,5 +2335,47 @@ func TestBuildFFmpegArgs_BurnsAnImageSubtitle(t *testing.T) {
 	}
 	if strings.Contains(line, "-vf") {
 		t.Errorf("-vf cannot share an output with -filter_complex:\n%s", line)
+	}
+}
+
+// TestBuildFFmpegArgs_HardwareLadderCarriesTheForcedIDRSpellingPerRendition
+// guards the ladder spelling for S-15.
+//
+// Every encoder option on a ladder needs a stream specifier, or it lands on the
+// first video stream and the remaining rungs keep the native GOP - the exact
+// problem the forced keyframe exists to remove, left in place for every rung but
+// one.
+func TestBuildFFmpegArgs_HardwareLadderCarriesTheForcedIDRSpellingPerRendition(t *testing.T) {
+	t.Parallel()
+
+	args, err := BuildFFmpegArgs("/tmp/session", "/media/movie.mkv", Decision{
+		Mode: ModeTranscode, Deliverable: true,
+		VideoAction: ActionTranscode, AudioAction: ActionTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac",
+		Renditions: []Rendition{
+			{Height: 1080, BitrateKbps: 5000},
+			{Height: 720, BitrateKbps: 2500},
+		},
+	}, ManagerConfig{
+		SegmentSeconds: 4,
+		Server: ServerCapability{
+			VideoEncoders: []string{"h264_nvenc"},
+			AudioEncoders: []string{"aac"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildFFmpegArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
+
+	for _, want := range []string{"-forced-idr:0 1", "-forced-idr:1 1"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("a ladder rung is missing the specifier on %q:\n%s", want, joined)
+		}
+	}
+	// The unsuffixed form would apply to the first video stream only, which is
+	// what the specifier exists to avoid.
+	if strings.Contains(joined, "-forced-idr 1") {
+		t.Errorf("the forced-IDR flag was emitted without a specifier on a ladder:\n%s", joined)
 	}
 }

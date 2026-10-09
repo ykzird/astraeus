@@ -864,6 +864,17 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 			// first rung would be cut on the boundary.
 			args = append(args, "-force_key_frames"+videoStreamSuffix(len(plans), index),
 				fmt.Sprintf("expr:gte(t,n_forced*%d)", cfg.SegmentSeconds))
+			// Forcing a keyframe is not the same as forcing an IDR frame, and
+			// only an IDR frame is a key the HLS muxer can cut at. NVENC, QSV
+			// and AMF all default their forced-IDR flags to false, so without
+			// this the forced keyframes are not marked as key and the cut falls
+			// back to the encoder's native GOP - the slow-first-segment problem
+			// -force_key_frames exists to remove (S-15). Software and VAAPI need
+			// no flag: both produce a keyframe that is already what the muxer
+			// cuts on, measured at exactly 2.000 s on this host.
+			if flag := forcedIDRFlag(encoder); len(flag) > 0 {
+				args = append(args, flag[0]+videoStreamSuffix(len(plans), index), flag[1])
+			}
 		}
 	default:
 		return nil, fmt.Errorf("unsupported video action %q", decision.VideoAction)

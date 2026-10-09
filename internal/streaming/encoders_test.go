@@ -1139,3 +1139,51 @@ func TestCodecCanCarryHDR(t *testing.T) {
 		}
 	}
 }
+
+// TestForcedIDRFlag covers the per-family spelling for S-15.
+//
+// Forcing a keyframe and forcing an IDR frame are different things, and only an
+// IDR frame is a key the HLS muxer cuts at. NVENC, QSV and AMF default their
+// forced-IDR flags to false, so without these the forced keyframes are not
+// marked as key and the cut falls back to the native GOP - the slow first
+// segment -force_key_frames exists to remove.
+//
+// The spellings are reasoned from each family's documented options rather than
+// measured, because none of the three has run on hardware here.
+func TestForcedIDRFlag(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		encoder string
+		want    []string
+	}{
+		{encoder: "h264_nvenc", want: []string{"-forced-idr", "1"}},
+		{encoder: "hevc_nvenc", want: []string{"-forced-idr", "1"}},
+		{encoder: "h264_qsv", want: []string{"-forced_idr", "1"}},
+		{encoder: "hevc_qsv", want: []string{"-forced_idr", "1"}},
+		{encoder: "h264_amf", want: []string{"-forced_idr", "1"}},
+		// Nothing to add: these already produce the frame the muxer cuts on,
+		// and an option the encoder does not know is an error, not a no-op.
+		{encoder: "h264_vaapi"},
+		{encoder: "libx264"},
+		{encoder: "libx265"},
+		{encoder: "libvpx-vp9"},
+		{encoder: "h264_videotoolbox"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.encoder, func(t *testing.T) {
+			t.Parallel()
+
+			got := forcedIDRFlag(tt.encoder)
+			if len(got) != len(tt.want) {
+				t.Fatalf("forcedIDRFlag(%q) = %v, want %v", tt.encoder, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("forcedIDRFlag(%q) = %v, want %v", tt.encoder, got, tt.want)
+				}
+			}
+		})
+	}
+}
