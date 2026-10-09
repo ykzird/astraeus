@@ -227,6 +227,9 @@ func runServe(args []string) error {
 		"bearer token for token mode; prefer setting ASTRAEUS_AUTH_TOKEN over passing it as an argument")
 	authExempt := fs.String("auth-exempt", "/api/health",
 		"paths that bypass the access gate (comma separated, exact matches)")
+	accessPolicy := fs.String("access-policy", "",
+		"access policy file: which libraries each viewer may see, and who may change the library "+
+			"(empty means every admitted viewer sees and may change everything)")
 	rateLimit := fs.Float64("rate-limit", 0,
 		"API requests per second allowed per client (0 disables; only /api paths are limited)")
 	rateLimitBurst := fs.Int("rate-limit-burst", 0,
@@ -278,6 +281,25 @@ func runServe(args []string) error {
 		return err
 	}
 
+	// The access policy is what turns a gate that admits a request into one that
+	// decides what the request may see. It is optional: without a file every
+	// admitted viewer sees every library, which is what an install has always
+	// done. A file that cannot be read is an error rather than a fallback,
+	// because starting open when the operator asked for restricted is the one
+	// failure mode this must not have.
+	var policy *access.Policy
+	if *accessPolicy != "" {
+		policy, err = access.LoadPolicy(*accessPolicy)
+		if err != nil {
+			return err
+		}
+		app.logger.Info("access policy loaded",
+			"path", policy.Source(),
+			"viewers", policy.Viewers(),
+			"admins", policy.Admins(),
+			"default", map[bool]string{true: "all", false: "none"}[policy.DefaultAll()])
+	}
+
 	if *enrichInterval > 0 {
 		worker := metadata.NewWorker(app.repo, app.provider, *enrichInterval, app.logger)
 		worker.SetMetrics(metrics)
@@ -296,6 +318,7 @@ func runServe(args []string) error {
 		Scheduler:  scheduler,
 		Worker:     app.worker,
 		Metrics:    metrics,
+		Policy:     policy,
 		WebDir:     *webDir,
 		Logger:     app.logger,
 	}

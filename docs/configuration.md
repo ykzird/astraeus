@@ -134,6 +134,48 @@ the gate is doing.
 A browser cannot attach a bearer token to a plain navigation, so browser access
 belongs behind `proxy` mode; `token` mode suits clients and automation.
 
+### Which libraries a viewer may see
+
+The gate decides whether a request is admitted. `--access-policy` decides what an
+admitted viewer may see and change, which is what makes more than one person
+share an install:
+
+```
+# /etc/astraeus/access-policy.conf
+default: none            # an unlisted viewer sees nothing (the default)
+admin: jok@example.com   # may scan, enrich, add and remove libraries
+
+jok@example.com: *       # "*" is every library, including ones added later
+alice@example.com: Movies, Documentaries
+bob@example.com: Kids    # a name, matched case-insensitively
+```
+
+```sh
+./astraeus-server serve --auth-mode proxy --trusted-proxy 127.0.0.1/32 \
+  --access-policy /etc/astraeus/access-policy.conf
+```
+
+Four things are worth knowing:
+
+- **Without a file, nothing changes.** Every admitted viewer sees and may change
+  every library, which is what an install has always done. A file that cannot be
+  read or parsed is an error and the server refuses to start, because starting
+  open when the operator asked for restricted is the one failure that matters.
+- **A grant is a name or an id.** A name is matched case-insensitively, an id
+  exactly, and a name that does not exist yet is not an error — it matches
+  nothing until the library is added. `*` means every library, present and future.
+- **Visibility and administration are separate.** An admin may scan, enrich and
+  change libraries; that grants nothing to look at. The operator above is granted
+  both deliberately. A hidden library is reported as **404, not 403**, so the API
+  is not a way to discover which libraries exist.
+- **Changing the file needs a restart.** The policy is read once at startup and
+  the loaded policy is named on the startup line (`viewers=2 admins=1
+  default=none`), so a typo in a path is visible rather than silent.
+
+Only the visibility of a library is enforced per viewer. What a viewer may do
+*inside* a library it can see — play anything in it, report progress on it — is
+not restricted further, and there is no per-library administration.
+
 ## Rate limiting
 
 `--rate-limit` (requests per second per client, default `0` = off) bounds how

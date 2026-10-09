@@ -84,6 +84,10 @@ type Deps struct {
 	// Subtitles converts text subtitle tracks to WebVTT. When nil, no subtitle
 	// tracks are advertised.
 	Subtitles SubtitleConverter
+	// Policy decides which libraries a viewer may see and who may change the
+	// library. A nil Policy permits everything, which is what an install that
+	// has not written one has always done.
+	Policy *access.Policy
 	// WebDir is a directory of static UI assets served at /. When it is empty
 	// or missing, only the API is served.
 	WebDir string
@@ -111,6 +115,7 @@ type Server struct {
 	metrics   *observability.Metrics
 	subtitles SubtitleConverter
 	webFS     http.Handler
+	policy    *access.Policy
 	rateLimit func(http.Handler) http.Handler
 	tracer    *tracing.Tracer
 	logger    *slog.Logger
@@ -134,6 +139,7 @@ func NewServer(deps Deps) *Server {
 		images:    deps.Images,
 		metrics:   deps.Metrics,
 		subtitles: deps.Subtitles,
+		policy:    deps.Policy,
 		rateLimit: deps.RateLimit,
 		tracer:    deps.Tracer,
 		logger:    logger,
@@ -351,7 +357,7 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListLibraries(w http.ResponseWriter, r *http.Request) {
-	libraries, err := s.repo.ListLibraries(r.Context())
+	libraries, err := s.access(r).libraries(r.Context())
 	if err != nil {
 		s.writeRepoError(w, r, err, "listing libraries")
 		return
@@ -366,6 +372,10 @@ type createLibraryRequest struct {
 }
 
 func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
 	var req createLibraryRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -418,7 +428,7 @@ func (s *Server) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetLibrary(w http.ResponseWriter, r *http.Request) {
-	lib, err := s.repo.GetLibrary(r.Context(), r.PathValue("id"))
+	lib, err := s.access(r).library(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting library")
 		return
@@ -427,6 +437,10 @@ func (s *Server) handleGetLibrary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteLibrary(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
 	if err := s.repo.DeleteLibrary(r.Context(), r.PathValue("id")); err != nil {
 		s.writeRepoError(w, r, err, "deleting library")
 		return
@@ -435,6 +449,12 @@ func (s *Server) handleDeleteLibrary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleScanLibrary(w http.ResponseWriter, r *http.Request) {
+	// Scanning writes to the library, so it is an admin operation rather than a
+	// visible one: an admin may scan a library it cannot see.
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
 	lib, err := s.repo.GetLibrary(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting library")
@@ -452,6 +472,10 @@ func (s *Server) handleScanLibrary(w http.ResponseWriter, r *http.Request) {
 // handleScanAll re-scans every registered library in one pass. It is the manual
 // override for the periodic scheduler.
 func (s *Server) handleScanAll(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
 	if s.scheduler == nil {
 		writeError(w, http.StatusServiceUnavailable, "scanning_unavailable",
 			"scanning every library is not configured on this server")
@@ -467,15 +491,10 @@ func (s *Server) handleScanAll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListLibraryEntities(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	// Check the library exists so an unknown id is a 404 rather than an
-	// indistinguishable empty list.
-	if _, err := s.repo.GetLibrary(r.Context(), id); err != nil {
-		s.writeRepoError(w, r, err, "getting library")
-		return
-	}
-
-	entities, err := s.repo.ListEntitiesByLibrary(r.Context(), id)
+	// The accessor looks the library up first, so an unknown id is a 404 rather
+	// than an indistinguishable empty list - and a library this viewer may not
+	// see answers exactly the same way.
+	entities, err := s.access(r).entitiesInLibrary(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "listing entities")
 		return
@@ -484,7 +503,7 @@ func (s *Server) handleListLibraryEntities(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleListEntities(w http.ResponseWriter, r *http.Request) {
-	entities, err := s.repo.ListEntities(r.Context())
+	entities, err := s.access(r).entities(r.Context())
 	if err != nil {
 		s.writeRepoError(w, r, err, "listing entities")
 		return
@@ -534,18 +553,22 @@ func newProgressResource(progress *library.PlaybackProgress) *progressResource {
 
 func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	entity, err := s.repo.GetEntity(ctx, r.PathValue("id"))
+	// Everything below is read through the scoped view, so an entity in a
+	// library this viewer may not see is a 404 here exactly as an unknown id is.
+	scoped := s.access(r)
+
+	entity, err := scoped.entity(ctx, r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity")
 		return
 	}
 
-	objects, err := s.repo.GetObjectsByEntity(ctx, entity.ID)
+	objects, err := scoped.objects(ctx, entity.ID)
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity objects")
 		return
 	}
-	children, err := s.repo.ListChildren(ctx, entity.ID)
+	children, err := scoped.children(ctx, entity.ID)
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity children")
 		return
@@ -564,7 +587,7 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 		Progress: newProgressResource(progress),
 	}
 	if entity.ParentID != nil {
-		parent, err := s.repo.GetEntity(ctx, *entity.ParentID)
+		parent, err := scoped.entity(ctx, *entity.ParentID)
 		if err == nil {
 			parentResource := s.decorateEntity(*parent)
 			detail.Parent = &parentResource
@@ -578,6 +601,10 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnrich(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
 	result, err := s.worker.EnrichOnce(r.Context())
 	if err != nil {
 		s.writeRepoError(w, r, err, "enriching metadata")
@@ -660,13 +687,17 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entity, err := s.repo.GetEntity(ctx, r.PathValue("id"))
+	// Negotiation is a read of the entity and its objects, so it goes through
+	// the same scoped view the listings do: a viewer cannot start a session for
+	// a library it may not see, which is also what keeps the session URL from
+	// being a capability somebody else can replay.
+	entity, err := s.access(r).entity(ctx, r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity")
 		return
 	}
 
-	objects, err := s.repo.GetObjectsByEntity(ctx, entity.ID)
+	objects, err := s.access(r).objects(ctx, entity.ID)
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity objects")
 		return
@@ -893,8 +924,23 @@ func (s *Server) handleListProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A position outlives the grant that allowed it: revoking a viewer's access
+	// to a library must not leave that library's titles in their Continue
+	// watching list. Filtering after the query can return fewer rows than the
+	// limit asked for, which is the correct reading of a limit - but a viewer
+	// whose recent history is mostly hidden may need to play something visible
+	// before the list fills again.
+	scoped := s.access(r)
 	resources := make([]progressEntryResource, 0, len(entries))
 	for _, entry := range entries {
+		allowed, err := scoped.allowed(r.Context(), entry.Entity.LibraryID)
+		if err != nil {
+			s.writeRepoError(w, r, err, "checking playback progress")
+			return
+		}
+		if !allowed {
+			continue
+		}
 		resources = append(resources, progressEntryResource{
 			Entity:   s.decorateEntity(entry.Entity),
 			Progress: newProgressResource(&entry.Progress),
@@ -921,7 +967,10 @@ type progressRequest struct {
 func (s *Server) handleSaveProgress(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	entity, err := s.repo.GetEntity(ctx, r.PathValue("id"))
+	// A viewer may only report a position for something it can see; otherwise a
+	// hidden entity would be a way to probe what the server holds, and a
+	// revoked viewer could keep writing positions nobody can read.
+	entity, err := s.access(r).entity(ctx, r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting entity")
 		return
@@ -1008,6 +1057,10 @@ func (s *Server) handleStopStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Deliberately not scoped the way the playlist route is. Stopping is
+	// cleanup rather than a read, the session id is an unguessable UUID, and
+	// requiring the entity to be visible would leave a transcode running when a
+	// grant is revoked mid-session - the opposite of what a revocation should do.
 	s.streams.Stop(id)
 	s.logger.InfoContext(r.Context(), "streaming session stopped by request", "session_id", id)
 	w.WriteHeader(http.StatusNoContent)
@@ -1017,7 +1070,7 @@ func (s *Server) handleStopStream(w http.ResponseWriter, r *http.Request) {
 // needs. http.ServeFile handles range requests, without which seeking in a
 // large file would not work.
 func (s *Server) handleObjectFile(w http.ResponseWriter, r *http.Request) {
-	object, err := s.repo.GetObject(r.Context(), r.PathValue("id"))
+	object, err := s.access(r).object(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting media object")
 		return
@@ -1047,6 +1100,22 @@ func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 			"segmented streaming is not configured on this server")
 		return
 	}
+	// A session URL is a capability: whoever holds it can fetch the media. It is
+	// only handed to a viewer that was allowed to negotiate, but that viewer can
+	// pass it on and a grant can be revoked afterwards, so the playlist and
+	// segment route re-checks the library the session belongs to rather than
+	// trusting that the negotiation happened.
+	session, ok := s.streams.Session(r.PathValue("session"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "session_not_found",
+			"no streaming session with that id is running")
+		return
+	}
+	if _, err := s.access(r).entity(r.Context(), session.EntityID); err != nil {
+		s.writeRepoError(w, r, err, "serving a stream")
+		return
+	}
+
 	s.streams.ServeFile(w, r, r.PathValue("session"), r.PathValue("file"))
 }
 
@@ -1173,7 +1242,7 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	object, err := s.repo.GetObject(r.Context(), r.PathValue("id"))
+	object, err := s.access(r).object(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeRepoError(w, r, err, "getting media object")
 		return

@@ -106,6 +106,15 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Resumable playback over the API: `PUT`/`DELETE /api/entities/{id}/progress`,
       the stored position on the entity detail, and `GET /api/progress` for what is
       worth continuing
+- [x] **Per-viewer library access**: `--access-policy` maps each identity to the
+      libraries it may see, plus the identities that may change the library.
+      Enforced through one scoped view of the repository that every viewer-facing
+      read goes through, so a library the viewer may not see answers `404` and is
+      indistinguishable from one that does not exist. The playlist route
+      re-checks the library its session belongs to, Continue watching drops
+      positions whose grant has gone, and the mutating routes require an admin.
+      A policy in use denies by default, a file that will not parse stops the
+      server, and no file at all leaves an install unchanged
 - [x] Progress is per viewer: keyed on the identity the access gate attaches to
       the request, so two viewers of one film keep separate places, listings are
       scoped to the caller, and a pre-existing database keeps its rows under the
@@ -301,6 +310,14 @@ Status as of the current build. Evidence for each claim is the test suite
   treated as unrestricted, which can hand a browser a stream it cannot decode
   (see [`docs/configuration.md`](docs/configuration.md)). The failure surfaces as a stalled player rather than a
   clear error, so a client that guesses wrong has nothing to go on.
+- Artwork is not scoped per viewer: `/api/images` is a shared cache keyed by the
+  upstream path, so a poster can be fetched by anyone who knows its file name,
+  whichever library it belongs to. The exposure is limited to artwork of media
+  the requester cannot play, and the name only appears in a listing they cannot
+  read — but it is a gap rather than a non-issue.
+- The access policy is read once at startup, so adding a tester means editing the
+  file and restarting. That is deliberate for an operator-managed file; a reload
+  or a table would be the change if it stops being one.
 - `--auth-mode` defaults to `none`. That is right for a trusted LAN and wrong
   for anything reachable from the internet; use `proxy` or `token` before
   exposing it.

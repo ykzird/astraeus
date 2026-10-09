@@ -33,6 +33,10 @@ type fakeStreams struct {
 	stopped   []string
 	startErr  error
 	servedOut string
+	// sessionEntityID is the entity the running session belongs to. The real
+	// manager knows this because the playlist route re-checks the library, so a
+	// fake that forgot it would let a test pass a check that never happened.
+	sessionEntityID string
 }
 
 func (f *fakeStreams) Start(ctx context.Context, entityID, objectPath string, decision streaming.Decision) (*streaming.Session, error) {
@@ -47,6 +51,7 @@ func (f *fakeStreams) StartAt(_ context.Context, entityID, objectPath string, de
 	f.lastPath = objectPath
 	f.lastMode = decision.Mode
 	f.lastStart = startSeconds
+	f.sessionEntityID = entityID
 	return &streaming.Session{
 		ID:           "fake-session",
 		EntityID:     entityID,
@@ -60,7 +65,7 @@ func (f *fakeStreams) Session(id string) (*streaming.Session, bool) {
 	if id != "fake-session" {
 		return nil, false
 	}
-	return &streaming.Session{ID: id}, true
+	return &streaming.Session{ID: id, EntityID: f.sessionEntityID}, true
 }
 
 func (f *fakeStreams) Stop(id string) {

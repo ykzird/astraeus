@@ -1,9 +1,10 @@
 # Handoff
 
-**As of the round-15 work of 2026-10-09 — TLS and the reverse proxy, verified
-against a real one. 137 tracked files; `v0.17.0` and `v0.18.0` are released, so
-the in-tree version is `dev` and the next tag would be `v0.18.1`.** (`git log`
-names the commits. Round 15 added `deploy/tls/` and ran it: Caddy terminating
+**As of the round-16 work of 2026-10-09 — per-viewer library access. 141 tracked
+files; `v0.17.0` and `v0.18.0` are released, so the in-tree version is `dev` and
+the next tag would be `v0.18.1`.** (`git log` names the commits. Round 16 added
+`--access-policy`, which turns the gate from "may this request in" into "what may
+it see" (§6). Round 15 added `deploy/tls/` and ran it: Caddy terminating
 TLS, a client certificate as the viewer's identity, and the trust boundary the
 access gate depends on (§6). Round 14 added `scripts/load-verify/` and measured
 the API and the 1080p and 4K transcode paths
@@ -744,6 +745,41 @@ transcode actually runs for; the test that pins it failed first at exactly
 real and explainable rather than arithmetic: the server measures from ffmpeg
 starting, the client measures the whole round trip.
 
+**Per-viewer library access** landed as of round 16, as `--access-policy`: a file
+mapping each identity to the libraries it may see, plus an admin list. Until now
+the gate decided whether a request was admitted and nothing decided what it could
+read, so every admitted viewer saw the whole library. A policy in use denies by
+default; a hidden library answers `404` rather than `403`, so the API is not a way
+to enumerate what exists; and no policy at all leaves an install exactly as it
+was. Visibility and administration are separate grants — an admin may scan,
+enrich and change libraries without being able to see them — which is why an
+operator who wants both says both.
+
+It is enforced through one seam: a per-request scoped view of the repository that
+every viewer-facing read goes through, so an entity behind a library the viewer
+may not see is indistinguishable from one that does not exist, and a new handler
+that reads through the scoped view cannot forget the check. The playlist and
+segment route re-checks the library its session belongs to, because a session URL
+is a capability that can be passed on or outlive a grant. `DELETE
+/api/streams/{id}` deliberately does not, because stopping is cleanup and
+requiring visibility would leave a transcode running after a revocation. A
+position outliving its grant is filtered out of Continue watching, so revoking a
+library does not leave its titles in the list.
+
+Verified against a running server, not only in tests. With a policy granting one
+of two libraries by name, that viewer listed one library and three entities, was
+refused the other library's series with `404`, and was refused `403` on
+registering a library and on `POST /api/scan`, while the operator identity saw
+both libraries, all eight entities and registered one. A policy file that does not
+parse stops the server with the offending line number rather than starting open.
+
+**Artwork is not scoped.** `/api/images` is a shared cache keyed by the upstream
+path, so a poster can be fetched by anyone who knows its file name, whatever
+library it belongs to. The exposure is limited to artwork of media the requester
+cannot play, and discovery requires guessing a name that only appears in a
+listing they cannot read — but it is a real gap and is recorded rather than
+implied away.
+
 **TLS and the reverse proxy** are documented and verified as of round 15, in
 `deploy/tls/`: a Caddy configuration beside the unit that terminates TLS, sends
 the `Strict-Transport-Security` the server deliberately does not, and
@@ -1105,14 +1141,11 @@ surface. What is left:
    This is the natural continuation of round 8 and is smaller than it was: the
    pipeline, the routing and the fixture font all exist, so the work is one more
    decoder plus a fixture. See the OCR bullet in §8 for what is unverified.
-2. **Per-user *access*, if it is ever wanted.** Progress is per viewer now, but
-   the gate remains instance-wide: it admits a request, it does not decide what
-   the request may see, so every admitted viewer sees the whole library.
-3. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
+2. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise
    complete, and both need hardware or samples that do not exist on this host.
-4. **Validating an identity-aware proxy's assertion, if one is ever put in
+3. **Validating an identity-aware proxy's assertion, if one is ever put in
    front.** In `proxy` mode the gate believes `Tailscale-User-Login` or
    `Cf-Access-Authenticated-User-Email` from a trusted address, and neither is
    signed — so the whole control is that the proxy is the only path to the port

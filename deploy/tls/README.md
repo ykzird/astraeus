@@ -332,9 +332,10 @@ Everything above was run, not reasoned about: a Debian host serving
 
 ## Not covered
 
-- **Per-user libraries.** The gate admits a request; it does not decide what the
-  request may see. Every admitted viewer sees the whole library. Playback
-  progress is per viewer, access is not.
+- **What a viewer may do inside a library it can see.** `--access-policy`
+  decides which libraries each viewer may see and who may change the library —
+  see [`docs/configuration.md`](../../docs/configuration.md) — but within a
+  library a viewer can see, everything in it is available to them.
 - **Certificate lifecycle.** Nothing here revokes, rotates or audits a client
   certificate. `openssl` and a calendar are the whole toolchain.
 - **High availability.** One proxy, one server, one host. Several servers behind

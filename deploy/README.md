@@ -317,9 +317,13 @@ identity that wrote them was never recorded.
 
 ## Not covered yet
 
-- **Multiple users or per-user libraries.** The gate is instance-wide: it decides
-  whether a request is admitted, not what it may see, so every admitted user sees
-  the whole library. Playback progress is per viewer, but access is not.
+- **Per-library access is covered; anything finer is not.** `--access-policy`
+  decides which libraries a viewer may see and who may change the library, and a
+  hidden library answers `404` rather than advertising itself. What is still
+  absent: per-entity or per-tag permission, any notion of a role *inside* a
+  library a viewer can see, and self-service — the policy is a file an operator
+  writes, not something a client can ask for. See
+  [`docs/configuration.md`](../docs/configuration.md).
 - **Kubernetes manifests, Windows or macOS packaging.** Release archives are
   built for Linux, and the image is Linux-only; `scripts/build-release.sh` takes
   extra `goos/goarch` arguments if that changes.

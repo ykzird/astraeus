@@ -136,7 +136,11 @@ responses are exempt from the policy, which they could not act on.
 server speaks plain HTTP and browsers ignore the header there.
 
 ### 7.1 Authentication & Authorization
-*   **Access Model:** A single-gate, instance-wide access model.
+*   **Access Model:** A single gate that admits a request, plus an optional
+    per-viewer policy (`--access-policy`) deciding which libraries each viewer may
+    see and who may change the library. Visibility defaults to everything when no
+    policy is configured, so the single-gate model is what an install has until an
+    operator chooses otherwise.
 *   **Implementation:** Integration with **Tailscale** or **Cloudflare Access** for secure, identity-aware remote connectivity. No built-in user registration; access is managed by the administrator.
 
 ---
