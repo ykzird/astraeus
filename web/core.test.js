@@ -161,3 +161,46 @@ test("progressAction shares its thresholds with the UI", () => {
   assert.equal(core.RESUME_MIN_SECONDS, 5);
   assert.equal(core.FINISHED_FRACTION, 0.95);
 });
+
+test("resumeOffsetFor refuses anything the report path would call finished", () => {
+  // The two used to disagree: this refused only within half a second of the
+  // end, while progressAction cleared anything in the last 5%. A position the
+  // server has cleared must not be offered back.
+  const duration = 1000;
+  const finished = duration * core.FINISHED_FRACTION;
+
+  assert.equal(core.resumeOffsetFor({ position_seconds: finished, duration_seconds: duration }, true), 0);
+  assert.equal(core.resumeOffsetFor({ position_seconds: duration - 1, duration_seconds: duration }, true), 0);
+  assert.equal(core.resumeOffsetFor({ position_seconds: duration, duration_seconds: duration }, true), 0);
+
+  // And a position just short of that is still resumable.
+  assert.equal(
+    core.resumeOffsetFor({ position_seconds: finished - 1, duration_seconds: duration }, true),
+    finished - 1
+  );
+});
+
+test("resumeOffsetFor resumes a real position", () => {
+  assert.equal(
+    core.resumeOffsetFor({ position_seconds: 45 * 60, duration_seconds: 5400 }, true),
+    45 * 60
+  );
+});
+
+test("resumeOffsetFor refuses a position that is not worth resuming", () => {
+  assert.equal(core.resumeOffsetFor(null, true), 0);
+  assert.equal(core.resumeOffsetFor(undefined, true), 0);
+  assert.equal(core.resumeOffsetFor({ position_seconds: 2, duration_seconds: 5400 }, true), 0);
+  assert.equal(core.resumeOffsetFor({ position_seconds: NaN, duration_seconds: 5400 }, true), 0);
+  // A finished flag wins over a plausible position.
+  assert.equal(
+    core.resumeOffsetFor({ position_seconds: 600, duration_seconds: 5400, finished: true }, true),
+    0
+  );
+});
+
+test("resumeOffsetFor refuses a non-leaf entity", () => {
+  // A series or a season has no position of its own; resuming one would start
+  // playback on a container.
+  assert.equal(core.resumeOffsetFor({ position_seconds: 600, duration_seconds: 5400 }, false), 0);
+});

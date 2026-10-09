@@ -27,6 +27,8 @@
     formatClock, mediaTime, pad2, producedWindow, progressAction, sourceTime,
     subtitleDeliverable, subtitleNeedsBurn,
   } = window.AstraeusCore;
+  /* Aliased because the local wrapper below keeps the name call sites use. */
+  const { resumeOffsetFor: resumeOffsetFromProgress } = window.AstraeusCore;
 
   /* ── 1. DOM references ───────────────────────────────────────────────── */
 
@@ -2291,18 +2293,11 @@
   function resumeOffsetFor(entity) {
     const detail = state.detail;
     if (!detail || !detail.entity || detail.entity.id !== entity.id) return 0;
-    if (!isLeafType(entity.type)) return 0;
-    const progress = detail.progress;
-    if (!progress || typeof progress !== "object") return 0;
-    if (progress.finished === true) return 0;
-    const position = Number(progress.position_seconds);
-    if (!isFinite(position) || position < RESUME_MIN_SECONDS) return 0;
-    /* A stored position can outlive the file it was measured against — a
-       different release of the same film, say — and the server rejects a start
-       at or past the end outright. Refusing to resume is the honest answer. */
-    const duration = Number(progress.duration_seconds);
-    if (isFinite(duration) && duration > 0 && position >= duration - 0.5) return 0;
-    return position;
+    /* The decision itself is pure and lives in core.js, next to the report
+       path's, because the two used to disagree: a position in the last half
+       second was "too near the end to resume" here while the report path called
+       anything in the last 5% finished. One rule now decides both. */
+    return resumeOffsetFromProgress(detail.progress, isLeafType(entity.type));
   }
 
   /**

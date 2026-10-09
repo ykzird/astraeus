@@ -160,11 +160,43 @@
     return "save";
   }
 
+  /**
+   * Decide where, if anywhere, to resume a title.
+   *
+   * Returns the source offset to start at, or 0 for "from the beginning".
+   *
+   * This lives beside progressAction because the two answer halves of the same
+   * question and used to disagree: the report path treated a position in the
+   * last 5% as finished, while this refused to resume only in the last half
+   * second. One rule now decides both, so a position the server has cleared
+   * cannot be offered back, and a position a viewer would call finished is not
+   * resumed.
+   *
+   * `progress` is the server's stored position for this entity.
+   */
+  function resumeOffsetFor(progress, leaf) {
+    if (leaf !== true) return 0;
+    if (!progress || typeof progress !== "object") return 0;
+    if (progress.finished === true) return 0;
+
+    const position = Number(progress.position_seconds);
+    if (!isFinite(position) || position < RESUME_MIN_SECONDS) return 0;
+
+    /* A stored position can outlive the file it was measured against - a
+       different release of the same film, say - so a position that looks
+       finished, or past the end, is not resumed. */
+    const duration = Number(progress.duration_seconds);
+    if (isFinite(duration) && duration > 0 && position >= duration * FINISHED_FRACTION) return 0;
+
+    return position;
+  }
+
   return {
     FINISHED_FRACTION: FINISHED_FRACTION,
     RESUME_MIN_SECONDS: RESUME_MIN_SECONDS,
     formatClock: formatClock,
     progressAction: progressAction,
+    resumeOffsetFor: resumeOffsetFor,
     mediaTime: mediaTime,
     pad2: pad2,
     producedWindow: producedWindow,
