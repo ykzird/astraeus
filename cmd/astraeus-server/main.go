@@ -33,6 +33,7 @@ import (
 	"github.com/ykzird/astraeus/internal/access"
 	"github.com/ykzird/astraeus/internal/api"
 	"github.com/ykzird/astraeus/internal/images"
+	"github.com/ykzird/astraeus/internal/jobs"
 	"github.com/ykzird/astraeus/internal/library"
 	"github.com/ykzird/astraeus/internal/library/sqlite"
 	"github.com/ykzird/astraeus/internal/metadata"
@@ -392,11 +393,19 @@ func runServe(args []string) error {
 	scheduler.SetMetrics(metrics)
 	go scheduler.Start(ctx)
 
+	// Long work runs on a runner rather than inside the request that asked for
+	// it. It descends from the signal context, so a shutdown cancels the jobs
+	// while a client going away does not - which is the difference the review's
+	// W-2 turns on: the UI's fifteen-second timeout used to end the scan.
+	runner := jobs.New(ctx, jobs.Config{}, app.logger)
+	defer runner.Close()
+
 	deps := api.Deps{
 		Repository:  app.repo,
 		Scanner:     app.scanner,
 		Scheduler:   scheduler,
 		Worker:      app.worker,
+		Jobs:        runner,
 		Metrics:     metrics,
 		Policy:      policy,
 		WebDir:      *webDir,

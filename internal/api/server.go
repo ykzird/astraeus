@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/ykzird/astraeus/internal/access"
 	"github.com/ykzird/astraeus/internal/images"
+	"github.com/ykzird/astraeus/internal/jobs"
 	"github.com/ykzird/astraeus/internal/library"
 	"github.com/ykzird/astraeus/internal/metadata"
 	"github.com/ykzird/astraeus/internal/observability"
@@ -69,7 +70,12 @@ type Deps struct {
 	// Scheduler re-scans every library; when nil, the scan-all endpoint is
 	// unavailable.
 	Scheduler *library.ScanScheduler
-	Worker    *metadata.Worker
+	// Jobs runs work that must outlive the request that asked for it. When nil,
+	// the endpoints that start long work run it synchronously, which is the
+	// behaviour every one of them had before the runner existed - a client that
+	// disconnects then cancels the work.
+	Jobs   *jobs.Runner
+	Worker *metadata.Worker
 	// Prober inspects media files. When nil, playback negotiation is disabled.
 	Prober streaming.Prober
 	// Streams produces segmented streams. When nil, only direct play works.
@@ -113,6 +119,7 @@ type Server struct {
 	repo      library.Repository
 	scanner   *library.Scanner
 	scheduler *library.ScanScheduler
+	jobs      *jobs.Runner
 	worker    *metadata.Worker
 	prober    streaming.Prober
 	streams   StreamManager
@@ -142,6 +149,7 @@ func NewServer(deps Deps) *Server {
 		repo:      deps.Repository,
 		scanner:   deps.Scanner,
 		scheduler: deps.Scheduler,
+		jobs:      deps.Jobs,
 		worker:    deps.Worker,
 		prober:    deps.Prober,
 		streams:   deps.Streams,
@@ -194,6 +202,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/objects/{id}/file", s.handleObjectFile)
 	mux.HandleFunc("GET /api/objects/{id}/subtitles/{file}", s.handleSubtitle)
 	mux.HandleFunc("GET /api/system/capabilities", s.handleSystemCapabilities)
+	mux.HandleFunc("GET /api/jobs/{id}", s.handleGetJob)
 	mux.HandleFunc("GET /api/images/{size}/{file}", s.handleImage)
 
 	// Metrics live outside /api because that is the convention scrapers expect.
@@ -481,6 +490,14 @@ func (s *Server) handleScanLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.startJob(w, r, "scan:"+lib.ID, func(ctx context.Context) (any, error) {
+		return s.scanner.ScanLibrary(ctx, lib)
+	}) {
+		return
+	}
+
+	// No runner configured: run it here, which is what this always did. A
+	// client that disconnects still cancels it in that shape.
 	result, err := s.scanner.ScanLibrary(r.Context(), lib)
 	if err != nil {
 		s.writeRepoError(w, r, err, "scanning library")
@@ -499,6 +516,12 @@ func (s *Server) handleScanAll(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler == nil {
 		writeError(w, http.StatusServiceUnavailable, "scanning_unavailable",
 			"scanning every library is not configured on this server")
+		return
+	}
+
+	if s.startJob(w, r, "scan:all", func(ctx context.Context) (any, error) {
+		return s.scheduler.ScanAll(ctx)
+	}) {
 		return
 	}
 
@@ -622,6 +645,12 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEnrich(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
+		return
+	}
+
+	if s.startJob(w, r, "enrich:all", func(ctx context.Context) (any, error) {
+		return s.worker.EnrichOnce(ctx)
+	}) {
 		return
 	}
 
