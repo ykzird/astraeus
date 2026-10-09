@@ -171,7 +171,9 @@ func NewServer(deps Deps) *Server {
 	// no CORS configuration and no separate web server.
 	if deps.WebDir != "" {
 		if info, err := os.Stat(deps.WebDir); err == nil && info.IsDir() {
-			server.webFS = http.FileServer(http.Dir(deps.WebDir))
+			// Wrapped, not bare: http.FileServer lists directories and serves
+			// dotfiles, which is a map of the install for anyone who asks (A-10).
+			server.webFS = uiFileServer(http.FileServer(http.Dir(deps.WebDir)))
 			logger.Info("serving the web UI", "dir", deps.WebDir)
 		} else {
 			logger.Warn("web UI directory is not present; serving the API only", "dir", deps.WebDir)
@@ -1392,7 +1394,14 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	// private, not public. A subtitle track is reachable only through a library the
+	// viewer may see, so the answer is specific to one viewer's rights - and
+	// `public` invites a shared cache, or a proxy in front of the server, to keep
+	// it and hand it to somebody else (A-10 of the 2026-10-09 review). The
+	// `Content-Type` above is a bare string, not an attacker-controlled value, so
+	// it is not a header-injection route; the concern here is only who may reuse
+	// the response.
+	w.Header().Set("Cache-Control", "private, max-age=86400")
 	http.ServeFile(w, r, path)
 }
 

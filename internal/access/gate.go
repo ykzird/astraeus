@@ -396,7 +396,14 @@ func (g *Gate) deny(w http.ResponseWriter, r *http.Request, err error) {
 		"Requests refused by the access gate.", map[string]string{"reason": code})
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("WWW-Authenticate", `Bearer realm="astraeus"`)
+	// A challenge belongs on a 401, and only for a scheme this server actually
+	// accepts. Sending `WWW-Authenticate: Bearer` on a 403 told a client to retry
+	// with a bearer token that would not have helped: proxy mode does not read one,
+	// and the other 403s are refusals of a request the client was already
+	// authenticated for (A-10 of the 2026-10-09 review).
+	if status == http.StatusUnauthorized && g.mode == ModeToken {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="astraeus"`)
+	}
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(struct {
 		Code    string `json:"code"`

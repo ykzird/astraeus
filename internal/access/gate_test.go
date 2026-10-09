@@ -634,3 +634,78 @@ func TestNew_RefusesAShortToken(t *testing.T) {
 		t.Error("New accepted a blank token")
 	}
 }
+
+// TestDeny_ChallengesOnlyWhereItHelps is the last of A-10's smaller items.
+//
+// Every denial carried `WWW-Authenticate: Bearer`, including proxy-mode 403s and
+// the 403s that are not about credentials at all. The header is an instruction:
+// "authenticate with a bearer token and try again". In proxy mode that is advice
+// the client cannot take - the gate does not read a token - and on an
+// already-authenticated refusal it is wrong about what the failure was.
+func TestDeny_ChallengesOnlyWhereItHelps(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		mode          Mode
+		status        int
+		code          string
+		wantChallenge bool
+	}{
+		{
+			name:          "a token-mode 401 is a challenge",
+			mode:          ModeToken,
+			status:        http.StatusUnauthorized,
+			code:          "unauthenticated",
+			wantChallenge: true,
+		},
+		{
+			name:          "a token-mode 403 is not",
+			mode:          ModeToken,
+			status:        http.StatusForbidden,
+			code:          "untrusted_source",
+			wantChallenge: false,
+		},
+		{
+			// The case the finding named: a proxy-mode refusal told the client to
+			// present a token.
+			name:          "a proxy-mode 403 is not",
+			mode:          ModeProxy,
+			status:        http.StatusForbidden,
+			code:          "untrusted_source",
+			wantChallenge: false,
+		},
+		{
+			name:          "a 401 in a mode that takes no token is not",
+			mode:          ModeNone,
+			status:        http.StatusUnauthorized,
+			code:          "ambiguous_identity",
+			wantChallenge: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			gate := &Gate{mode: tt.mode, logger: testLogger(), metrics: observability.New()}
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/api/libraries", nil)
+
+			gate.deny(recorder, request, &Denied{Status: tt.status, Code: tt.code, Message: "no"})
+
+			if recorder.Code != tt.status {
+				t.Errorf("status = %d, want %d", recorder.Code, tt.status)
+			}
+			got := recorder.Header().Get("WWW-Authenticate")
+			if tt.wantChallenge && got == "" {
+				t.Error("a token-mode 401 carried no challenge, so a client is not told how " +
+					"to authenticate")
+			}
+			if !tt.wantChallenge && got != "" {
+				t.Errorf("the denial carries %q, which tells the client to retry with a "+
+					"bearer token that this mode does not read", got)
+			}
+		})
+	}
+}

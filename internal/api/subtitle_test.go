@@ -767,3 +767,40 @@ func TestSubtitleEndpoint_OCRPassOutlivesItsRequest(t *testing.T) {
 		t.Errorf("the follow-up request = %d, want 200", got)
 	}
 }
+
+// TestSubtitleResponseIsPrivatelyCached is the other half of A-10's static-file
+// item.
+//
+// The converted track was served `Cache-Control: public, max-age=86400`, and a
+// subtitle track is reachable only through a library the viewer may see - so the
+// answer belongs to one viewer's rights. `public` invites a shared cache, or a
+// reverse proxy in front of the server, to keep it and hand it to somebody who has
+// no access to that library at all.
+func TestSubtitleResponseIsPrivatelyCached(t *testing.T) {
+	t.Parallel()
+
+	converter := &fakeConverter{ocrReady: true}
+	env := newTestEnv(t,
+		withProber(stubProber{info: subtitledInfo()}),
+		withStreams(&fakeStreams{}),
+		withSubtitles(converter))
+	entity, _ := seedPlayableEntity(t, env, "Dune (2021).mkv", "bytes")
+	objects, err := env.repo.GetObjectsByEntity(context.Background(), entity.ID)
+	if err != nil {
+		t.Fatalf("getting objects: %v", err)
+	}
+
+	recorder := env.do(t, http.MethodGet, "/api/objects/"+objects[0].ID+"/subtitles/2.vtt", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+
+	cacheControl := recorder.Header().Get("Cache-Control")
+	if strings.Contains(cacheControl, "public") {
+		t.Errorf("Cache-Control = %q, want it private: access to a subtitle track is "+
+			"per library, so a shared cache must not keep the response", cacheControl)
+	}
+	if !strings.Contains(cacheControl, "private") {
+		t.Errorf("Cache-Control = %q, want it to say private", cacheControl)
+	}
+}
