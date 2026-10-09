@@ -2,13 +2,15 @@ package library_test
 
 import (
 	"context"
-	"github.com/ykzird/astraeus/internal/library"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/ykzird/astraeus/internal/library"
 )
 
 func writeFile(t *testing.T, path, content string) {
@@ -320,7 +322,7 @@ func TestScanner_ScanLibrary_ShowsBuildsHierarchy(t *testing.T) {
 	}
 }
 
-func TestScanner_ScanLibrary_WarnsOnUnplaceableFile(t *testing.T) {
+func TestScanner_ScanLibrary_NotesAnUnplaceableFile(t *testing.T) {
 	t.Parallel()
 
 	repo := newTestRepo(t)
@@ -337,8 +339,14 @@ func TestScanner_ScanLibrary_WarnsOnUnplaceableFile(t *testing.T) {
 	if result.FilesSeen != 1 {
 		t.Errorf("files seen = %d, want 1", result.FilesSeen)
 	}
-	if len(result.Warnings) != 1 {
-		t.Errorf("warnings = %v, want exactly one", result.Warnings)
+	// A notice, not a warning: the file was read and simply could not be
+	// classified. Warnings mean the scan could not read every path, and only
+	// those block a prune (L-7).
+	if len(result.Notices) != 1 {
+		t.Errorf("notices = %v, want exactly one", result.Notices)
+	}
+	if len(result.Warnings) != 0 {
+		t.Errorf("warnings = %v, want none: an unplaceable file was read successfully", result.Warnings)
 	}
 	entities, err := repo.ListEntitiesByLibrary(ctx, lib.ID)
 	if err != nil {
@@ -613,4 +621,110 @@ func hasEntityNamed(entities []library.MediaEntity, name string) bool {
 		}
 	}
 	return false
+}
+
+// TestScanner_PrunesDespiteAnUnplaceableFile is the regression test for L-7.
+//
+// An unplaceable file used to be recorded as a warning, and a warning means the
+// scan may not have seen the whole disk - so it refused to prune. That is right
+// for a subtree it could not read and wrong for a file it read and could not
+// name: a multi-episode name like S01E02E03 is the common trigger, and its
+// presence disabled pruning for the whole library permanently. Deleting a file
+// then left its entity in place for good, and every later scan repeated the same
+// warning.
+func TestScanner_PrunesDespiteAnUnplaceableFile(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	root := t.TempDir()
+
+	// A show with two episodes in its season directory, which is the layout the
+	// scanner places, plus one name it cannot classify beside them.
+	scene := filepath.Join(root, "Show", "Season 01")
+	writeFile(t, filepath.Join(scene, "Show S01E01.mkv"), "episode one")
+	writeFile(t, filepath.Join(scene, "Show S01E02E03.mkv"), "a double episode")
+
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	scanner := library.NewScanner(repo, newTestLogger())
+
+	first, err := scanner.ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if len(first.Notices) != 1 {
+		t.Fatalf("notices = %v, want exactly one for the unplaceable file", first.Notices)
+	}
+	if first.EntitiesCreated == 0 {
+		t.Fatalf("the placeable file produced no entities, so there is nothing to prune")
+	}
+
+	// The episode is deleted from disk. The unplaceable file is still there.
+	if err := os.Remove(filepath.Join(scene, "Show S01E01.mkv")); err != nil {
+		t.Fatalf("removing the episode: %v", err)
+	}
+
+	second, err := scanner.ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+
+	if second.EntitiesPruned == 0 {
+		t.Errorf("nothing was pruned although the only placeable file was deleted\n"+
+			"notices=%v warnings=%v - an unplaceable file must not disable pruning",
+			second.Notices, second.Warnings)
+	}
+
+	entities, err := repo.ListEntitiesByLibrary(ctx, lib.ID)
+	if err != nil {
+		t.Fatalf("listing entities: %v", err)
+	}
+	for _, entity := range entities {
+		if strings.Contains(entity.Name, "S01E01") && !strings.Contains(entity.Name, "E02E03") {
+			t.Errorf("the deleted episode's entity is still present: %+v", entity)
+		}
+	}
+}
+
+// TestScanner_StillRefusesToPruneWhenAPathCannotBeRead guards the other half:
+// the warnings distinction must not have weakened the guard it exists for.
+func TestScanner_StillRefusesToPruneWhenAPathCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("this test needs Unix file permissions")
+	}
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	root := t.TempDir()
+
+	writeFile(t, filepath.Join(root, "Show S01E01.mkv"), "episode one")
+	unreadable := filepath.Join(root, "private")
+	if err := os.MkdirAll(unreadable, 0o000); err != nil {
+		t.Fatalf("creating the unreadable directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o755) })
+
+	if _, err := os.ReadDir(unreadable); err == nil {
+		t.Skip("running as a user that can read a 0000 directory")
+	}
+
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	if _, err := library.NewScanner(repo, newTestLogger()).ScanLibrary(ctx, lib); err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(root, "Show S01E01.mkv")); err != nil {
+		t.Fatalf("removing the episode: %v", err)
+	}
+
+	result, err := library.NewScanner(repo, newTestLogger()).ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	if result.EntitiesPruned != 0 {
+		t.Errorf("a scan that could not read a path pruned %d entities; an unreadable "+
+			"subtree means the disk view is incomplete", result.EntitiesPruned)
+	}
 }

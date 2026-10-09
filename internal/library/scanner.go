@@ -17,14 +17,22 @@ import (
 // ScanResult summarises what a scan actually did. It is returned to callers
 // (CLI and API) so a scan can be reported without guessing.
 type ScanResult struct {
-	FilesSeen       int      `json:"files_seen"`
-	EntitiesCreated int      `json:"entities_created"`
-	EntitiesReused  int      `json:"entities_reused"`
-	ObjectsCreated  int      `json:"objects_created"`
-	ObjectsUpdated  int      `json:"objects_updated"`
-	ObjectsPruned   int      `json:"objects_pruned"`
-	EntitiesPruned  int      `json:"entities_pruned"`
-	Warnings        []string `json:"warnings,omitempty"`
+	FilesSeen       int `json:"files_seen"`
+	EntitiesCreated int `json:"entities_created"`
+	EntitiesReused  int `json:"entities_reused"`
+	ObjectsCreated  int `json:"objects_created"`
+	ObjectsUpdated  int `json:"objects_updated"`
+	ObjectsPruned   int `json:"objects_pruned"`
+	EntitiesPruned  int `json:"entities_pruned"`
+	// Warnings are paths the scan could not read. They mean its view of the disk
+	// may be incomplete, so a prune is refused while any remain.
+	Warnings []string `json:"warnings,omitempty"`
+	// Notices are files the scan read but could not place in the library
+	// hierarchy - a multi-episode name, an unrecognised pattern, a sample file.
+	// The file is visible and simply not catalogued, so a notice does not mean
+	// the disk view is incomplete and does not block a prune (L-7 of the
+	// 2026-10-09 review).
+	Notices []string `json:"notices,omitempty"`
 }
 
 // Scanner walks a library directory and persists what it finds. It is
@@ -146,7 +154,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 		"entities_created", result.EntitiesCreated,
 		"entities_reused", result.EntitiesReused,
 		"objects_created", result.ObjectsCreated,
-		"warnings", len(result.Warnings))
+		"warnings", len(result.Warnings), "notices", len(result.Notices))
 	return result, nil
 }
 
@@ -194,6 +202,12 @@ func (s *Scanner) pruneMissing(ctx context.Context, lib *Library, seenPaths map[
 			"library", lib.Name, "warnings", len(result.Warnings))
 		return PruneResult{}, nil
 	}
+	if len(result.Notices) > 0 {
+		// A notice is not a reason to refuse. It is logged so an operator can
+		// see what was not catalogued.
+		s.logger.InfoContext(ctx, "pruning despite files that could not be classified",
+			"library", lib.Name, "notices", len(result.Notices))
+	}
 
 	if result.FilesSeen == 0 {
 		existing, err := s.repo.ListEntitiesByLibrary(ctx, lib.ID)
@@ -226,8 +240,14 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 
 	containers, leaf, ok := PlacementFor(lib, rel, absPath)
 	if !ok {
+		// A notice rather than a warning: the file was read, and it is on disk
+		// where the scan can see it. Failing to classify it says nothing about
+		// whether the scan's view of the library is complete, and treating it as
+		// though it did meant one unplaceable file - a multi-episode name, say -
+		// disabled pruning for its whole library forever. Deleting an episode
+		// then left its entity in place for good (L-7).
 		msg := fmt.Sprintf("%s: could not be placed in the library hierarchy; skipped", rel)
-		result.Warnings = append(result.Warnings, msg)
+		result.Notices = append(result.Notices, msg)
 		s.logger.WarnContext(ctx, "skipping unplaceable file", "file", rel, "library_kind", lib.Kind)
 		return nil
 	}

@@ -620,6 +620,9 @@ func runScan(args []string) error {
 	for _, warning := range result.Warnings {
 		fmt.Printf("  warning: %s\n", warning)
 	}
+	for _, notice := range result.Notices {
+		fmt.Printf("  notice: %s\n", notice)
+	}
 	fmt.Println("\nRun 'astraeus-server enrich' to attach metadata.")
 	return nil
 }
