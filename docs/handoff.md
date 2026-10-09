@@ -1208,16 +1208,22 @@ the TLS example — are done, and observed rather than reasoned about. §6 recor
 what running them found, including the defects that only a real run could
 surface. What is left:
 
-1. **A DVB image-subtitle decoder.** The fixture half is now done, which was the
+1. **A DVB image-subtitle decoder.** The fixture half is done, which was the
    blocker: round 19 found that ffmpeg's `dvbsub` encoder takes only bitmap
    subtitle input (so the VobSub trick does not transfer) but that ffmpeg's PGS
    *decoder* can feed it, and `scripts/make-dvb-fixture.sh` now decodes this
    project's own PGS fixture into a real `dvb_subtitle` track that ffmpeg
-   re-decodes and tesseract reads. What is left is the decoder — display
-   definition, page, region, CLUT and object segments, and the 2/4/8-bit pixel
-   strings — and the routing, which is the same shape the VobSub reader uses. A
-   DVB track keeps its colour table in the stream rather than the container, so
-   there is no extraction step beyond demuxing.
+   re-decodes and tesseract reads. A decoder was then written and **withdrawn**:
+   it produced a correctly sized crop and a plausible colour table but drew only
+   696 of ffmpeg's 3440 ink pixels, so it was not working and shipping it would
+   have been worse than not having it. `TODO.md` now carries the verified
+   segment layouts, the pixel-string grammars and the exact point the attempt
+   stopped, so the next one starts from evidence. What is left is that decoder
+   and the routing, which is the same shape the VobSub reader uses; a DVB track
+   keeps its colour table in the stream rather than the container, so there is
+   no extraction step beyond demuxing. **Budget note: this is a bigger increment
+   than the VobSub reader was, and the fixture's framing is the only part that
+   is already pinned.**
 2. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise

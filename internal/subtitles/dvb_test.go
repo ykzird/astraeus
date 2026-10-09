@@ -13,15 +13,17 @@ import (
 // the picture's contents are vouched for by that script rather than here.
 const dvbFixture = "testdata/dvb-caption.mkv"
 
-// DVB subtitle segment types, from ETSI EN 300 743.
+// DVB subtitle segment types, from ETSI EN 300 743. The decoder that will read
+// these does not exist yet; they are named here so the fixture's framing test
+// can check for the segments a display set needs.
 const (
-	dvbSegmentPage     = 0x10
-	dvbSegmentRegion   = 0x11
-	dvbSegmentCLUT     = 0x12
-	dvbSegmentObject   = 0x13
-	dvbSegmentDisplay  = 0x14
-	dvbSegmentEndOfSet = 0x80
-	dvbSegmentSync     = 0x0F
+	dvbSegmentPage            = 0x10
+	dvbSegmentRegion          = 0x11
+	dvbSegmentCLUT            = 0x12
+	dvbSegmentObject          = 0x13
+	dvbSegmentDisplay         = 0x14
+	dvbSegmentEndOfDisplaySet = 0x80
+	dvbSegmentSync            = 0x0F
 )
 
 // readDVBSubtitlePackets pulls the subtitle packets out of the fixture without
@@ -126,7 +128,7 @@ func TestDVBFixture_IsAFramedDisplaySet(t *testing.T) {
 			t.Errorf("the fixture has no %#02x segment", kind)
 		}
 	}
-	if seen[dvbSegmentEndOfSet] == 0 {
+	if seen[dvbSegmentEndOfDisplaySet] == 0 {
 		t.Error("the fixture has no end-of-display-set segment")
 	}
 }
