@@ -1271,22 +1271,92 @@ func TestNegotiateForServer_KeepsHDRWhenTheEncoderWasVerified(t *testing.T) {
 	}
 }
 
-// TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped covers the dead end
-// in the other direction: the client can show HDR but only decodes H.264, which
-// has no meaningful 10-bit HDR form. The picture is tone mapped to SDR, which is
-// the best that can honestly be delivered.
-func TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped(t *testing.T) {
-	t.Parallel()
-
+// hdrClientWithOnlyH264 is the dead end in the other direction: the client can
+// show HDR but only decodes H.264, which has no meaningful 10-bit HDR form.
+func hdrClientWithOnlyH264() ClientCapability {
 	capability := hdrCapability()
 	capability.Containers = []string{"hls"}
 	capability.VideoCodecs = []string{"h264"}
+	return capability
+}
 
+// hdrSourceNeedingATranscode is an HDR film the browser profile cannot copy:
+// VP9 video and no audio in a container it does not accept, so the decision is
+// a real re-encode rather than a copy.
+func hdrSourceNeedingATranscode() *MediaInfo {
 	info := hdrFilm()
 	info.VideoCodec = "vp9"
 	info.AudioCodec = "aac"
+	return info
+}
 
-	server := ServerCapability{VideoEncoders: []string{"libx264"}}
+// hostileHDRServer advertises libx264 as a verified 10-bit HDR encoder, which
+// is what this host really reports before the S-6 fix: libx264 does produce
+// yuv420p10le when probed. The old test used a server with an empty
+// HDRVideoEncoders list, which is exactly the condition that hid the bug.
+func hostileHDRServer() ServerCapability {
+	return ServerCapability{
+		VideoEncoders:    []string{"libx264"},
+		AudioEncoders:    []string{"aac"},
+		HDRVideoEncoders: []HDREncoder{{Encoder: "libx264", PixelFormat: "yuv420p10le"}},
+	}
+}
+
+// TestNegotiate_HDRClientWithOnlyH264IsToneMapped is the S-6 regression test at
+// the layer that must not depend on the host.
+//
+// The bug was that pure negotiation kept an HDR range while targeting H.264,
+// and only tone mapped by accident when the server capability list happened to
+// have no HDR encoders. This asserts the rule on the codec alone, with no
+// server in the picture at all.
+func TestNegotiate_HDRClientWithOnlyH264IsToneMapped(t *testing.T) {
+	t.Parallel()
+
+	decision := Negotiate(hdrSourceNeedingATranscode(), hdrClientWithOnlyH264())
+	if decision.VideoAction != ActionTranscode {
+		t.Fatalf("video action = %q, want a transcode", decision.VideoAction)
+	}
+	if decision.TargetVideoCodec != "h264" {
+		t.Fatalf("target codec = %q, want h264", decision.TargetVideoCodec)
+	}
+	if !decision.ToneMap || decision.TargetDynamicRange != RangeSDR {
+		t.Errorf("H.264 cannot carry HDR, so this must be tone mapped to SDR: "+
+			"tonemap=%v range=%q\nreasons: %s",
+			decision.ToneMap, decision.TargetDynamicRange, strings.Join(decision.Reasons, "; "))
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "cannot carry") {
+		t.Errorf("the decision should say why the range changed: %s",
+			strings.Join(decision.Reasons, "; "))
+	}
+}
+
+// TestNegotiate_HDRCapableCodecKeepsTheRange is the control: the rule must not
+// tone map a decode the client can actually use.
+func TestNegotiate_HDRCapableCodecKeepsTheRange(t *testing.T) {
+	t.Parallel()
+
+	capability := hdrClientWithOnlyH264()
+	capability.VideoCodecs = []string{"h264", "hevc"}
+
+	decision := Negotiate(hdrSourceNeedingATranscode(), capability)
+	if decision.TargetVideoCodec != "hevc" {
+		t.Fatalf("target codec = %q, want hevc: the HDR-capable codec should win", decision.TargetVideoCodec)
+	}
+	if decision.ToneMap || decision.TargetDynamicRange != RangeHDR10 {
+		t.Errorf("an HDR-capable target must keep the range: tonemap=%v range=%q",
+			decision.ToneMap, decision.TargetDynamicRange)
+	}
+}
+
+// TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped covers the same dead
+// end once a server is in the picture, and adds the case that used to hide the
+// bug: a server that lists libx264 as a 10-bit HDR encoder.
+func TestNegotiateForServer_HDRClientWithOnlyH264IsToneMapped(t *testing.T) {
+	t.Parallel()
+
+	capability := hdrClientWithOnlyH264()
+	info := hdrSourceNeedingATranscode()
+	server := hostileHDRServer()
 
 	decision := NegotiateForServer(info, capability, server)
 	if !decision.Deliverable {

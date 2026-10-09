@@ -227,6 +227,22 @@ var videoCodecPreference = []string{"h264", "hevc", "vp9", "av1"}
 // into it produces a stream that plays as washed-out SDR.
 var hdrVideoCodecPreference = []string{"hevc", "av1", "vp9"}
 
+// codecCanCarryHDR reports whether a video codec can deliver high dynamic range.
+//
+// H.264 cannot, which is why it is absent from hdrVideoCodecPreference and why
+// negotiation tone maps an HDR source rather than targeting it (S-6 of the
+// 2026-10-09 review). The predicate is stated separately from the preference
+// order because the two answer different questions: the list is about what to
+// prefer, this is about what is possible.
+func codecCanCarryHDR(codec string) bool {
+	switch NormaliseVideoCodec(codec) {
+	case "hevc", "av1", "vp9":
+		return true
+	default:
+		return false
+	}
+}
+
 // audioCodecPreference is the equivalent order for audio.
 var audioCodecPreference = []string{"aac", "opus", "mp3", "ac3", "eac3", "flac"}
 

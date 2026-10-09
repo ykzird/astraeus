@@ -278,6 +278,31 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 				fmt.Sprintf("%s is tone mapped to SDR for this client", dynamicRangeLabel(info)))
 		}
 	}
+
+	// An HDR source stays HDR only when the thing being delivered can carry it.
+	//
+	// The codec preference above puts HEVC, AV1 and VP9 first for an HDR client,
+	// but a client that lists none of them - one that advertises HDR and only
+	// H.264, which Chromium does - keeps the H.264 target, and H.264 cannot
+	// carry the range. Leaving it there is S-6: the session delivered 10-bit
+	// H.264 tagged PQ, which the code's own comment calls wrong, and the
+	// existing test passed only because its fake server happened to list no HDR
+	// encoders at all.
+	//
+	// Only a re-encode is judged by this. A copy delivers the source's own
+	// codec whatever TargetVideoCodec says, and direct play of an HDR file to
+	// an HDR client is exactly the case that must not be touched.
+	//
+	// The encoder question - does this host have a verified 10-bit encoder for
+	// the codec we chose - is a separate one and is answered in
+	// NegotiateForServer, which is the function that knows.
+	if !hdrMismatch && info.IsHDR() &&
+		decision.VideoAction == ActionTranscode && !codecCanCarryHDR(decision.TargetVideoCodec) {
+		decision.ToneMap = true
+		decision.Reasons = append(decision.Reasons,
+			fmt.Sprintf("%q cannot carry %s, so it is tone mapped to SDR instead",
+				decision.TargetVideoCodec, dynamicRangeLabel(info)))
+	}
 	decision.TargetDynamicRange = deliveryRangeFor(info.DynamicRange, decision.ToneMap)
 
 	// Say which way the dynamic range went, whichever branch produced it. A
@@ -797,8 +822,18 @@ func DetectServerCapability(ctx context.Context, ffmpegBin, ffprobeBin, deviceDi
 		// An encoder that works at 8 bits is a candidate for HDR, not proof of
 		// it: 10-bit surfaces are a separate capability, and on one host the
 		// hardware encoder lacks it while the software one has it.
-		if support, err := probeHDRSupport(ctx, ffmpegBin, encoder, device); err == nil {
-			capability.HDRVideoEncoders = append(capability.HDRVideoEncoders, support)
+		//
+		// H.264 is excluded, and that is not a quality judgement. A 10-bit
+		// H.264 stream is not an HDR delivery format - no browser or television
+		// treats it as one - so listing libx264 here let negotiation keep an HDR
+		// range while targeting H.264 and deliver High-10 frames tagged PQ
+		// (S-6 of the 2026-10-09 review). The code went on to tone map only
+		// because this list had no HDR encoders, which is a host-dependent
+		// accident rather than a rule.
+		if encoderCanCarryHDR(encoder) {
+			if support, err := probeHDRSupport(ctx, ffmpegBin, encoder, device); err == nil {
+				capability.HDRVideoEncoders = append(capability.HDRVideoEncoders, support)
+			}
 		}
 	}
 

@@ -583,6 +583,19 @@ func TestDetectServerCapability_RejectsEncodersThatCannotRun(t *testing.T) {
 		t.Errorf("libx264 is missing from the capability report: %v", capability.VideoEncoders)
 	}
 
+	// S-6, as a sanity check rather than the proof: no encoder offered as an HDR
+	// one may produce a codec that cannot carry HDR. This cannot fail on a host
+	// whose libx264 10-bit probe never succeeded - there would be nothing to
+	// catch here - so the rule itself is proved by TestEncoderCanCarryHDR,
+	// which is host-independent. This assertion is kept because it is nearly
+	// free and would catch a regression on a host where the probe does succeed.
+	for _, support := range capability.HDRVideoEncoders {
+		if !encoderCanCarryHDR(support.Encoder) {
+			t.Errorf("%q is advertised as a 10-bit HDR encoder, which is not an HDR delivery format",
+				support.Encoder)
+		}
+	}
+
 	// Every claimed family must be backed by an encoder of that family which is
 	// actually offered. Writing it per family would need updating whenever one
 	// is added, which is exactly how a claim drifts away from reality.

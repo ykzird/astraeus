@@ -679,6 +679,30 @@ func hdrPixelFormatCandidates(encoder string) []string {
 	}
 }
 
+// encoderCanCarryHDR reports whether an ffmpeg encoder produces a codec that
+// can deliver high dynamic range.
+//
+// H.264 is the one that cannot, and the omission is deliberate rather than a
+// quality judgement: a 10-bit H.264 stream is not an HDR delivery format - no
+// browser or television treats it as one - so probing libx264 for 10-bit
+// support and recording that it succeeded advertised H.264 as an HDR encoder.
+// Negotiation then kept an HDR range while targeting H.264 and delivered
+// High-10 frames tagged PQ with washed-out colour (S-6 of the 2026-10-09
+// review). HEVC, AV1 and VP9 can all carry it and are the codecs
+// hdrVideoCodecPreference offers.
+//
+// An encoder's name always contains the codec it produces - libx264, h264_vaapi,
+// h264_nvenc, hevc_qsv, libsvtav1, libvpx-vp9 - so it is matched on the name
+// rather than on a second table that would have to be kept in step. HEVC is
+// spelled "x265" for the software encoder and "hevc" for every hardware one, so
+// both are matched.
+func encoderCanCarryHDR(encoder string) bool {
+	name := strings.ToLower(encoder)
+	return strings.Contains(name, "hevc") || strings.Contains(name, "x265") ||
+		strings.Contains(name, "av1") ||
+		strings.Contains(name, "vp9") || strings.Contains(name, "vp8")
+}
+
 // EncoderForHDR returns the encoder and pixel format to use for a 10-bit HDR
 // stream of the given codec, and whether this host has one.
 //

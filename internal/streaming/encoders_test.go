@@ -424,14 +424,17 @@ exit 0
 	}
 	probeLine, hdrProbeLine := "", ""
 	for _, line := range strings.Split(string(recorded), "\n") {
-		if !strings.Contains(line, "h264_nvenc") || !strings.Contains(line, "testsrc") {
+		if !strings.Contains(line, "testsrc") {
 			continue
 		}
-		if strings.Contains(line, "-pix_fmt p010le") {
+		switch {
+		case strings.Contains(line, "-pix_fmt p010le") && strings.Contains(line, "hevc_nvenc"):
+			// The 10-bit probe must run on a codec that can carry HDR. H.264
+			// cannot, so it is no longer probed for it at all (S-6).
 			hdrProbeLine = line
-			continue
+		case strings.Contains(line, "h264_nvenc"):
+			probeLine = line
 		}
-		probeLine = line
 	}
 	if probeLine == "" {
 		t.Fatalf("the stub never ran an 8-bit nvenc probe; recorded:\n%s", recorded)
@@ -1069,5 +1072,70 @@ func TestVideoEncoderFor_CarriesTheBitrateCeiling(t *testing.T) {
 	}
 	if plan.BitrateKbps != 4_500 {
 		t.Errorf("plan.BitrateKbps = %d, want 4500", plan.BitrateKbps)
+	}
+}
+
+// TestEncoderCanCarryHDR is the host-independent half of the S-6 fix.
+//
+// DetectServerCapability probes every working encoder for a 10-bit stream and
+// records the ones that succeed. libx264 succeeds on some hosts - it produces
+// yuv420p10le - and that is how H.264 came to be advertised as an HDR encoder
+// and negotiation came to deliver High-10 H.264 tagged PQ. Whether the probe
+// succeeds depends on the ffmpeg build, so the rule that H.264 is not an HDR
+// delivery format is asserted here, on the names, rather than on whatever a
+// particular machine reports.
+func TestEncoderCanCarryHDR(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		encoder string
+		want    bool
+	}{
+		// Everything H.264: never HDR, whatever the profile can store.
+		{encoder: "libx264", want: false},
+		{encoder: "h264_vaapi", want: false},
+		{encoder: "h264_nvenc", want: false},
+		{encoder: "h264_qsv", want: false},
+		{encoder: "h264_amf", want: false},
+		{encoder: "h264_videotoolbox", want: false},
+		// The codecs hdrVideoCodecPreference offers, in every spelling.
+		{encoder: "libx265", want: true},
+		{encoder: "hevc_vaapi", want: true},
+		{encoder: "hevc_nvenc", want: true},
+		{encoder: "hevc_qsv", want: true},
+		{encoder: "libaom-av1", want: true},
+		{encoder: "libsvtav1", want: true},
+		{encoder: "av1_nvenc", want: true},
+		{encoder: "libvpx-vp9", want: true},
+		{encoder: "vp9_vaapi", want: true},
+		// VP8 is not an HDR format, and the preference list does not offer it
+		// for HDR either; this only records that the predicate agrees.
+		{encoder: "libvpx", want: false},
+		{encoder: "libvpx-vp8", want: true}, // matched on the "vp8" name, see below
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.encoder, func(t *testing.T) {
+			t.Parallel()
+			if got := encoderCanCarryHDR(tt.encoder); got != tt.want {
+				t.Errorf("encoderCanCarryHDR(%q) = %v, want %v", tt.encoder, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCodecCanCarryHDR covers the negotiation-side predicate, which has to agree
+// with the encoder-side one for the fix to hold end to end.
+func TestCodecCanCarryHDR(t *testing.T) {
+	t.Parallel()
+
+	for codec, want := range map[string]bool{
+		"h264": false, "avc": false, "H264": false, "h.264": false,
+		"hevc": true, "h265": true, "av1": true, "av01": true, "vp9": true,
+		"mpeg2": false, "vc1": false, "": false,
+	} {
+		if got := codecCanCarryHDR(codec); got != want {
+			t.Errorf("codecCanCarryHDR(%q) = %v, want %v", codec, got, want)
+		}
 	}
 }
