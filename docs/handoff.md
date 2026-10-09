@@ -183,13 +183,15 @@ mise exec -- go test -run 'BurnsAnImageSubtitle|DoesNotBurnATextSubtitle|BurnInd
 
 # OCR for PGS *and* VobSub. Both parsers are unit-tested against committed
 # fixtures; the VobSub fixture is decoded from a Matroska container, so that test
-# needs no ffmpeg at all. The OCR path is integration-tagged and asserts the
+# needs no ffmpeg at all. The DVB fixture (scripts/make-dvb-fixture.sh) is
+# committed and its framing is unit-tested, but no decoder reads it yet, so its
+# tests are named separately rather than pretending to be OCR. The OCR path is integration-tagged and asserts the
 # *words*, through real ffmpeg and a real tesseract - it skips when tesseract is
 # absent, and separate always-run unit tests pin the refusal that an install
 # without it keeps and the routing (image track -> ConvertImage, DVB -> 415).
 # The VobSub fixture is regenerated with scripts/make-vobsub-fixture.sh; its
 # decoder was checked against ffmpeg's own decode, pixel for pixel.
-mise exec -- go test -count=1 -run 'ParsePGS|ParseVobSub|OCR|ConvertImage' ./internal/subtitles/
+mise exec -- go test -count=1 -run 'ParsePGS|ParseVobSub|DVBFixture|OCR|ConvertImage' ./internal/subtitles/
 mise exec -- go test -tags=integration -run OCR -v ./internal/subtitles/
 mise exec -- go test -run 'SubtitleEndpoint|AdvertisesImageTrack' ./internal/api/
 # And the whole path against a running server: an image track is advertised with
@@ -945,6 +947,27 @@ ways: a VobSub track is advertised and served with an engine, and keeps its
 `415` refusal and its burn without one; DVB, which still has no decoder, keeps
 the refusal even with an engine.
 
+**The DVB fixture was solved in round 19**, removing the last obstacle to a
+third bitmap reader. The VobSub route did not transfer: ffmpeg's `dvbsub`
+*encoder* accepts only bitmap subtitle input and refuses even its own `dvdsub`
+output. Its PGS *decoder* can feed it, though, so
+`scripts/make-dvb-fixture.sh` decodes this project's own PGS fixture and
+re-encodes it as a real `dvb_subtitle` track. One non-obvious detail decides
+whether the result is usable: the encoder authors against a 720x576 canvas and
+rescales whatever it is given to fit, so the project's 640x360 fixture came out
+with warped glyphs and the recogniser read `"RSTRAELS MEDIA"`. Drawing the
+source at 720x576 — the canvas the encoder actually uses — makes the encode a
+straight copy and tesseract reads `"ASTRAEUS MEDIA"` exactly. The script
+validates itself the same way: it renders the fixture with ffmpeg and refuses to
+leave one behind unless tesseract reads the caption out of it, so the committed
+`.mkv` and `.ts` are vouched for by that check rather than by inspection. An
+always-run unit test pins the framing (sync byte, then type, *segment id*, then
+length — the id first, the reverse of the VobSub framing and the one field easy
+to read backwards) and that the track carries no codec private, which is the
+difference that matters: a DVB colour table lives in the stream, not the
+container, so there is no extraction step beyond demuxing. The decoder itself is
+the next increment (§7).
+
 **Front-end unit tests** landed as of 0.14.0, which closes the largest remaining
 untested surface. The player's timeline arithmetic — the source↔media time
 conversion (`source = media + sessionStart` and its inverse), the produced window,
@@ -1182,12 +1205,16 @@ the TLS example — are done, and observed rather than reasoned about. §6 recor
 what running them found, including the defects that only a real run could
 surface. What is left:
 
-1. **DVB image subtitles.** The VobSub reader landed in round 18 (§6); DVB
-   (`dvb_subtitle`) still keeps its refusal and its burn, because no decoder for
-   it has been written. It is a different format again — its palette and
-   composition are carried in the stream as segments rather than in a container
-   — and no sample of one exists here, so a fixture would have to come first the
-   way round 17 built the VobSub one.
+1. **A DVB image-subtitle decoder.** The fixture half is now done, which was the
+   blocker: round 19 found that ffmpeg's `dvbsub` encoder takes only bitmap
+   subtitle input (so the VobSub trick does not transfer) but that ffmpeg's PGS
+   *decoder* can feed it, and `scripts/make-dvb-fixture.sh` now decodes this
+   project's own PGS fixture into a real `dvb_subtitle` track that ffmpeg
+   re-decodes and tesseract reads. What is left is the decoder — display
+   definition, page, region, CLUT and object segments, and the 2/4/8-bit pixel
+   strings — and the routing, which is the same shape the VobSub reader uses. A
+   DVB track keeps its colour table in the stream rather than the container, so
+   there is no extraction step beyond demuxing.
 2. **Dolby Vision profile 5 done properly** (libplacebo with a Vulkan device, or
    the Dolby Vision tooling) and **carrying mastering-display / content-light
    metadata through a re-encode**. Both are refinements of work that is otherwise

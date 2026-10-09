@@ -101,6 +101,20 @@ Status as of the current build. Evidence for each claim is the test suite
       builds a 480-topped ladder and asserts each produced segment's *measured*
       height, and a unit test pins that a 4K source with a 720 preference is not
       direct-played untouched
+- [ ] **OCR for DVB image subtitles**: the third bitmap reader. The fixture is
+      now solved, which was the blocker: ffmpeg's `dvbsub` encoder takes only
+      bitmap subtitle input, so the round-17 trick does not transfer, but
+      ffmpeg's PGS *decoder* can feed it — `scripts/make-dvb-fixture.sh` decodes
+      this project's own PGS fixture and re-encodes it as `dvb_subtitle`, and
+      ffmpeg's decoder plus tesseract read the caption back out. One detail
+      decides whether the result is legible: the encoder authors against 720x576
+      and rescales what it is given, so the source has to be drawn at that size
+      or the glyphs warp and the recogniser reads "RSTRAELS MEDIA". The fixture
+      is committed (`internal/subtitles/testdata/dvb-caption.{mkv,ts}`) and its
+      framing is unit-tested; what is missing is the decoder — display
+      definition, page, region, CLUT and object segments, and the 2/4/8-bit
+      pixel strings. A DVB track keeps its colour table in the stream rather than
+      in the container, so no extraction step is needed beyond demuxing.
 - [ ] Dolby Vision profile 5 *correct* conversion (IPTPQc2 needs a Dolby Vision
       tone mapper; the software chain produces approximate colour and says so)
 
@@ -298,7 +312,8 @@ Status as of the current build. Evidence for each claim is the test suite
     verified five software encoders at 10-bit.
 - OCR covers **PGS and VobSub**. DVB subtitles still have no decoder: they keep
   the `415` refusal and are offered as a burn rather than advertised and then
-  failing inside the extractor.
+  failing inside the extractor. The fixture that was missing now exists
+  (`scripts/make-dvb-fixture.sh`), so the decoder is the only work left there.
 - The VobSub reader is verified against a **synthetic** sample, and its input is
   a container's codec private. A real disc rip's palette arrives in an `.idx`
   sidecar, which the same parser reads, but nothing has tried one; a bare
