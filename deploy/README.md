@@ -355,7 +355,8 @@ identity that wrote them was never recorded.
 - **Kubernetes manifests, Windows or macOS packaging.** Release archives are
   built for Linux, and the image is Linux-only; `scripts/build-release.sh` takes
   extra `goos/goarch` arguments if that changes.
-- **Hardware encoders have never run.** VAAPI, NVENC, AMF and VideoToolbox are
+- **Hardware encoders have never run.** VAAPI, QuickSync, NVENC, AMF and
+  VideoToolbox are
   implemented and unit-tested, and the startup probe is what validates them on
   the machine that starts the server — but no host with a GPU has been available,
   so the CPU path is the only one observed end to end.

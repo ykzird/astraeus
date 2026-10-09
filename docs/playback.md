@@ -210,7 +210,7 @@ playback failed.
 
 Neither signal on its own is trustworthy. `ffmpeg -encoders` lists what was
 *compiled in* — this project's own development machine lists NVENC, AMF,
-QuickSync and VAAPI and can use none of them. A populated `/dev/dri` says nothing
+QuickSync, VideoToolbox and VAAPI and can use none of them. A populated `/dev/dri` says nothing
 about the GPU vendor either, since an AMD machine exposes a device directory
 exactly as an Intel one does.
 

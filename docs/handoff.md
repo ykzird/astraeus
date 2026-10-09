@@ -102,7 +102,8 @@ mise exec -- go test -tags=integration -race -count=1 ./...
 # The front end's pure timeline core. Node's own runner; no npm install.
 node --test web/*.test.js
 
-# A demo library (a film plus a three-episode show, one with a real subtitle track).
+# A demo library (two films and a three-episode show: one film carries two audio
+# tracks and one the HEVC codec, and one episode carries a real subtitle track).
 # It needs ./astraeus-server built first. Defaults: media outside the repo, db at ./demo.db.
 mise exec -- go build -o ./astraeus-server ./cmd/astraeus-server
 ./scripts/make-demo-media.sh
@@ -1272,7 +1273,7 @@ surface. What is left:
 
 ## 8. Known-unverified — treat with suspicion
 
-- **NVENC, AMF and VideoToolbox have never run on real hardware.** They are
+- **QuickSync, NVENC, AMF and VideoToolbox have never run on real hardware.** They are
   implemented, unit-tested for their arguments, and covered by a test that drives
   detection through a stub ffmpeg standing in for an NVIDIA host. The startup
   probe validates the actual options on the machine that runs it.
@@ -1475,7 +1476,8 @@ surface. What is left:
   container and now the systemd unit have both been run for real — the unit on a
   clean VM (§6, §10) — and the release workflow has run end to end, so the GitHub
   Release and the GHCR push are observed rather than assumed. What is still
-  reasoned about is VAAPI, NVENC, AMF and VideoToolbox inside either shape. The
+  reasoned about is VAAPI, QuickSync, NVENC, AMF and VideoToolbox inside either
+  shape. The
   guest has no GPU and no render node, so it rejected all six hardware encoders at
   startup and transcoded on the CPU: that is a statement about the guest, not
   about the unit. The arm64 image needed QEMU for the runtime layer's `apt-get`;

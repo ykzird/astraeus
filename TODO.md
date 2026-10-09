@@ -416,9 +416,9 @@ Status as of the current build. Evidence for each claim is the test suite
   a previous run are swept at startup.
 - Probe results are cached per path for the process lifetime; a file replaced
   underneath the server keeps its old technical metadata until restart.
-- NVENC, AMF and VideoToolbox are implemented but have never been run against
-  real hardware: the development host is an AMD machine with none of the three
-  reachable. What is on this host is covered by tests that simulate the
+- QuickSync, NVENC, AMF and VideoToolbox are implemented but have never been run
+  against real hardware: the development host is an AMD machine with none of the
+  four reachable. What is on this host is covered by tests that simulate the
   detection path with a stub ffmpeg, and the startup probe validates the options
   on whatever machine actually runs it. VAAPI is in the same position - its
   `/dev/dri` is not visible here - which is how it came to be built without the
@@ -432,8 +432,8 @@ Status as of the current build. Evidence for each claim is the test suite
 - Packaging is released, and both shapes have now been run: the container by
   running it, and the systemd unit on a clean Debian 12 VM, where it started,
   answered `/api/health` and transcoded under its own syscall filter. What remains
-  unobserved there is hardware — the guest had no render node, so VAAPI, NVENC, AMF
-  and VideoToolbox are still only unit-tested and probe-validated. The
+  unobserved there is hardware — the guest had no render node, so VAAPI, QuickSync,
+  NVENC, AMF and VideoToolbox are still only unit-tested and probe-validated. The
   `SystemCallFilter` in that unit is the one setting that could stop ffmpeg on a
   host where an encoder needs a call outside the list; a `libx264` encode is now
   known to pass it, and the runbook says how to diagnose and relax it when another

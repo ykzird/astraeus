@@ -130,9 +130,12 @@ Register whatever you add with `./astraeus-server scan`, then reload the UI.
 - [ ] **Do this:** click the **incomplete** filter, and note the statuses first.
       **Expect:** the badge's count equals the number of entities whose status is
       `Incomplete`, and the visible list matches. A freshly scanned library is
-      `Incomplete`; if `metadata enrich` has run (the demo script enriches when a
-      TMDB key is configured, and `demo.db` is local state that may already have
-      been enriched) every entity is `Complete` and the filter correctly shows
+      `Incomplete`; the demo script always runs `enrich` (line 110 of
+      `make-demo-media.sh`), and without a TMDB key that writes synthetic metadata
+      and leaves every entity `Complete`, so on a plain demo run the filter
+      correctly shows nothing. `demo.db` is local state, so a checkout that was
+      enriched with a key behaves the same way; only a database that was scanned
+      and never enriched has anything in `Incomplete`.
       none. **Check the badge against the statuses rather than assuming either**
       — that is the assertion, not a particular count.
       **[auto]** read each entity's `status` from `/api/entities`, count the
