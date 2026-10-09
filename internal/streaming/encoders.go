@@ -316,7 +316,18 @@ func hdrTagFilter(dynamicRange DynamicRange) string {
 // costs nothing - on a source that is already even.
 const evenDimensions = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 
-// videoFilters renders the -vf chain for a plan and an encoder.
+// videoFilters renders the filter chain for a plan and an encoder, up to the
+// point where an encoder can accept the frames.
+//
+// The returned bool reports whether the chain ends in software frames that a
+// hardware encoder still has to receive. That distinction exists for subtitle
+// burn-in: the compositing filters are software-only (the review's S-5), so
+// uploading before the overlay hands hardware frames to a software filter and
+// ffmpeg refuses with "Impossible to convert between the formats supported by
+// the filter 'Parsed_scale2ref_3' and the filter 'auto_scale_2'". The burn graph
+// therefore takes the software part, overlays, and then applies
+// hardwareUploadFilters - which is why the upload is not simply the last entry
+// of one list.
 //
 // The two arrangements differ because VAAPI scales on the GPU after uploading
 // and cannot convert a transfer function itself (tonemap_vaapi exists but has
@@ -327,44 +338,77 @@ const evenDimensions = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 //
 // Every re-encode gets at least evenDimensions, whether or not it needs a
 // downscale, because the two are different questions.
-func videoFilters(encoder string, plan videoPlan) []string {
-	scale := evenDimensions
-	if plan.Height > 0 {
-		scale = fmt.Sprintf("scale=-2:%d", plan.Height)
-	}
-
-	var filters []string
-	if strings.HasSuffix(encoder, "_vaapi") {
+func videoFilters(encoder string, plan videoPlan) ([]string, bool) {
+	if !strings.HasSuffix(encoder, "_vaapi") {
+		scale := evenDimensions
+		if plan.Height > 0 {
+			scale = fmt.Sprintf("scale=-2:%d", plan.Height)
+		}
+		var filters []string
+		if scale != "" {
+			filters = append(filters, scale)
+		}
 		if plan.ToneMap {
 			filters = append(filters, toneMapFilterChain)
 		}
 		if plan.HDR() {
 			filters = append(filters, hdrTagFilter(plan.TargetRange))
 		}
-		format := "nv12"
-		if plan.HDR() {
-			format = plan.HDRPixelFormat
-		}
-		filters = append(filters, "format="+format, "hwupload")
-		if plan.Height > 0 {
-			filters = append(filters, fmt.Sprintf("scale_vaapi=w=-2:h=%d", plan.Height))
-		} else {
-			// VAAPI needs its own spelling, and it needs the same evenness: the
-			// hardware scaler rounds, but relying on that is not a guarantee the
-			// way an explicit trunc is.
-			filters = append(filters, "scale_vaapi=w=trunc(iw/2)*2:h=trunc(ih/2)*2")
-		}
-		return filters
+		return filters, false
 	}
 
-	if scale != "" {
-		filters = append(filters, scale)
-	}
+	// VAAPI: everything that has to happen in software, in the order it has to
+	// happen. The upload and the hardware scale follow in
+	// hardwareUploadFilters, so a software compositing stage can go between.
+	var filters []string
 	if plan.ToneMap {
 		filters = append(filters, toneMapFilterChain)
 	}
 	if plan.HDR() {
 		filters = append(filters, hdrTagFilter(plan.TargetRange))
+	}
+	// The upload needs a software frame in the format hwupload knows how to
+	// convert, and that conversion is left off here because
+	// hardwareUploadFilters opens with it: for an ordinary session the two are
+	// adjacent, so this avoids emitting "format=nv12,format=nv12", and for a
+	// burn session the conversion has to happen after the overlay anyway.
+	//
+	// The format is nv12 and not yuv420p, which is not cosmetic: feeding
+	// hwupload yuv420p on this host produced "Terminating thread with return
+	// code -5" and an empty encode, which the startup probe correctly read as a
+	// broken encoder and rejected - taking the whole hardware path down with it.
+	return filters, true
+}
+
+// hardwareUploadFilters moves software frames onto the VAAPI surface and scales
+// them there. It is the tail of a VAAPI chain, and for a burn session it is
+// applied after the overlay rather than before it - which is why the conversion
+// it opens with lives here rather than in videoFilters.
+//
+// The conversion is not assumed to be already done, because the compositing
+// filters in a burn graph can hand back a different format; a conversion that
+// is already correct costs nothing.
+func hardwareUploadFilters(plan videoPlan) []string {
+	format := "nv12"
+	if plan.HDR() {
+		format = plan.HDRPixelFormat
+	}
+	filters := []string{"format=" + format, "hwupload"}
+	if plan.Height > 0 {
+		return append(filters, fmt.Sprintf("scale_vaapi=w=-2:h=%d", plan.Height))
+	}
+	// VAAPI needs its own spelling, and it needs the same evenness: the
+	// hardware scaler rounds, but relying on that is not a guarantee the way an
+	// explicit trunc is.
+	return append(filters, "scale_vaapi=w=trunc(iw/2)*2:h=trunc(ih/2)*2")
+}
+
+// videoFilterChain joins the software chain and, when the encoder needs it, the
+// hardware upload that follows.
+func videoFilterChain(encoder string, plan videoPlan) []string {
+	filters, needsUpload := videoFilters(encoder, plan)
+	if needsUpload {
+		filters = append(filters, hardwareUploadFilters(plan)...)
 	}
 	return filters
 }
@@ -562,7 +606,7 @@ func rateControlArgs(encoder string, plan videoPlan, suffix string) []string {
 // encoderFilterArgs renders the picture filter chain as the option spelling the
 // output needs.
 func encoderFilterArgs(encoder string, plan videoPlan, suffix string) []string {
-	filters := videoFilters(encoder, plan)
+	filters := videoFilterChain(encoder, plan)
 	if len(filters) == 0 {
 		return nil
 	}

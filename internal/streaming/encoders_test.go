@@ -514,7 +514,7 @@ exit 0
 func TestVideoFilters_ToneMapIsBuiltForSoftwareAndVAAPI(t *testing.T) {
 	t.Parallel()
 
-	software := strings.Join(videoFilters("libx264", videoPlan{Height: 1080, ToneMap: true}), ",")
+	software := strings.Join(videoFilterChain("libx264", videoPlan{Height: 1080, ToneMap: true}), ",")
 	// Scaling first is not cosmetic: the float conversion is the expensive part
 	// and a 1080p frame is a quarter of the work of a 4K one.
 	if !strings.HasPrefix(software, "scale=-2:1080,zscale=t=linear") {
@@ -528,14 +528,17 @@ func TestVideoFilters_ToneMapIsBuiltForSoftwareAndVAAPI(t *testing.T) {
 
 	// VAAPI scales on the device after upload, so the tone map runs first and
 	// the upload carries the format the encoder will accept.
-	vaapi := strings.Join(videoFilters("h264_vaapi", videoPlan{Height: 720, ToneMap: true}), ",")
+	vaapi := strings.Join(videoFilterChain("h264_vaapi", videoPlan{Height: 720, ToneMap: true}), ",")
 	toneMapAt := strings.Index(vaapi, "tonemap=tonemap=hable")
 	uploadAt := strings.Index(vaapi, "hwupload")
 	if toneMapAt == -1 || uploadAt == -1 || toneMapAt > uploadAt {
 		t.Errorf("VAAPI must tone map in software before uploading:\n%s", vaapi)
 	}
+	// hwupload takes nv12. Feeding it yuv420p is not merely slower: on this
+	// host it fails with "Terminating thread with return code -5" and encodes
+	// nothing, which is what made the startup probe reject h264_vaapi outright.
 	if !strings.Contains(vaapi, "format=nv12,hwupload,scale_vaapi=w=-2:h=720") {
-		t.Errorf("VAAPI should still upload nv12 and scale on the device:\n%s", vaapi)
+		t.Errorf("VAAPI should upload nv12 frames and scale on the device:\n%s", vaapi)
 	}
 	// A tone-mapped frame is 8-bit; asking for a 10-bit surface would be a
 	// contradiction.
@@ -550,7 +553,7 @@ func TestVideoFilters_ToneMapIsBuiltForSoftwareAndVAAPI(t *testing.T) {
 func TestVideoFilters_HDRStatesItsColourOnTheFrames(t *testing.T) {
 	t.Parallel()
 
-	joined := strings.Join(videoFilters("libx265", videoPlan{
+	joined := strings.Join(videoFilterChain("libx265", videoPlan{
 		HDRPixelFormat: "yuv420p10le",
 		TargetRange:    RangeHDR10,
 	}), ",")
@@ -565,7 +568,7 @@ func TestVideoFilters_HDRStatesItsColourOnTheFrames(t *testing.T) {
 
 	// HLG is a different transfer and has to be named as such: tagging HLG as PQ
 	// would make a player interpret it with the wrong curve.
-	hlg := strings.Join(videoFilters("libx265", videoPlan{
+	hlg := strings.Join(videoFilterChain("libx265", videoPlan{
 		HDRPixelFormat: "yuv420p10le",
 		TargetRange:    RangeHLG,
 	}), ",")
@@ -583,10 +586,10 @@ func TestVideoFilters_HDRStatesItsColourOnTheFrames(t *testing.T) {
 func TestVideoFilters_PlainSDROutputIsUntouched(t *testing.T) {
 	t.Parallel()
 
-	if got := videoFilters("libx264", videoPlan{Height: 720}); len(got) != 1 || got[0] != "scale=-2:720" {
+	if got := videoFilterChain("libx264", videoPlan{Height: 720}); len(got) != 1 || got[0] != "scale=-2:720" {
 		t.Errorf("a plain SDR scale-down = %v, want just the scale filter", got)
 	}
-	got := videoFilters("libx264", videoPlan{})
+	got := videoFilterChain("libx264", videoPlan{})
 	if len(got) != 1 || got[0] != evenDimensions {
 		t.Errorf("a plain SDR transcode with no scaling = %v, want only the even-dimension scaler", got)
 	}
@@ -610,7 +613,7 @@ func TestVideoFilters_OddSourceGetsAnEvenOutput(t *testing.T) {
 		t.Run(encoder, func(t *testing.T) {
 			t.Parallel()
 
-			got := strings.Join(videoFilters(encoder, videoPlan{}), ",")
+			got := strings.Join(videoFilterChain(encoder, videoPlan{}), ",")
 			if !strings.Contains(got, "trunc(iw/2)*2") || !strings.Contains(got, "trunc(ih/2)*2") {
 				t.Errorf("%s must clamp both dimensions to even:\n%s", encoder, got)
 			}

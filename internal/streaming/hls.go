@@ -906,11 +906,26 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 // *after* the plan's own filters, which is what makes it right for a tone map:
 // a subtitle bitmap is SDR white, and it must be laid over the finished SDR
 // picture rather than passed through the HDR-to-SDR conversion with it.
+//
+// The graph is built in three stages for a hardware encoder, and that split is
+// the S-5 fix. scale2ref and overlay are software filters, so a chain that
+// uploaded to a VAAPI surface first handed them hardware frames and ffmpeg
+// refused: "Impossible to convert between the formats supported by the filter
+// 'Parsed_scale2ref_3' and the filter 'auto_scale_2'". Every burn on a VAAPI
+// host therefore failed once and was retried in software, which cost a second
+// ffmpeg start, logged a misleading "hardware transcode failed", and bumped the
+// fallback counter for a session that was going to fail every time.
+//
+// So: software filters, then the overlay, then upload and scale on the GPU. The
+// hardware path is still used, and it is used after the point that cannot work
+// on hardware.
 func burnFilterGraph(encoder string, plan videoPlan, subtitleIndex int) string {
+	software, needsUpload := videoFilters(encoder, plan)
+
 	var graph strings.Builder
 	graph.WriteString("[0:v:0]")
-	if filters := videoFilters(encoder, plan); len(filters) > 0 {
-		graph.WriteString(strings.Join(filters, ","))
+	if len(software) > 0 {
+		graph.WriteString(strings.Join(software, ","))
 	} else {
 		graph.WriteString("null")
 	}
@@ -920,7 +935,18 @@ func burnFilterGraph(encoder string, plan videoPlan, subtitleIndex int) string {
 	// tracks come first would otherwise burn the wrong stream.
 	fmt.Fprintf(&graph, "[1:%d]format=rgba[burn0];", subtitleIndex)
 	graph.WriteString("[burn0][base]scale2ref=flags=neighbor[burn][base2];")
-	graph.WriteString("[base2][burn]overlay=format=auto[v]")
+	graph.WriteString("[base2][burn]overlay=format=auto")
+
+	if !needsUpload {
+		graph.WriteString("[v]")
+		return graph.String()
+	}
+
+	// The composited software frames are what the hardware encoder needs; upload
+	// them and scale on the device, exactly as the non-burn chain does.
+	graph.WriteString("[composited];[composited]")
+	graph.WriteString(strings.Join(hardwareUploadFilters(plan), ","))
+	graph.WriteString("[v]")
 	return graph.String()
 }
 
