@@ -164,9 +164,18 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	}
 
 	// A codec name the client accepts does not mean it can decode this stream:
-	// 10-bit H.264 ("High 10") is refused by every browser's media pipeline.
-	tooDeep := info.BitDepth > 8 &&
-		(capability.MaxBitDepth == 0 || info.BitDepth > capability.MaxBitDepth)
+	// 10-bit H.264 ("High 10") is refused by every browser's media pipeline. A
+	// client that declares a depth is held to it.
+	//
+	// Zero means unrestricted, which is what the field documents and what every
+	// other limit here means. It did not: zero made every deeper-than-8-bit source
+	// a transcode, and the reason said "the client decodes at most 0-bit", which
+	// is not something a client can mean. The browser protection is unaffected,
+	// because it comes from the built-in profile setting 8 explicitly rather than
+	// from the zero value - so a client that sends no capability at all is still
+	// held to 8, and only one that sends a partial manifest is trusted (S-14 of
+	// the 2026-10-09 review).
+	tooDeep := capability.MaxBitDepth > 0 && info.BitDepth > capability.MaxBitDepth
 	if tooDeep {
 		decision.Reasons = append(decision.Reasons,
 			fmt.Sprintf("source is %d-bit but the client decodes at most %d-bit",

@@ -323,11 +323,31 @@ catches what a click cannot.
       **[auto]** assert the status and that a second scan is idempotent — the
       entity count must not change.
 
-- [ ] **Do this:** send a capability manifest that no encoder can satisfy, e.g.
-      `"video_codecs":["av1"]` against this host.
+- [ ] **Do this:** send a capability manifest that no encoder on *this* host can
+      satisfy.
+      **Prove it:** read what the host offers first, then ask for something it
+      does not. Hardcoding AV1 made this step impossible on a machine with
+      `libaom-av1` or `libsvtav1`, which is most of them:
+
+      ```sh
+      # What this host can actually encode.
+      curl -s localhost:8910/api/system/capabilities \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("video_encoders"))'
+
+      # Ask for a codec that is not in that list. AV1 and MPEG-2 are the usual
+      # absent ones; pick from what the line above printed rather than assuming.
+      curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8910/api/entities/<id>/playback \
+        -H 'Content-Type: application/json' \
+        -d '{"containers":["hls"],"video_codecs":["mpeg2video"],"audio_codecs":["aac"],"supports_hls":true}'
+      ```
+
       **Expect:** a `409` naming what it cannot do, not a 500 and not a silent
-      software fallback.
-      **[auto]** assert the status *and* the error code.
+      software fallback. If the codec you picked is in the host's list you get a
+      session instead, which means the step chose badly rather than that the
+      server is wrong.
+      **[auto]** assert the status *and* the error code, and derive the codec from
+      the capabilities response so the step cannot go stale on a host with a
+      different encoder set.
 
 - [ ] **Do this:** send a manifest with a codec name that does not exist.
       **Expect:** a `400` before anything reaches ffmpeg.

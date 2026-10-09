@@ -2578,3 +2578,74 @@ func TestNegotiate_TextTrackRefusalNamesTheWholeRule(t *testing.T) {
 			"text track is delivered and a bitmap is burned: %s", reasons)
 	}
 }
+
+// TestNegotiate_BitDepthZeroMeansUnrestricted is the regression test for S-14.
+//
+// The field documents zero as "unrestricted", and the check treated it as "at
+// most 0-bit" - so every source deeper than 8 bits became a transcode, with a
+// reason no client can mean. The browser protection does not depend on the zero
+// value: it comes from the built-in profile setting 8 explicitly, which the test
+// below pins alongside this one.
+func TestNegotiate_BitDepthZeroMeansUnrestricted(t *testing.T) {
+	t.Parallel()
+
+	// 10-bit HEVC, which a browser cannot decode as H.264 High 10 but which a
+	// client that declares no depth limit is saying it can.
+	info := &MediaInfo{
+		Container: "matroska", VideoCodec: "hevc", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 10, DurationSeconds: 600,
+	}
+
+	// A client that declares a depth is held to it: 10-bit is over its 8.
+	strict := ClientCapability{
+		Containers: []string{"hls"}, VideoCodecs: []string{"hevc"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true,
+		MaxBitDepth: 8,
+	}.Normalise()
+	if !reasonSays(strict, info, "bit") {
+		t.Errorf("a client asking for at most 8-bit was given a 10-bit source without a "+
+			"reason; reasons: %v", Negotiate(info, strict).Reasons)
+	}
+
+	// A client that leaves it zero is not.
+	open := ClientCapability{
+		Containers: []string{"hls"}, VideoCodecs: []string{"hevc"},
+		AudioCodecs: []string{"aac"}, SupportsHLS: true,
+	}.Normalise()
+	decision := Negotiate(info, open)
+	for _, reason := range decision.Reasons {
+		if strings.Contains(reason, "bit") && strings.Contains(reason, "0-bit") {
+			t.Errorf("the reason claims a client decodes at most 0-bit, which is not "+
+				"something a client can mean: %s", reason)
+		}
+	}
+}
+
+// TestNegotiate_BuiltInProfileStillRefusesDeepVideo guards the protection the
+// zero value must not be mistaken for.
+func TestNegotiate_BuiltInProfileStillRefusesDeepVideo(t *testing.T) {
+	t.Parallel()
+
+	// mp4 rather than matroska, on purpose: the browser profile does not accept
+	// matroska, so a matroska fixture is refused for its container and this test
+	// would pass without the bit-depth check doing anything. The fixture has to
+	// make bit depth the only obstacle, or it asserts nothing.
+	info := &MediaInfo{
+		Container: "mp4", VideoCodec: "h264", AudioCodec: "aac",
+		Width: 1920, Height: 1080, BitDepth: 10, DurationSeconds: 600,
+	}
+	// The browser profile sets MaxBitDepth to 8 rather than leaving it zero, and
+	// that is what stops a 10-bit H.264 being direct-played into a stalled player.
+	decision := Negotiate(info, BrowserCapability().Normalise())
+	if decision.Mode == ModeDirectPlay {
+		t.Errorf("the built-in profile direct-played a 10-bit source; mode = %q", decision.Mode)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "; "), "bit") {
+		t.Errorf("the refusal does not say it is about bit depth: %v", decision.Reasons)
+	}
+}
+
+// reasonSays reports whether a negotiation produced a reason mentioning a word.
+func reasonSays(capability ClientCapability, info *MediaInfo, word string) bool {
+	return strings.Contains(strings.Join(Negotiate(info, capability).Reasons, "; "), word)
+}

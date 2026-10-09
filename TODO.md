@@ -61,8 +61,10 @@ Status as of the current build. Evidence for each claim is the test suite
       `internal/subtitles` and read by `tesseract` into WebVTT, so the track is
       served like any text track and can be toggled, restyled and searched. The
       engine is an optional runtime dependency — without it the server keeps the
-      old `415` refusal and the burn-in path, rather than failing — and the reader
-      is PGS-only, so VobSub keeps its refusal and its burn. The generated fixture
+      old `415` refusal and the burn-in path, rather than failing. (This line said
+      "the reader is PGS-only", which stopped being true when the VobSub reader
+      landed two entries below; a reader that contradicts the checkbox under it is
+      the kind of thing that makes a status file untrustworthy.) The generated fixture
       is now a real caption (a 5x7 bitmap font, `scripts/pgsgen -text`), and the
       integration test reads the words back through real ffmpeg and a real
       tesseract; the browser harness sees the caption on screen (10/10). The
