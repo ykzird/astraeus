@@ -337,3 +337,79 @@ func TestShippedUnitDoesNotUseTokenMode(t *testing.T) {
 		}
 	}
 }
+
+// TestBackupDocumentationNamesRealPaths ties the backup section of the deployment
+// runbook to the paths the shipped unit actually uses.
+//
+// The backup section is the one page where a wrong path is worse than missing
+// documentation: it tells an operator what to copy, and a path that does not
+// match the unit produces a backup of something else, or of nothing, without
+// reporting an error. The unit is the authority - it is what runs - so the paths
+// it names are the ones the documentation has to name.
+func TestBackupDocumentationNamesRealPaths(t *testing.T) {
+	t.Parallel()
+
+	unit, err := os.ReadFile(filepath.Join("..", "..", "deploy", "astraeus.service"))
+	if err != nil {
+		t.Fatalf("reading the shipped unit: %v", err)
+	}
+	runbook, err := os.ReadFile(filepath.Join("..", "..", "deploy", "README.md"))
+	if err != nil {
+		t.Fatalf("reading the deployment runbook: %v", err)
+	}
+
+	// The database path the unit passes to --db.
+	unitText := string(unit)
+	match := regexp.MustCompile(`--db\s+(\S+)`).FindStringSubmatch(unitText)
+	if match == nil {
+		t.Fatal("the unit does not pass --db, so this test cannot check the path")
+	}
+	database := match[1]
+
+	// The check is scoped to the backup section, not the whole runbook: the
+	// database path appears in several places, so a whole-file search passed even
+	// with the backup table pointing at a directory that does not exist. What
+	// matters is that the section telling an operator what to copy names the real
+	// path.
+	const heading = "## Backups and upgrades"
+	start := strings.Index(string(runbook), heading)
+	if start < 0 {
+		t.Fatalf("the runbook has no %q section", heading)
+	}
+	// To the next top-level heading, which is where the section ends.
+	section := string(runbook[start:])
+	if next := strings.Index(section[len(heading):], "\n## "); next >= 0 {
+		section = section[:len(heading)+next]
+	}
+
+	// The state table is the part that says *what* to copy, so its database row
+	// is what has to agree with the unit. Checking the section as a whole passed
+	// with a corrupted table, because the real path also appears in the restore
+	// example below it.
+	stateRow := regexp.MustCompile("(?m)^\\|\\s*The database\\s*\\|\\s*`([^`]+)`")
+	row := stateRow.FindStringSubmatch(section)
+	if row == nil {
+		t.Fatal(`the backup section has no "The database" row, so this test cannot ` +
+			"check what it tells an operator to copy")
+	}
+	if row[1] != database {
+		t.Errorf("the backup section says the database is %s and the unit uses %s, so "+
+			"an operator following it copies the wrong file", row[1], database)
+	}
+
+	// The two files the runbook calls state have to be the ones the unit reads.
+	for _, path := range []string{"/etc/astraeus/access-policy.conf", "/etc/astraeus/astraeus.env"} {
+		if !strings.Contains(section, path) {
+			t.Errorf("the backup section does not mention %s, which is state", path)
+		}
+	}
+	// The unit reads the environment file, so the runbook's claim that it is state
+	// is checkable rather than decorative.
+	if !strings.Contains(unitText, "astraeus.env") {
+		t.Error("the unit does not read astraeus.env, so the runbook should not call it state")
+	}
+	// And it must say sqlite3 is required, because it is not a project dependency.
+	if !strings.Contains(section, "sqlite3") {
+		t.Error("the backup section does not mention sqlite3, which its recipe needs")
+	}
+}

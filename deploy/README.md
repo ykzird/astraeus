@@ -170,6 +170,30 @@ systemctl status astraeus
 # family, which takes seconds on a slow or emulated host - so wait for it rather
 # than treating the line above as proof that it is already serving.
 for i in $(seq 1 30); do curl -sf localhost:8642/api/health && break; sleep 1; done
+
+# 5. Register the library. The unit starts an empty server; it has nothing to
+#    serve until this has run once. Run the CLI AS THE SERVICE USER, not as root
+#    - see the note below.
+sudo -u astraeus /usr/local/bin/astraeus-server scan \
+  --db /var/lib/astraeus/astraeus.db \
+  --path /srv/media --kind movies --name "Films"
+```
+
+```sh
+# ...or register it over the API, which is the same operation:
+curl -s -X POST localhost:8642/api/libraries -H 'Content-Type: application/json' \
+  -d '{"name":"Films","path":"/srv/media","kind":"movies"}'
+```
+
+**Run the CLI as `astraeus`, not as `root`.** The database is in WAL mode, so the
+process that first opens it creates `astraeus.db-wal` and `astraeus.db-shm`
+*owned by that process*. A `root`-run `scan` leaves root-owned sidecars that the
+service, which runs as `astraeus`, cannot write — and the service then fails at
+startup with a readonly-database or database-is-locked error that names neither
+the file nor the reason. If it has already happened:
+
+```sh
+sudo chown -R astraeus:astraeus /var/lib/astraeus
 ```
 
 The unit binds **127.0.0.1:8642** and leaves `--auth-mode` at its default `none`,
@@ -322,17 +346,89 @@ by design, which is exactly where the second defect was hiding.
 
 ## Backups and upgrades
 
+Three things are state, and one of them is easy to forget because it is not under
+the data directory:
+
+| What | Where | Why it is state |
+| --- | --- | --- |
+| The database | `/var/lib/astraeus/astraeus.db` | Libraries, entities, metadata, and every viewer's resume position |
+| The access policy | `/etc/astraeus/access-policy.conf` | Who may see and change what. Losing it is losing the configuration, not the data |
+| The environment file | `/etc/astraeus/astraeus.env`, mode `0600` | `TMDB_API_KEY`, and any token an API client uses |
+
+Nothing under `/var/cache` needs preserving: artwork and extracted subtitles are
+re-derived, and stream directories are swept at startup. Nothing in `web` is
+state either — it is served from the archive.
+
+### The database
+
+**The copy has to be taken properly.** `sqlite3` is required and is not otherwise
+a dependency of this project, so install it (`apt install sqlite3`) or use one of
+the alternatives below. The database is in **WAL mode**, which means that while
+the server is running there are `astraeus.db-wal` and `astraeus.db-shm` files
+beside it holding commits that are not yet in the main file. A `cp` of
+`astraeus.db` alone while the server runs gives you a database *missing its most
+recent writes*, and it does so silently.
+
 ```sh
-# The database is the state. Stop the server, or copy it with SQLite's own
-# backup API so a write in flight cannot tear the copy.
-sqlite3 /var/lib/astraeus/astraeus.db ".backup /var/backups/astraeus-$(date +%F).db"
+# The whole state, with a consistent database. Stop the service first, which is
+# the simplest correct thing, or use ".backup" alone if it must stay up.
+sudo systemctl stop astraeus
+sudo install -d -m 0755 /var/backups/astraeus
+sudo cp -a /var/lib/astraeus/astraeus.db "/var/backups/astraeus/astraeus-$(date +%F).db"
+sudo cp -a /etc/astraeus "/var/backups/astraeus/etc-$(date +%F)"
+sudo systemctl start astraeus
 ```
 
+```sh
+# Without stopping it: SQLite's own backup API takes a consistent snapshot even
+# with writes in flight, and the WAL is folded in - so the -wal and -shm files do
+# not need copying. This is the one to prefer on a server that must stay up.
+sqlite3 /var/lib/astraeus/astraeus.db \
+  ".backup '/var/backups/astraeus/astraeus-$(date +%F).db'"
+```
+
+```sh
+# In the container, where sqlite3 may not be installed on the host. The volume
+# name is whatever Docker actually made - it carries the Compose project as a
+# prefix when Compose started it - so find it rather than assuming the short name.
+volume="$(docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "/data" }}{{ .Name }}{{ end }}{{ end }}' astraeus)"
+echo "the data volume is $volume"      # e.g. astraeus_astraeus-data
+
+# Stopping the container is what makes the tar consistent, for the same WAL
+# reason as above: the sidecars are checkpointed on a clean shutdown.
+docker stop astraeus
+docker run --rm -v "$volume":/data -v /var/backups:/backup debian:bookworm-slim \
+  tar czf "/backup/astraeus-$(date +%F).tar.gz" -C /data .
+docker start astraeus
+```
+
+### Restoring
+
+Stop the service, put the database back **and remove any stranded sidecars**, then
+start it. Leaving a `-wal` from a different database beside a restored one is the
+one way to get a restore that looks successful and is not:
+
+```sh
+sudo systemctl stop astraeus
+sudo rm -f /var/lib/astraeus/astraeus.db-wal /var/lib/astraeus/astraeus.db-shm
+sudo cp -a /var/backups/astraeus/astraeus-2026-10-09.db /var/lib/astraeus/astraeus.db
+sudo chown astraeus:astraeus /var/lib/astraeus/astraeus.db
+sudo systemctl start astraeus
+curl -sf localhost:8642/api/health && curl -s localhost:8642/api/libraries
+```
+
+### Upgrades
+
 Schema migrations live in the binary and run at startup; a database written by an
-older build is upgraded in place. **The server does not keep a backup before it
-does**, so take one first if the database matters — the command above is the one
-to run. Upgrading is then: replace the binary and the `web` directory, restart.
-Nothing under `/var/cache` needs to be preserved.
+older build is upgraded in place, and since the migration is a single transaction
+a failed upgrade leaves the previous database intact and startable. **The server
+does not keep a backup before it runs them**, so take one first if the database
+matters.
+
+The migrations are forward-only. There is no down-migration, so rolling back to an
+older binary against an upgraded database is not supported — restoring the backup
+above is the way back. Upgrading is then: replace the binary and the `web`
+directory, restart.
 
 One upgrade changes shape rather than adding tables: playback progress became
 per viewer, which SQLite cannot do in place, so the table is rebuilt in a
