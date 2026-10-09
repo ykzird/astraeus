@@ -1,6 +1,9 @@
 package naming
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestParseEpisodeName(t *testing.T) {
 	t.Parallel()
@@ -191,8 +194,50 @@ func TestParseMovieName(t *testing.T) {
 		wantYear  int
 	}{
 		{name: "title with year in parentheses", input: "Blade Runner 2049 (2017).mkv", wantTitle: "Blade Runner 2049", wantYear: 2017},
-		{name: "dotted release", input: "Dune.2021.2160p.WEB-DL.mkv", wantTitle: "Dune 2021 2160p WEB-DL", wantYear: 0},
-		{name: "trailing year only", input: "Arrival.2016.mkv", wantTitle: "Arrival", wantYear: 2016},
+		{
+			// The number in the title is a title; the year is the one the name
+			// declares. Reading 2049 as the year both cut the title in half and
+			// looked the film up as a 2049 release (L-17).
+			name:      "a number in the title is not the year",
+			input:     "Blade Runner 2049.mkv",
+			wantTitle: "Blade Runner 2049",
+			wantYear:  0,
+		},
+		{
+			// The review's example: the resolution follows the year, so a pattern
+			// anchored to the end of the name found nothing at all.
+			name:      "a dotted release with the year mid-name",
+			input:     "Dune.2021.2160p.WEB-DL.mkv",
+			wantTitle: "Dune 2021",
+			wantYear:  2021,
+		},
+		{
+			// The review's other example: the year is bracketed and something
+			// follows it.
+			name:      "a bracketed year with noise after it",
+			input:     "The.Movie.(2010).[1080p].mkv",
+			wantTitle: "The Movie",
+			wantYear:  2010,
+		},
+		{
+			// The local database held this one verbatim, release group and all.
+			name:      "a full release name leaves a title",
+			input:     "Battleship.2012.UHD.BluRay.2160p.x265.HDR.DTS-HDMA.7.1-DTOne.mkv",
+			wantTitle: "Battleship 2012",
+			wantYear:  2012,
+		},
+		{
+			// A bare year stays in the title. There is no way to tell "Arrival 2016"
+			// from "Blade Runner 2049" by shape alone - both are a title and a
+			// number - so the rule is one rule: a year the name brackets is a
+			// release marker and comes out, and a year the name spells as a word is
+			// part of the name and stays. It is also what stops two films of one
+			// title losing the only thing that told them apart.
+			name:      "a trailing bare year stays in the title",
+			input:     "Arrival.2016.mkv",
+			wantTitle: "Arrival 2016",
+			wantYear:  2016,
+		},
 		{name: "no year", input: "Whiplash.mkv", wantTitle: "Whiplash", wantYear: 0},
 		{name: "year in the middle is not a release year", input: "2001 A Space Odyssey.mkv", wantTitle: "2001 A Space Odyssey", wantYear: 0},
 	}
@@ -201,7 +246,7 @@ func TestParseMovieName(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			title, year := ParseMovieName(tt.input)
+			title, year := parseMovieNameAt(tt.input, time.Date(2026, 10, 9, 0, 0, 0, 0, time.UTC))
 			if title != tt.wantTitle {
 				t.Errorf("title = %q, want %q", title, tt.wantTitle)
 			}
