@@ -237,6 +237,14 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		}
 	}
 
+	// The segmented modes mux MPEG-TS, so a codec the client is happy to decode
+	// can still be one the container cannot describe. Asking only the client -
+	// which is what this did - produced segments ffmpeg wrote without complaint
+	// and every player read as bin_data, so the session "started" and played
+	// nothing (S-3 of the 2026-10-09 review).
+	segmentCarriesVideo := segmentContainerCanCarry(info.VideoCodec)
+	segmentCarriesAudio := !hasAudio || segmentContainerCanCarry(audioTrack.Codec)
+
 	switch {
 	case !videoCompatible || !audioCompatible || needsDownscale || tooDeep || channelsTooMany || hdrMismatch || bitrateTooHigh || burning:
 		decision.Mode = ModeTranscode
@@ -244,12 +252,19 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 		decision.Mode = ModeRemux
 	case containerCompatible:
 		decision.Mode = ModeDirectPlay
+	case !segmentCarriesVideo || !segmentCarriesAudio:
+		decision.Mode = ModeTranscode
+		decision.Reasons = append(decision.Reasons,
+			fmt.Sprintf("the segment container cannot carry %s, so this is re-encoded rather than copied",
+				uncarriableCodecs(info, hasAudio, audioTrack.Codec)))
 	default:
 		decision.Mode = ModeRemux
 	}
 
-	// Video action.
-	if !videoCompatible || needsDownscale || tooDeep || hdrMismatch || bitrateTooHigh || burning {
+	// Video action. A codec the segment container cannot carry counts as one
+	// that has to be re-encoded, for the same reason a codec the client cannot
+	// decode does: copying it produces a stream nobody can play.
+	if !videoCompatible || !segmentCarriesVideo || needsDownscale || tooDeep || hdrMismatch || bitrateTooHigh || burning {
 		decision.VideoAction = ActionTranscode
 		decision.TargetVideoCodec = capability.PreferredVideoCodec()
 		// An HDR source that has to be re-encoded should land in a codec that can
@@ -344,7 +359,10 @@ func Negotiate(info *MediaInfo, capability ClientCapability) Decision {
 	switch {
 	case !hasAudio:
 		decision.AudioAction = ActionNone
-	case !audioCompatible || channelsTooMany:
+	case !audioCompatible || !segmentCarriesAudio || channelsTooMany:
+		// The container check is the audio half of S-3: Vorbis and FLAC are
+		// codecs a browser may well accept and MPEG-TS cannot describe, so
+		// copying them produced a silent bin_data track.
 		decision.AudioAction = ActionTranscode
 		decision.TargetAudioCodec = capability.PreferredAudioCodec()
 		if decision.TargetAudioCodec == "" {

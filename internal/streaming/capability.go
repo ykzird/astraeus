@@ -227,6 +227,64 @@ var videoCodecPreference = []string{"h264", "hevc", "vp9", "av1"}
 // into it produces a stream that plays as washed-out SDR.
 var hdrVideoCodecPreference = []string{"hevc", "av1", "vp9"}
 
+// segmentContainerCanCarry reports whether the container the segmented modes
+// actually mux into can carry a codec.
+//
+// The segmented modes always mux MPEG-TS (hls.go passes no -hls_segment_type),
+// and MPEG-TS is not a general container: it carries H.264 and HEVC, and it
+// carries almost nothing else. A stream it cannot describe is still accepted by
+// ffmpeg - exit status 0, no warning - and written out as a private stream of
+// type 6, which every probe then reports as "bin_data". The session appears to
+// start and the viewer gets a black or silent picture with nothing in the log
+// (S-3 of the 2026-10-09 review).
+//
+// Measured on this host, muxing one stream of each codec into MPEG-TS:
+//
+//	h264, hevc        carried
+//	vp9, av1          bin_data        (VP9 also measured through -c copy)
+//	flac, vorbis      bin_data
+//	aac, mp3, ac3     carried
+//
+// So a stream whose codecs this reports false for has to be re-encoded rather
+// than copied, even when the client would have decoded it happily: the client's
+// capability is about what it can play, and this is about what the segment
+// container can hold. The two are different questions and the code only asked
+// the first one.
+//
+// The durable fix is fMP4 segments, which carry all of these and are what Apple
+// requires for HEVC. Until then this table is what keeps negotiation honest, and
+// it is deliberately a table rather than a rule so that its entries can be
+// checked one at a time.
+func segmentContainerCanCarry(codec string) bool {
+	switch NormaliseVideoCodec(codec) {
+	case "h264", "hevc":
+		return true
+	}
+	switch NormaliseAudioCodec(codec) {
+	case "aac", "mp3", "ac3", "eac3":
+		return true
+	}
+	return false
+}
+
+// uncarriableCodecs names the codecs that forced a re-encode because the segment
+// container cannot hold them, for the decision's Reasons.
+func uncarriableCodecs(info *MediaInfo, hasAudio bool, audioCodec string) string {
+	var names []string
+	if !segmentContainerCanCarry(info.VideoCodec) {
+		names = append(names, info.VideoCodec)
+	}
+	if hasAudio && !segmentContainerCanCarry(audioCodec) {
+		names = append(names, audioCodec)
+	}
+	if len(names) == 0 {
+		// Unreachable when the caller checked first, but a blank name would be
+		// worse than saying nothing.
+		return "a codec in this file"
+	}
+	return strings.Join(names, " and ")
+}
+
 // codecCanCarryHDR reports whether a video codec can deliver high dynamic range.
 //
 // H.264 cannot, which is why it is absent from hdrVideoCodecPreference and why

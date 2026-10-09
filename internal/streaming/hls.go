@@ -906,6 +906,15 @@ func BuildFFmpegArgsAt(dir, inputPath string, decision Decision, cfg ManagerConf
 		return nil, fmt.Errorf("unsupported audio action %q", decision.AudioAction)
 	}
 
+	// No -hls_segment_type, so ffmpeg's default MPEG-TS muxer is what produces
+	// the segments. That is load-bearing rather than incidental:
+	// segmentContainerCanCarry in negotiate.go decides which codecs negotiation
+	// may copy on the strength of it, because MPEG-TS carries H.264 and HEVC and
+	// writes everything else out as bin_data without complaining (S-3 of the
+	// 2026-10-09 review). Switching this to fmp4 would be the better long-term
+	// answer - fMP4 carries AV1, VP9, Opus and FLAC, and Apple requires it for
+	// HEVC - but it changes the segment extension, the playlist and what the UI
+	// fetches, so the two must move together.
 	args = append(args,
 		"-f", "hls",
 		"-hls_time", fmt.Sprint(cfg.SegmentSeconds),

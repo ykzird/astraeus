@@ -196,6 +196,106 @@ func TestManager_OddDimensionsEndToEnd(t *testing.T) {
 	t.Logf("odd source %dx%d produced a %dx%d segment", info.Width, info.Height, produced.Width, produced.Height)
 }
 
+// generateTSUnfriendlyClip renders a Matroska clip whose codecs MPEG-TS cannot
+// describe: VP9 video and Vorbis audio. Both are codecs a browser may accept, so
+// the interesting failure is not "the client cannot decode it" but "the segment
+// container cannot hold it".
+func generateTSUnfriendlyClip(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc=size=320x240:rate=15:duration=3",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+		"-c:v", "libvpx-vp9", "-b:v", "200k", "-c:a", "libvorbis", "-shortest",
+		path,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generating the VP9/Vorbis fixture: %v\n%s", err, output)
+	}
+
+	info, err := NewFFProbe("ffprobe").Probe(context.Background(), path)
+	if err != nil {
+		t.Fatalf("probing the VP9/Vorbis fixture: %v", err)
+	}
+	if info.VideoCodec != "vp9" || info.AudioCodec != "vorbis" {
+		t.Fatalf("the fixture is %s/%s, want vp9/vorbis", info.VideoCodec, info.AudioCodec)
+	}
+	return path
+}
+
+// TestManager_TSUnfriendlyCodecsAreTranscoded is the regression test for S-3.
+//
+// A client that can decode VP9 and Vorbis still cannot be served them in
+// MPEG-TS. ffmpeg accepts the copy, exits 0, and writes each stream as a
+// private stream of type 6 - bin_data - so the session "starts" and the viewer
+// gets a black or silent picture with nothing in the log. Negotiation now treats
+// a codec the segment container cannot hold as one that has to be re-encoded,
+// and this asserts on the produced segment rather than on the arguments, because
+// the arguments were always accepted.
+func TestManager_TSUnfriendlyCodecsAreTranscoded(t *testing.T) {
+	requireFFmpeg(t)
+
+	root := t.TempDir()
+	source := generateTSUnfriendlyClip(t, root, "vp9-vorbis.mkv")
+
+	info, err := NewFFProbe("ffprobe").Probe(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+
+	// The client accepts both codecs, but not the Matroska container, so the
+	// delivery has to be repackaged. That is the case S-3 is about: the remux
+	// branch is reached, and the only question left is whether the segment
+	// container can hold what is being copied into it.
+	capability := ClientCapability{
+		Containers:  []string{"mp4", "hls"},
+		VideoCodecs: []string{"vp9", "h264"},
+		AudioCodecs: []string{"vorbis", "aac"},
+		SupportsHLS: true,
+	}
+	decision := Negotiate(info, capability)
+	if decision.VideoAction != ActionTranscode {
+		t.Errorf("video action = %q, want a transcode: MPEG-TS cannot carry VP9",
+			decision.VideoAction)
+	}
+	if decision.AudioAction != ActionTranscode {
+		t.Errorf("audio action = %q, want a transcode: MPEG-TS cannot carry Vorbis",
+			decision.AudioAction)
+	}
+	if decision.Mode != ModeTranscode {
+		t.Fatalf("mode = %q, want %q", decision.Mode, ModeTranscode)
+	}
+
+	manager, session, _ := startSession(t, root, source, decision)
+	defer manager.Stop(session.ID)
+
+	segment := waitForSegment(t, session.Dir, 90*time.Second)
+	if segment == "" {
+		t.Fatal("no segment was produced")
+	}
+
+	// The decisive assertion: what the segment really contains.
+	produced, err := NewFFProbe("ffprobe").Probe(context.Background(), filepath.Join(session.Dir, segment))
+	if err != nil {
+		t.Fatalf("probing the produced segment: %v", err)
+	}
+	if produced.VideoCodec == "bin_data" {
+		t.Errorf("the segment carries bin_data video: the streams were copied into a container that cannot hold them")
+	}
+	if produced.VideoCodec != "h264" {
+		t.Errorf("segment video codec = %q, want h264", produced.VideoCodec)
+	}
+	if produced.AudioCodec == "bin_data" {
+		t.Errorf("the segment carries bin_data audio: the streams were copied into a container that cannot hold them")
+	}
+	if produced.AudioCodec != "aac" {
+		t.Errorf("segment audio codec = %q, want aac", produced.AudioCodec)
+	}
+	t.Logf("vp9/vorbis source produced a %s/%s segment", produced.VideoCodec, produced.AudioCodec)
+}
+
 func TestManager_RemuxEndToEnd(t *testing.T) {
 	requireFFmpeg(t)
 
