@@ -55,7 +55,26 @@ func NewScanner(repo Repository, logger *slog.Logger) *Scanner {
 type entitySpec struct {
 	Type EntityType
 	Name string
-	Meta *MetadataSet
+	// Identity is what makes this the same entity across scans. It is set from
+	// structured data - a movie's title and year, an episode's season and
+	// number - and is deliberately independent of the display name, so a
+	// renamed file keeps its entity and a remake keeps its own.
+	Identity string
+	Meta     *MetadataSet
+}
+
+// identityFor returns the identity to key an entity on.
+//
+// A spec that sets one uses it. Otherwise the display name is the best
+// available answer - it is what the entity's own kind is keyed on, and a
+// container's name comes from its directory rather than from a file name that
+// changes. Being explicit about that fallback keeps the rule in one place
+// instead of leaving it implied at every call site.
+func identityFor(spec entitySpec) string {
+	if spec.Identity != "" {
+		return spec.Identity
+	}
+	return spec.Name
 }
 
 // ScanLibrary walks lib.Path and reconciles the database with the files found.
@@ -256,7 +275,7 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 		var parentID *string
 
 		for _, spec := range containers {
-			entity, err := tx.FindEntity(ctx, lib.ID, parentID, spec.Type, spec.Name)
+			entity, err := tx.FindEntity(ctx, lib.ID, parentID, spec.Type, identityFor(spec))
 			if err != nil {
 				if !errors.Is(err, ErrNotFound) {
 					return err
@@ -272,7 +291,7 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 			parentID = &entity.ID
 		}
 
-		leafEntity, err := tx.FindEntity(ctx, lib.ID, parentID, leaf.Type, leaf.Name)
+		leafEntity, err := tx.FindEntity(ctx, lib.ID, parentID, leaf.Type, identityFor(leaf))
 		if err != nil {
 			if !errors.Is(err, ErrNotFound) {
 				return err
@@ -284,6 +303,18 @@ func (s *Scanner) ingestFile(ctx context.Context, lib *Library, absPath, root st
 			tally.markCreated(leafEntity.ID)
 		} else {
 			tally.markReused(leafEntity.ID)
+			// The entity is the same one, but what it is called can have
+			// changed: renaming "Show S01E01.mkv" to "Show S01E01 - Pilot.mkv"
+			// makes the display name follow the file. The identity is what makes
+			// it the same entity, so the name is now free to move - and leaving
+			// it stale would show a viewer the old title after a rename (L-8).
+			if leaf.Name != "" && leafEntity.Name != leaf.Name {
+				leafEntity.Name = leaf.Name
+				leafEntity.UpdatedAt = s.now()
+				if err := tx.UpdateEntity(ctx, leafEntity); err != nil {
+					return err
+				}
+			}
 		}
 
 		existing, err := tx.GetObjectByPath(ctx, absPath)
@@ -326,6 +357,7 @@ func (s *Scanner) newEntity(libraryID string, parentID *string, spec entitySpec)
 		ParentID:  parentID,
 		Type:      spec.Type,
 		Name:      spec.Name,
+		Identity:  identityFor(spec),
 		Status:    StatusIncomplete,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -374,6 +406,10 @@ func moviePlacement(relPath, absPath string) (entitySpec, bool) {
 	spec := entitySpec{Type: MovieEntity, Name: title}
 	if year != 0 {
 		spec.Meta = &MetadataSet{Extra: map[string]string{"year": fmt.Sprint(year)}}
+		// Two films can share a title - Dune (1984) and Dune (2021) - and
+		// without the year in the identity they became one entity with two
+		// files, enriched as whichever year happened to arrive first (L-6).
+		spec.Identity = fmt.Sprintf("%s (%d)", title, year)
 	}
 	return spec, true
 }
@@ -398,5 +434,14 @@ func showPlacement(relPath, absPath string) ([]entitySpec, entitySpec, bool) {
 		"season":  fmt.Sprint(info.Season),
 		"episode": fmt.Sprint(info.Episode),
 	}}
-	return containers, entitySpec{Type: EpisodeEntity, Name: name, Meta: meta}, true
+	// The identity is the episode number alone, scoped by its season above it.
+	// The name carries the release's own title, which changes when a file is
+	// renamed - and with the name as the identity, a rename deleted the entity
+	// and took the viewer's progress with it (L-8).
+	return containers, entitySpec{
+		Type:     EpisodeEntity,
+		Name:     name,
+		Identity: fmt.Sprintf("S%02dE%02d", info.Season, info.Episode),
+		Meta:     meta,
+	}, true
 }

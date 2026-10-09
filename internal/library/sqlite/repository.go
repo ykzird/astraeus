@@ -114,6 +114,7 @@ func (r *Repository) Migrate(ctx context.Context) error {
 			parent_id TEXT,
 			type TEXT NOT NULL,
 			name TEXT NOT NULL DEFAULT '',
+			identity TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
@@ -162,10 +163,13 @@ func (r *Repository) Migrate(ctx context.Context) error {
 		return err
 	}
 
-	// Databases created before libraries existed are missing these columns.
+	// Databases created before libraries existed are missing these columns, and
+	// so is any database written before identity did. The column has to exist
+	// before the identity index below can be created on it.
 	for _, col := range []struct{ name, ddl string }{
 		{"library_id", `ALTER TABLE media_entities ADD COLUMN library_id TEXT NOT NULL DEFAULT ''`},
 		{"name", `ALTER TABLE media_entities ADD COLUMN name TEXT NOT NULL DEFAULT ''`},
+		{"identity", `ALTER TABLE media_entities ADD COLUMN identity TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := r.ensureColumn(ctx, "media_entities", col.name, col.ddl); err != nil {
 			return err
@@ -175,6 +179,15 @@ func (r *Repository) Migrate(ctx context.Context) error {
 	// Entities from before the name column need a name before the identity
 	// index below can be enforced.
 	if err := r.backfillEntityNames(ctx); err != nil {
+		return err
+	}
+
+	// Rows written before identity existed have an empty one, and an empty
+	// identity in a unique index means two such rows collide as soon as a third
+	// arrives. They are given the name they already have, which is exactly what
+	// the old index keyed on, so an existing install keeps the entities it has
+	// and gains a stable key from then on.
+	if err := r.backfillEntityIdentities(ctx); err != nil {
 		return err
 	}
 
@@ -198,12 +211,19 @@ func (r *Repository) Migrate(ctx context.Context) error {
 	}
 
 	// Identity index: a library holds at most one entity of a given type and
-	// name under a given parent. COALESCE keeps top-level (NULL parent) rows
+	// identity under a given parent. COALESCE keeps top-level (NULL parent) rows
 	// subject to the same rule, which plain unique indexes do not do in SQLite.
+	//
+	// The index was on `name` until the 2026-10-09 review. Name is the display
+	// string, so keying on it meant two remakes of one title collided (L-6) and
+	// a renamed episode file lost its progress with the entity (L-8). Identity
+	// is derived from the title and year, or the season and number, and is not
+	// shown to anyone.
 	post := []string{
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_media_objects_path ON media_objects(file_path)`,
+		`DROP INDEX IF EXISTS idx_media_entities_identity`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_media_entities_identity
-			ON media_entities(library_id, COALESCE(parent_id, ''), type, name)`,
+			ON media_entities(library_id, COALESCE(parent_id, ''), type, identity)`,
 		`CREATE INDEX IF NOT EXISTS idx_media_entities_library ON media_entities(library_id)`,
 		// The continue-watching query filters by viewer and orders by recency,
 		// which is exactly this index.
@@ -310,6 +330,74 @@ func (r *Repository) rebuildProgressPerViewer(ctx context.Context) error {
 		return fmt.Errorf("committing playback_progress rebuild: %w", err)
 	}
 	return nil
+}
+
+// backfillEntityIdentities gives an identity to entities created before that
+// column existed.
+//
+// The rule mirrors what the scanner computes for a row it creates today, as far
+// as a row that already exists can be reconstructed: a movie's identity is its
+// title and the year its metadata records, an episode's is its season and
+// number, and anything else is keyed on the name it already has - which is what
+// the old unique index used, so no existing entity changes which entity it is.
+//
+// Getting this wrong is not cosmetic. An empty identity in the unique index
+// means the next entity inserted with an empty one collides with it, and a
+// mismatch between this and the scanner means the next scan creates a duplicate
+// for every file in the library.
+func (r *Repository) backfillEntityIdentities(ctx context.Context) error {
+	type row struct {
+		ID       string  `db:"id"`
+		Type     string  `db:"type"`
+		Name     string  `db:"name"`
+		Metadata *string `db:"metadata"`
+	}
+	var rows []row
+	if err := r.exec().SelectContext(ctx, &rows,
+		`SELECT id, type, name, metadata FROM media_entities WHERE identity = ''`); err != nil {
+		return fmt.Errorf("finding entities without an identity: %w", err)
+	}
+
+	for _, entity := range rows {
+		identity := identityFromRow(entity.Type, entity.Name, entity.Metadata)
+		if _, err := r.exec().ExecContext(ctx,
+			`UPDATE media_entities SET identity = ? WHERE id = ?`, identity, entity.ID); err != nil {
+			return fmt.Errorf("backfilling identity for entity %s: %w", entity.ID, err)
+		}
+	}
+	return nil
+}
+
+// identityFromRow reconstructs an identity from what a legacy row holds.
+func identityFromRow(entityType, name string, metadata *string) string {
+	if metadata == nil {
+		return name
+	}
+	var set library.MetadataSet
+	if err := json.Unmarshal([]byte(*metadata), &set); err != nil {
+		return name
+	}
+	if set.Extra == nil {
+		return name
+	}
+
+	switch library.EntityType(entityType) {
+	case library.MovieEntity:
+		if year := set.Extra["year"]; year != "" {
+			return fmt.Sprintf("%s (%s)", name, year)
+		}
+	case library.EpisodeEntity:
+		season, episode := set.Extra["season"], set.Extra["episode"]
+		if season != "" && episode != "" {
+			var s, e int
+			if _, err := fmt.Sscanf(season, "%d", &s); err == nil {
+				if _, err := fmt.Sscanf(episode, "%d", &e); err == nil {
+					return fmt.Sprintf("S%02dE%02d", s, e)
+				}
+			}
+		}
+	}
+	return name
 }
 
 // backfillEntityNames gives a name to entities created before the name column
@@ -527,10 +615,10 @@ func (row libraryRow) toLibrary() (*library.Library, error) {
 // ---- media entities --------------------------------------------------------
 
 // entityColumns is the shared SELECT list for media_entities.
-const entityColumns = `id, library_id, parent_id, type, name, status, created_at, updated_at, metadata`
+const entityColumns = `id, library_id, parent_id, type, name, identity, status, created_at, updated_at, metadata`
 
 // The same columns qualified for a join, where a bare id would be ambiguous.
-const prefixedEntityColumns = `e.id, e.library_id, e.parent_id, e.type, e.name, e.status,
+const prefixedEntityColumns = `e.id, e.library_id, e.parent_id, e.type, e.name, e.identity, e.status,
 	e.created_at, e.updated_at, e.metadata`
 
 type entityRow struct {
@@ -539,6 +627,7 @@ type entityRow struct {
 	ParentID  *string              `db:"parent_id"`
 	Type      library.EntityType   `db:"type"`
 	Name      string               `db:"name"`
+	Identity  string               `db:"identity"`
 	Status    library.EntityStatus `db:"status"`
 	CreatedAt string               `db:"created_at"`
 	UpdatedAt string               `db:"updated_at"`
@@ -570,6 +659,7 @@ func (row entityRow) toEntity() (*library.MediaEntity, error) {
 		ParentID:  parentID,
 		Type:      row.Type,
 		Name:      row.Name,
+		Identity:  row.Identity,
 		Status:    row.Status,
 		CreatedAt: createdAt,
 		UpdatedAt: updatedAt,
@@ -591,10 +681,25 @@ type entityWriteParams struct {
 	ParentID  *string              `db:"parent_id"`
 	Type      library.EntityType   `db:"type"`
 	Name      string               `db:"name"`
+	Identity  string               `db:"identity"`
 	Status    library.EntityStatus `db:"status"`
 	CreatedAt string               `db:"created_at"`
 	UpdatedAt string               `db:"updated_at"`
 	Metadata  string               `db:"metadata"`
+}
+
+// identityOrName is the identity to store for an entity, defaulting to its name.
+//
+// The scanner sets a structured identity, and a caller that does not - a test,
+// or any future writer - would otherwise store an empty string. Every such row
+// collides with every other in the unique index, which turns "this entity has no
+// identity yet" into "this library can hold one such entity". The name is what
+// the index keyed on before identity existed, so it is the honest default.
+func identityOrName(e *library.MediaEntity) string {
+	if e.Identity != "" {
+		return e.Identity
+	}
+	return e.Name
 }
 
 func entityParams(e *library.MediaEntity) (entityWriteParams, error) {
@@ -608,6 +713,7 @@ func entityParams(e *library.MediaEntity) (entityWriteParams, error) {
 		ParentID:  e.ParentID,
 		Type:      e.Type,
 		Name:      e.Name,
+		Identity:  identityOrName(e),
 		Status:    e.Status,
 		CreatedAt: formatTime(e.CreatedAt),
 		UpdatedAt: formatTime(e.UpdatedAt),
@@ -621,8 +727,8 @@ func (r *Repository) CreateEntity(ctx context.Context, entity *library.MediaEnti
 		return err
 	}
 	_, err = r.exec().NamedExecContext(ctx,
-		`INSERT INTO media_entities (id, library_id, parent_id, type, name, status, created_at, updated_at, metadata)
-		 VALUES (:id, :library_id, :parent_id, :type, :name, :status, :created_at, :updated_at, :metadata)`, params)
+		`INSERT INTO media_entities (id, library_id, parent_id, type, name, identity, status, created_at, updated_at, metadata)
+		 VALUES (:id, :library_id, :parent_id, :type, :name, :identity, :status, :created_at, :updated_at, :metadata)`, params)
 	if err != nil {
 		return fmt.Errorf("creating entity %q: %w", entity.Name, err)
 	}
@@ -637,7 +743,7 @@ func (r *Repository) UpdateEntity(ctx context.Context, entity *library.MediaEnti
 	res, err := r.exec().NamedExecContext(ctx,
 		`UPDATE media_entities
 		 SET library_id = :library_id, parent_id = :parent_id, type = :type, name = :name,
-		     status = :status, updated_at = :updated_at, metadata = :metadata
+		     identity = :identity, status = :status, updated_at = :updated_at, metadata = :metadata
 		 WHERE id = :id`, params)
 	if err != nil {
 		return fmt.Errorf("updating entity %s: %w", entity.ID, err)
@@ -661,18 +767,21 @@ func (r *Repository) GetEntity(ctx context.Context, id string) (*library.MediaEn
 	return row.toEntity()
 }
 
-func (r *Repository) FindEntity(ctx context.Context, libraryID string, parentID *string, entityType library.EntityType, name string) (*library.MediaEntity, error) {
+func (r *Repository) FindEntity(ctx context.Context, libraryID string, parentID *string, entityType library.EntityType, identity string) (*library.MediaEntity, error) {
 	var row entityRow
 	// `IS` compares NULL-safely, so a nil parentID matches top-level entities.
+	// The match is on identity, which is the structured form of what makes this
+	// entity this entity; the name it displays is free to change without the
+	// entity becoming a different one (L-6, L-8).
 	err := r.exec().GetContext(ctx, &row,
 		`SELECT `+entityColumns+` FROM media_entities
-		 WHERE library_id = ? AND parent_id IS ? AND type = ? AND name = ?`,
-		libraryID, parentID, entityType, name)
+		 WHERE library_id = ? AND parent_id IS ? AND type = ? AND identity = ?`,
+		libraryID, parentID, entityType, identity)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("entity %q: %w", name, library.ErrNotFound)
+			return nil, fmt.Errorf("entity %q: %w", identity, library.ErrNotFound)
 		}
-		return nil, fmt.Errorf("finding entity %q: %w", name, err)
+		return nil, fmt.Errorf("finding entity %q: %w", identity, err)
 	}
 	return row.toEntity()
 }

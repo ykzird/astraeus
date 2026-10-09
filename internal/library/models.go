@@ -82,11 +82,21 @@ type Library struct {
 // ContainerEntity (Series, Season) may hold children; a LeafEntity (Episode,
 // Movie) is the final node in a hierarchy and is what plays.
 type MediaEntity struct {
-	ID        string       `json:"id" db:"id"`
-	LibraryID string       `json:"library_id" db:"library_id"`
-	ParentID  *string      `json:"parent_id,omitempty" db:"parent_id"`
-	Type      EntityType   `json:"type" db:"type"`
-	Name      string       `json:"name" db:"name"`
+	ID        string     `json:"id" db:"id"`
+	LibraryID string     `json:"library_id" db:"library_id"`
+	ParentID  *string    `json:"parent_id,omitempty" db:"parent_id"`
+	Type      EntityType `json:"type" db:"type"`
+	Name      string     `json:"name" db:"name"`
+	// Identity is what makes an entity the same entity across scans. Name is
+	// what a viewer reads, and it must be free to change - a renamed episode
+	// file should keep its progress - while identity must not be. It is
+	// structured data rendered as a string: a movie is its title and year, an
+	// episode is its season and number.
+	//
+	// Keying on the display name instead was L-6 and L-8 of the 2026-10-09
+	// review: two remakes of one title collapsed into a single entity, and
+	// renaming a file deleted the entity the progress hung off.
+	Identity  string       `json:"-" db:"identity"`
 	Status    EntityStatus `json:"status" db:"status"`
 	CreatedAt time.Time    `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time    `json:"updated_at" db:"updated_at"`
