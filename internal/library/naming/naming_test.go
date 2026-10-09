@@ -282,6 +282,11 @@ func TestIsVideoFile(t *testing.T) {
 	}
 }
 
+// TestIsIgnored covers the directory rule.
+//
+// "extras" must not be in it. Extras is a name an actual series has - Ricky
+// Gervais's - and skipping the directory dropped that series from the library with
+// no warning at all, which is L-17 of the 2026-10-09 review.
 func TestIsIgnored(t *testing.T) {
 	t.Parallel()
 
@@ -291,7 +296,11 @@ func TestIsIgnored(t *testing.T) {
 	}{
 		{".hidden", true},
 		{"Sample", true},
-		{"extras", true},
+		{"Featurettes", true},
+		{"behind the scenes", true},
+		// The word that is also a series name.
+		{"Extras", false},
+		{"extras", false},
 		{"Season 01", false},
 		{"Breaking Bad", false},
 	}
@@ -301,6 +310,46 @@ func TestIsIgnored(t *testing.T) {
 			t.Parallel()
 			if got := IsIgnored(tt.name); got != tt.want {
 				t.Errorf("IsIgnored(%q) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsIgnoredFile covers the file rule, which is a different list because the
+// same word means different things at the two levels.
+func TestIsIgnoredFile(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		want bool
+	}{
+		// Samples are named for the title they came from, so a whole-name test
+		// matched none of these and the samples stayed in the library.
+		{"Dune.2021.2160p.sample.mkv", true},
+		{"Dune-sample.mkv", true},
+		{"Dune_sample_1080p.mkv", true},
+		{"Sample.mkv", true},
+		{"sample-1.mkv", true},
+		// A word that merely starts the same way is not the token.
+		{"Sampler.mkv", false},
+		{"Dune.2021.2160p.mkv", false},
+		// "The Sample Maker" is skipped, and that is the deliberate cost of the
+		// rule: nothing in a name distinguishes it from "Dune sample 1080p". The
+		// comment on IsIgnoredFile records the trade.
+		{"The Sample Maker.mkv", true},
+		// Supplementary files.
+		{"Extras.mkv", true},
+		{"trailer.mkv", true},
+		{".hidden.mkv", true},
+		{"S01E01.mkv", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsIgnoredFile(tt.name); got != tt.want {
+				t.Errorf("IsIgnoredFile(%q) = %v, want %v", tt.name, got, tt.want)
 			}
 		})
 	}

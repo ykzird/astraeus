@@ -141,7 +141,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, lib *Library) (ScanResult, er
 			}
 			return nil
 		}
-		if naming.IsIgnored(entry.Name()) || !naming.IsVideoFile(path) {
+		if naming.IsIgnoredFile(entry.Name()) || !naming.IsVideoFile(path) {
 			return nil
 		}
 

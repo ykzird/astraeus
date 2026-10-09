@@ -733,3 +733,85 @@ func TestScanner_StillRefusesToPruneWhenAPathCannotBeRead(t *testing.T) {
 			"subtree means the disk view is incomplete", result.EntitiesPruned)
 	}
 }
+
+// TestScanner_KeepsASeriesNamedExtrasAndDropsSamples is the scanner-level half of
+// L-17's ignore rules.
+//
+// IsIgnored matched whole directory names from one list used for both directories
+// and files, and it got both ends wrong. "Extras" is a name an actual series has -
+// Ricky Gervais's - and skipping the directory dropped it from the library with no
+// warning. And a sample is named for the title it came from, so the whole-name test
+// matched none of them: "Dune.2021.2160p.sample.mkv" stayed in the library as a
+// film.
+func TestScanner_KeepsASeriesNamedExtrasAndDropsSamples(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	root := t.TempDir()
+
+	// A series that happens to be called Extras.
+	extras := filepath.Join(root, "Extras", "Season 01")
+	writeFile(t, filepath.Join(extras, "Extras S01E01.mkv"), "episode one")
+
+	// And a film whose release shipped a sample beside it.
+	films := filepath.Join(root, "Films")
+	writeFile(t, filepath.Join(films, "Dune.2021.2160p.mkv"), "the feature")
+	writeFile(t, filepath.Join(films, "Dune.2021.2160p.sample.mkv"), "a sample")
+	// A samples directory, whose contents are named for the title rather than
+	// "sample", so only the directory rule can catch these.
+	samplesDir := filepath.Join(films, "Dune.2021.Samples")
+	writeFile(t, filepath.Join(samplesDir, "Dune.2021.sample-one.mkv"), "a sample")
+	writeFile(t, filepath.Join(samplesDir, "Dune.2021.sample-two.mkv"), "a sample")
+	// A featurette directory, which is supplementary wherever it appears.
+	writeFile(t, filepath.Join(films, "Featurettes", "about-the-film.mkv"), "a featurette")
+
+	lib := mustLibraryAt(t, repo, root, library.ShowsLibrary)
+	scanner := library.NewScanner(repo, newTestLogger())
+	result, err := scanner.ScanLibrary(ctx, lib)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	// FilesSeen is counted before ingest, so it is the number of files the walk
+	// decided to *keep*. Two videos is the episode and the feature; everything
+	// else here is a sample or a featurette.
+	//
+	// Asserting on entities instead would not test this: a sample that the walk
+	// keeps becomes an unplaceable file rather than a title, so the library looks
+	// the same while the sample is sitting in it - which is exactly how the review
+	// found samples in the local database.
+	if result.FilesSeen != 2 {
+		t.Errorf("FilesSeen = %d, want 2 (the episode and the feature): the walk kept a "+
+			"sample or a featurette. Notices=%v", result.FilesSeen, result.Notices)
+	}
+
+	entities, err := repo.ListEntitiesByLibrary(ctx, lib.ID)
+	if err != nil {
+		t.Fatalf("listing entities: %v", err)
+	}
+
+	var names []string
+	for _, entity := range entities {
+		names = append(names, entity.Name)
+	}
+	joined := strings.Join(names, "|")
+
+	if !strings.Contains(joined, "Extras") {
+		t.Errorf("the series called Extras is not in the library at all (entities %v): a "+
+			"directory name was treated as supplementary material even though it is also "+
+			"a series name", names)
+	}
+
+	// The samples must not have become films of their own.
+	for _, name := range names {
+		if strings.Contains(name, "sample") {
+			t.Errorf("a sample was scanned as a title: %q (entities %v)", name, names)
+		}
+	}
+	for _, name := range names {
+		if strings.Contains(strings.ToLower(name), "featurette") {
+			t.Errorf("a featurette was scanned as a title: %q (entities %v)", name, names)
+		}
+	}
+}

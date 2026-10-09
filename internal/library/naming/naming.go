@@ -47,6 +47,11 @@ var (
 	// tokens, which the noise list then failed to recognise, and left the second
 	// half in the title.
 	releaseHyphenRe = regexp.MustCompile(`\s+-\s+`)
+	// sampleFileRe matches a file the release marked as a sample. The name is the
+	// title with a word appended, so the test is on the token: "sample" separated
+	// from what precedes it by a separator, and either at the end of the name or in
+	// a form such as "sample-1".
+	sampleFileRe = regexp.MustCompile(`(?i)(?:^|[\s._-])samples?(?:[\s._-]|$)`)
 	// resolutionLikeRe matches a bare channel layout such as "7" left from "7.1".
 	resolutionLikeRe = regexp.MustCompile(`^\d$|^\d\.\d$`)
 	// trailingGroupRe matches a channel count with a release group attached, which
@@ -114,18 +119,75 @@ func IsVideoFile(path string) bool {
 	return VideoExtensions[strings.ToLower(filepath.Ext(path))]
 }
 
-// IsIgnored reports whether a path component should be skipped during a scan.
-// Hidden entries, sample folders and metadata sidecar directories are excluded.
+// supplementaryDirNames are directory names that hold material *about* a title
+// rather than the title itself, wherever they appear in the tree.
+var supplementaryDirNames = map[string]bool{
+	// "sample" and "samples" are directories too: a release often ships one beside
+	// the feature, and the files inside it are named for the title rather than
+	// "sample", so the file rule would not catch them.
+	"sample":  true,
+	"samples": true,
+	// The rest are material *about* a title.
+	"featurettes":       true,
+	"behind the scenes": true,
+	"bonus":             true,
+	"deleted scenes":    true,
+	"interviews":        true,
+	// "extras" is deliberately absent. It is a word an actual series has as a name
+	// - Ricky Gervais's - and skipping the directory dropped that series from the
+	// library with no warning (L-17 of the 2026-10-09 review).
+}
+
+// IsIgnored reports whether a directory component should be skipped during a scan.
+//
+// Supplementary directories are skipped at any depth, which is the common layout -
+// "Film (2019)/Extras/interview.mkv". The root itself is never judged, so a library
+// whose root *is* an Extras directory and which holds one series of that name is
+// still scanned; the scanner passes the root through this deliberately.
 func IsIgnored(name string) bool {
-	if strings.HasPrefix(name, ".") {
+	return isHidden(name) || supplementaryDirNames[strings.ToLower(name)]
+}
+
+// IsIgnoredFile reports whether a *file* should be skipped during a scan.
+//
+// This is a separate list from the directories, because the same word means
+// different things at the two levels and one list for both gets one of them wrong.
+// "Extras" is a name an actual series has - Ricky Gervais's - and skipping the
+// directory dropped it from the library silently. A file called "sample.mkv" is a
+// sample wherever it sits, and files named "Extras.mkv" are supplementary material
+// too, so that word still skips a file.
+//
+// A regular expression rather than a list, because samples are named for the title
+// they came from: "Dune.2021.2160p.sample.mkv" and "Dune-sample.mkv" are the same
+// thing, and the old whole-name test matched neither. They were left in the
+// library, which is L-17 of the 2026-10-09 review's other half.
+//
+// The cost of that is a title with "sample" as an ordinary word in it, which this
+// skips. Nothing in the name tells the two apart - "The Sample Maker" and "Dune
+// sample 1080p" have the same token in the same position - so the trade is made
+// deliberately: a release sample being left in the library is the more common
+// irritation, and the alternative signal, the file's size against the feature's, is
+// not available while walking a directory.
+func IsIgnoredFile(name string) bool {
+	if isHidden(name) {
 		return true
 	}
-	switch strings.ToLower(name) {
-	case "sample", "samples", "extras", "featurettes", "behind the scenes":
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	if sampleFileRe.MatchString(base) {
+		return true
+	}
+	switch strings.ToLower(base) {
+	case "extras", "featurette", "featurettes", "behind the scenes", "trailer", "trailers":
 		return true
 	default:
 		return false
 	}
+}
+
+// isHidden reports whether a name is a dotfile or dot-directory.
+func isHidden(name string) bool {
+	return strings.HasPrefix(name, ".") && name != "." && name != ".."
 }
 
 // EpisodeInfo is the result of parsing an episode file name or path.
