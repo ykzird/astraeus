@@ -48,9 +48,17 @@ type ClientCapability struct {
 	SupportsHDR bool `json:"supports_hdr"`
 	// AudioTrackIndex selects which audio stream to deliver, as the ffmpeg
 	// stream index reported in a probe's audio_tracks. Zero means the server's
-	// choice: the track the file marks default, or its first. A track that does
-	// not exist is not an error - the default is delivered and the reasons say
-	// so - because a missing track is not a reason to refuse the film.
+	// choice: the track the file marks default, or its first.
+	//
+	// A track that does not exist does not stop negotiation - the default is
+	// delivered and the Reasons say so - because a missing track is not a reason
+	// to refuse the film. That is this type's own tolerance and not the API's
+	// answer, which is 400 unknown_audio_track: by the time a request arrives the
+	// client has been told which indices exist, so an index the file does not
+	// have is a typo worth naming rather than something to quietly reinterpret.
+	// The two are consistent - the boundary refuses, and this fallback exists for
+	// callers that are not a request - but the comment used to read as though the
+	// API never refuses.
 	AudioTrackIndex int `json:"audio_track_index"`
 	// MaxAudioChannels is the most channels the client can decode. Chromium's
 	// media pipeline refuses a 5.1 AAC SourceBuffer, and browsers output stereo

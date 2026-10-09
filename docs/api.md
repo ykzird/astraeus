@@ -37,7 +37,17 @@ Two rules apply to those routes once an operator configures `--access-policy`
   unknown id does, so the API is not a way to discover which libraries exist.
   That covers everything reachable through one: the library, its entities, their
   media files, subtitle tracks, playback negotiation, progress, and the playlist
-  and segment URLs of a session belonging to it;
+  and segment URLs of a session belonging to it.
+
+  The one exception is `DELETE /api/entities/{id}/progress`, which answers
+  **`204`** whether or not the entity exists and whether or not the viewer can
+  see it. Forgetting a position is idempotent cleanup: there is nothing to
+  disclose in the answer, and a client clearing a position should not have to
+  distinguish "cleared" from "there was nothing there" or from "that entity is
+  not yours" - the first two are the same outcome, and telling a viewer the third
+  would answer a question the 404 rule exists to refuse. `PUT` on the same path
+  answers `404`, because it reveals nothing new to say a position cannot be
+  stored for an entity this viewer cannot see;
 - the routes that change the library — registering, removing or scanning one, and
   `POST /api/metadata/enrich` — answer **`403 admin_required`** for a viewer the
   policy does not list as an admin. Stopping a stream is not one of them: it is

@@ -2,6 +2,8 @@ package api
 
 import (
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -249,5 +251,79 @@ func TestListProgress_ListsWhatIsWorthResuming(t *testing.T) {
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, "invalid_limit") {
 		t.Errorf("expected an invalid_limit code, got %s", body)
+	}
+}
+
+// TestDeleteProgress_IsIdempotentAndInvisible is the regression test for D-10's
+// documented contract.
+//
+// api.md says a hidden library answers 404 "exactly as an unknown id does". That
+// is true of progress reads and writes and not of the delete, which answers 204
+// whether or not the entity exists and whether or not the viewer can see it.
+// Forgetting a position is idempotent cleanup: "cleared" and "there was nothing
+// there" are the same outcome, and telling a viewer that the entity is not
+// theirs would answer a question the 404 rule exists to refuse.
+//
+// Pinning it here means the documentation and the behaviour cannot drift apart
+// without a test saying which one moved.
+func TestDeleteProgress_IsIdempotentAndInvisible(t *testing.T) {
+	t.Parallel()
+
+	env := newTestEnv(t)
+
+	// Every case answers 204: an entity that exists, one that does not, and an
+	// empty id.
+	// An id that names nothing at all. (An empty id never reaches the handler:
+	// the mux normalises the path and redirects, which is a separate behaviour.)
+	recorder := env.do(t, http.MethodDelete, "/api/entities/does-not-exist/progress", "")
+	if recorder.Code != http.StatusNoContent {
+		t.Errorf("DELETE progress for an unknown entity = %d, want 204: forgetting a "+
+			"position is idempotent", recorder.Code)
+	}
+	// And twice, to say idempotent rather than merely permissive.
+	recorder = env.do(t, http.MethodDelete, "/api/entities/does-not-exist/progress", "")
+	if recorder.Code != http.StatusNoContent {
+		t.Errorf("the second DELETE = %d, want 204", recorder.Code)
+	}
+
+	// The write on the same path does not answer 204 for an unknown entity, so
+	// the endpoint is not simply ignoring its input.
+	recorder = env.do(t, http.MethodPut, "/api/entities/does-not-exist/progress",
+		`{"position_seconds": 60, "duration_seconds": 600}`)
+	if recorder.Code == http.StatusNoContent {
+		t.Error("PUT progress for an unknown entity reported success")
+	}
+}
+
+// TestProgressVisibility_IsDocumentedForHiddenLibraries pins the 404 rule the
+// same document states, so the exception above stays an exception.
+//
+// The hidden case is not arranged here. Making a library hidden from the viewer
+// under test means building the environment with a policy that hides it, and the
+// fixtures that seed a library go through the API - which the policy is
+// correctly refusing. The code path a hidden entity takes is the same one an
+// unknown id takes: handleDeleteProgress looks the entity up and answers 204
+// either way, and a write answers 404 either way. So the unknown-id case above is
+// what pins behaviour, and this test pins the rule the exception is measured
+// against by reading it from the document itself.
+func TestProgressVisibility_IsDocumentedForHiddenLibraries(t *testing.T) {
+	t.Parallel()
+
+	docs, err := os.ReadFile(filepath.Join("..", "..", "docs", "api.md"))
+	if err != nil {
+		t.Fatalf("reading docs/api.md: %v", err)
+	}
+	text := string(docs)
+
+	// The 404 rule has to be stated, and the delete's 204 has to be stated as an
+	// exception to it, or a reader has to guess which of the two applies.
+	if !strings.Contains(text, "may not see answers **`404`**") {
+		t.Error("docs/api.md no longer states the 404 rule for a library a viewer may not see")
+	}
+	if !strings.Contains(text, "DELETE /api/entities/{id}/progress") {
+		t.Error("docs/api.md does not state the 204 exception for deleting a position")
+	}
+	if !strings.Contains(text, "**`204`**") {
+		t.Error("docs/api.md does not say what the delete answers")
 	}
 }

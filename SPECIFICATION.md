@@ -126,7 +126,7 @@ The system will track the following key metrics to ensure performance excellence
 
 ### 7.0 Response hardening
 
-Every response carries `X-Content-Type-Options`, `Referrer-Policy`,
+Every response the API produces carries `X-Content-Type-Options`, `Referrer-Policy`,
 `X-Frame-Options`, `Cross-Origin-Resource-Policy` and `Permissions-Policy`;
 documents also carry a content security policy with no `unsafe-inline` and no
 `unsafe-eval`, and `img-src 'self'` so artwork can only come from this server's

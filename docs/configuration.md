@@ -86,10 +86,20 @@ checks.
 
 ## Security headers
 
-Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy:
-no-referrer`, `X-Frame-Options: DENY`, `Cross-Origin-Resource-Policy:
-same-origin` and a `Permissions-Policy` that refuses the features this app has no
-use for. Documents additionally carry a content security policy:
+Every response the API produces carries `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`,
+`Cross-Origin-Resource-Policy: same-origin` and a `Permissions-Policy` that
+refuses the features this app has no use for.
+
+The two outermost checks answer before those headers are applied, because they
+exist to refuse a request before it reaches any of this: the Host allowlist
+(`421`) and the access gate (`401`/`403`). A refusal therefore carries only its
+own status, a JSON body and, for an authentication failure, `WWW-Authenticate`.
+That is deliberate rather than an oversight - the point of both checks is to
+answer as early as possible - and a refusal is also absent from the request log,
+so `astraeus_http_requests_total` does not count it. The gate's own counters
+(`astraeus_auth_granted_total`, `astraeus_auth_denied_total{reason}`) are what
+record it instead. Documents additionally carry a content security policy:
 
 ```
 default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';
@@ -176,7 +186,10 @@ mode without a token, refuses to start.
 so liveness probes keep working. `/metrics` is **not** exempt: point Prometheus
 at it with a token or let it through the proxy.
 
-Identity is recorded on every request log line, so the gate is auditable, and
+Identity is recorded on every request log line the API serves, so the gate is
+auditable for everything it admits - a request it refuses is counted by
+`astraeus_auth_denied_total{reason}` instead, because the gate answers before
+the log is reached.
 `astraeus_auth_granted_total` / `astraeus_auth_denied_total{reason}` show what
 the gate is doing.
 
