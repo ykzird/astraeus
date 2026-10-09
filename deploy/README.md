@@ -59,24 +59,28 @@ The image's default command already sets every writable path inside one volume:
 | `/media` | your library, mounted read-only |
 | `/app/web` | the web UI the binary serves |
 
-A realistic run, with the gate on and the library read-only:
+A realistic run, with the library read-only:
 
 ```sh
 docker run -d --name astraeus \
   -p 127.0.0.1:8642:8642 \
-  -e ASTRAEUS_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -v /srv/media:/media:ro \
   -v astraeus-data:/data \
   astraeus-media:0.18.0 \
   serve --addr 0.0.0.0:8642 --web-dir /app/web \
         --db /data/astraeus.db --stream-root /data/streams \
-        --image-cache /data/images --subtitle-cache /data/subtitles \
-        --auth-mode token
+        --image-cache /data/images --subtitle-cache /data/subtitles
 ```
 
 Publishing on `127.0.0.1` and putting a reverse proxy in front is the intended
-shape; `-p 8642:8642` publishes it to every interface, which without
-`--auth-mode` hands anyone who can reach the port the whole library.
+shape, and it is what makes the port safe: `-p 8642:8642` publishes it to every
+interface and hands anyone who can reach it the whole library.
+
+**Do not add `--auth-mode token` to that command and expect the web UI to work.**
+A browser cannot send an `Authorization: Bearer` header on a navigation, so every
+request the UI makes is refused with `401`. Token mode is for API clients and
+scripts. For viewers, terminate TLS at a proxy and use `--auth-mode proxy` - see
+[`tls/README.md`](tls/README.md).
 [`tls/README.md`](tls/README.md) is the runbook for the proxy side: terminating
 TLS, sending `Strict-Transport-Security`, and giving each viewer an identity the
 gate can believe.
@@ -150,11 +154,11 @@ sudo cp -r README.md SPECIFICATION.md TODO.md CONTEXT.md CONTRIBUTING.md \
   /usr/local/share/doc/astraeus/
 sudo chmod -R a+rX /usr/local/share/doc/astraeus
 
-# 3. The token the unit reads, and the unit itself.
+# 3. The environment file the unit reads (optional: TMDB_API_KEY goes here), and
+#    the unit itself. The unit installs without a token in it on purpose - see
+#    the note below the block.
 sudo install -d -m 0755 /etc/astraeus
-printf 'ASTRAEUS_AUTH_TOKEN=%s\n' "$(openssl rand -hex 32)" \
-  | sudo tee /etc/astraeus/astraeus.env >/dev/null
-sudo chmod 0600 /etc/astraeus/astraeus.env
+sudo install -m 0600 /dev/null /etc/astraeus/astraeus.env
 sudo install -m 0644 deploy/astraeus.service /etc/systemd/system/astraeus.service
 
 # 4. Check what you are about to start, then start it.
@@ -168,10 +172,18 @@ systemctl status astraeus
 for i in $(seq 1 30); do curl -sf localhost:8642/api/health && break; sleep 1; done
 ```
 
-The unit binds **127.0.0.1:8642** and enables `--auth-mode token`, so nothing is
-reachable from off-host until you put a TLS-terminating reverse proxy in front of
-it. `TMDB_API_KEY` goes in the same environment file if you want real metadata
-instead of the synthetic fallback.
+The unit binds **127.0.0.1:8642** and leaves `--auth-mode` at its default `none`,
+so nothing is reachable from off-host until you put a TLS-terminating reverse
+proxy in front of it - and the UI works when you browse to it on the host or
+through that proxy. `TMDB_API_KEY` goes in the environment file if you want real
+metadata instead of the synthetic fallback.
+
+The unit deliberately does **not** set `--auth-mode token`, which an earlier
+version of this runbook did. A browser cannot send an `Authorization: Bearer`
+header on a navigation and `web/app.js` has no way to set one, so that install
+served a UI whose every request was refused with `401` - the runbook presented a
+broken install as the finished one. Token mode remains for API clients and
+scripts; a viewers-facing install uses `proxy` behind the TLS terminator.
 
 ### What the unit hardens, and what has been observed
 

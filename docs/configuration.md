@@ -159,7 +159,9 @@ rather than a built-in user database. `--auth-mode` selects the policy:
 ./astraeus-server serve --auth-mode proxy --auth-provider cloudflare \
   --trusted-proxy 127.0.0.1/32,::1/128
 
-# For API clients and scripts
+# For API clients and scripts. This leaves the web UI unusable: a browser cannot
+# send an Authorization header on a navigation, so every request it makes is
+# refused with 401. Use proxy mode for a UI.
 ASTRAEUS_AUTH_TOKEN=$(openssl rand -hex 32) ./astraeus-server serve --auth-mode token
 ```
 

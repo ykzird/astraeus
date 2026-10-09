@@ -131,12 +131,19 @@ CDP_PORT=9410 node real-media-verify.mjs    http://127.0.0.1:8910 <realFilmId> 1
 
 `player-chrome-verify.mjs` is the broadest single check: up to 32 assertions
 covering the overlay, icons, fullscreen, audio, quality switching, subtitle
-persistence and auto-hide. **Its score depends on the content**, so compare a run
-against the same fixture: it was **28/28** against the 17 GB film in the round-2
-verification, and it is **20/22** on the bundled three-second demo clips, where
-the two auto-hide checks fail because playback ends during the wait. 20/22 is also
-what the pre-change build scores there, so it is that fixture's baseline rather
-than a regression (§8).
+persistence and auto-hide. **Its score depends on the content, so a number from
+this script means nothing without the fixture it came from.** Three fixtures have
+been used, and each has its own baseline:
+
+| Fixture | Score | Baseline | What the failures are |
+| --- | --- | --- | --- |
+| The 17 GB film (round 2) | **28/28** | 28/28 | none |
+| The bundled three-second demo clips, direct play | **20/22** | 20/22 | the two auto-hide checks, because playback ends during the wait |
+| The demo's HEVC film, reached through a transcode | **22/28** | 22/28 | the six checks after its 600-second seek, which a four-second asset cannot satisfy (§8) |
+
+Quote the row, not the number. Reading 22/28 as a regression against 28/28, or
+20/22 as one against either, is how one baseline's number becomes another's
+problem.
 
 Dynamic range has its own checks, and they are worth re-running after any change
 to negotiation or to the ffmpeg argument builder:
@@ -914,8 +921,9 @@ it attaches a `<track>` with **zero** playback requests, and the active cue text
 on screen is the caption), and `burn-verify.mjs` is **10/10** on the same entity
 against a server started with `--tesseract-bin /nonexistent/tesseract`, so the
 burn fallback still works. `subtitle-verify.mjs` is **10/10** (text tracks
-unregressed) and `player-chrome-verify.mjs` is 20/21 on the demo clips, its
-documented auto-hide baseline for three-second fixtures.
+unregressed) and `player-chrome-verify.mjs` is **20/22** on the demo clips, its
+documented auto-hide baseline for three-second fixtures. (An earlier draft of this
+line said 20/21, which matches no run and no fixture.)
 
 The fixture side had to grow: `internal/testfixtures/pgs` gained a 5x7 bitmap
 font and a `-text` mode in `scripts/pgsgen`, and its run-length encoder had a
@@ -1344,9 +1352,10 @@ surface. What is left:
   no real Blu-ray or DVD sample exists on this host, so what was exercised is
   ffmpeg's PGS decoder on a synthetic rectangle — not a real Blu-ray subtitle with
   its palette, cropping and partial object updates. VobSub shares the track
-  classification and the same overlay path but has never been decoded here at
-  all; round 17 showed a VobSub sample can at least be synthesised (§7), which is
-  a fixture and not yet a decoder. `scale2ref`/`overlay` has only been run with
+  classification and the same overlay path, and since round 18 it has a decoder of
+  its own (`vobsub.go`); what it does **not** have is a real DVD sample, so that
+  decoder has only been exercised against synthesised fixtures - the same gap as
+  PGS, for the same reason. `scale2ref`/`overlay` has only been run with
   libx264: a hardware encoder's
   upload filter has never been combined with the burn graph, and a ladder is
   refused for a burn rather than composited per rung. A real PGS sample would be

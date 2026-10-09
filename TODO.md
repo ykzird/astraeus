@@ -155,7 +155,7 @@ Status as of the current build. Evidence for each claim is the test suite
 - [ ] Dolby Vision profile 5 *correct* conversion (IPTPQc2 needs a Dolby Vision
       tone mapper; the software chain produces approximate colour and says so)
 
-## Phase 3: API & Security — API and hardening complete; rate limiting and tracing are not
+## Phase 3: API & Security — complete
 
 - [x] Capability manifests validated: an unknown codec name is refused with `400`
       before it can reach ffmpeg, and a codec this host cannot encode is a `409` with
@@ -218,8 +218,11 @@ Status as of the current build. Evidence for each claim is the test suite
 - [x] Served by the binary from `--web-dir`, same origin as the API
 - [x] Direct-play playback in the browser: real `<video>`, working seek, and
       honest reporting of the negotiation decision
-- [x] Segmented playback in Chromium and Firefox via a locally vendored hls.js
-      (1.7.3, lazy-loaded), verified in a real browser
+- [x] Segmented playback via a locally vendored hls.js (1.7.3, lazy-loaded),
+      verified in a real browser — **Chromium**. Firefox is not installed on this
+      host and the path has never been exercised there, so the browser support is
+      untested rather than confirmed; see `docs/handoff.md`. The native-HLS
+      (Safari) branch has likewise never been observed firing.
 - [x] Subtitle tracks rendered and selectable in the player, defaulting to Off
       unless the server marks a default; an image track the server can read is
       offered as an ordinary track (a `<track>`, no re-encode), and one only a
@@ -383,7 +386,8 @@ Status as of the current build. Evidence for each claim is the test suite
   manifest, and the cap is a constant rather than a flag.
 - A capability manifest that omits `max_audio_channels` or `max_bit_depth` is
   treated as unrestricted, which can hand a browser a stream it cannot decode
-  (see [`docs/configuration.md`](docs/configuration.md)). The failure surfaces as a stalled player rather than a
+  (see [`docs/playback.md`](docs/playback.md), which documents the manifest and
+  the built-in profile). The failure surfaces as a stalled player rather than a
   clear error, so a client that guesses wrong has nothing to go on.
 - Artwork is not scoped per viewer: `/api/images` is a shared cache keyed by the
   upstream path, so a poster can be fetched by anyone who knows its file name,

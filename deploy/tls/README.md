@@ -91,15 +91,17 @@ handles issuance and renewal and you can skip this step entirely.
 
 ### 3. Point the server at the proxy
 
-The unit ships with `--auth-mode token`, which is the right default for an
-install that is not yet behind a proxy. Behind one, switch it to `proxy` and
-name the header and the address:
+The unit ships without `--auth-mode`, which is `none`. That is enough on a
+trusted network and not enough once this proxy is the only way in, so the
+installation below switches it. (It used to ship with `--auth-mode token`, which
+was wrong twice over: it neither gives the proxy an identity to forward nor lets a
+browser through at all.) Switch to `proxy` and name the header and the address:
 
 ```sh
 sudo systemctl edit astraeus        # or edit the unit directly
 ```
 
-Replace the `--auth-mode token` line in the `ExecStart` command with:
+Add to the `ExecStart` command:
 
 ```
     --auth-mode proxy \
@@ -123,8 +125,9 @@ sudo systemctl restart astraeus
 journalctl -u astraeus -n5 | grep 'access gate enabled'   # mode=proxy trusted_proxies=2
 ```
 
-`ASTRAEUS_AUTH_TOKEN` in `/etc/astraeus/astraeus.env` is now unused by the unit;
-leave it or remove it, but do not leave `--auth-mode token` beside these flags.
+Do not add `--auth-mode token` beside these flags: a browser cannot send a bearer
+token, so the UI would be refused with `401` and the identity the proxy forwards
+would be ignored.
 
 ### 4. Run Caddy
 

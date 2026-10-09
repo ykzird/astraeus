@@ -276,3 +276,64 @@ func TestServeFlagsAreDocumented(t *testing.T) {
 			"the reference does not cover the binary:\n  %s", strings.Join(missing, "\n  "))
 	}
 }
+
+// TestShippedUnitDoesNotUseTokenMode is the regression test for DD-13.
+//
+// The systemd unit shipped with `--auth-mode token`, and deploy/README.md
+// presented that install as the finished one. No browser can satisfy token mode:
+// the gate wants an `Authorization: Bearer` header, a navigation cannot send one,
+// and web/app.js has no way to set one. So the documented install served a UI
+// whose every request was refused with 401 - the runbook described a working
+// server and delivered a broken page.
+//
+// The mode is a string in a unit file, which is exactly the kind of thing that
+// gets edited back. This reads the unit that ships and the runbook that installs
+// it, and refuses token mode in the unit and a token step in the runbook.
+func TestShippedUnitDoesNotUseTokenMode(t *testing.T) {
+	t.Parallel()
+
+	unit, err := os.ReadFile(filepath.Join("..", "..", "deploy", "astraeus.service"))
+	if err != nil {
+		t.Fatalf("reading the shipped unit: %v", err)
+	}
+
+	// A commented mention is fine - the unit explains why it does not use token
+	// mode. What must not appear is the flag in the ExecStart command.
+	var execStart strings.Builder
+	for _, line := range strings.Split(string(unit), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		execStart.WriteString(trimmed)
+		execStart.WriteString(" ")
+	}
+	if strings.Contains(execStart.String(), "--auth-mode token") {
+		t.Error("the shipped unit runs with --auth-mode token, which leaves the web UI " +
+			"unusable: a browser cannot send a bearer token, so every request is refused " +
+			"with 401. Use proxy mode behind a TLS terminator, or leave the default")
+	}
+
+	// And the runbook must not tell an operator to create the token the unit
+	// would read, because that is the step that made the install look finished.
+	runbook, err := os.ReadFile(filepath.Join("..", "..", "deploy", "README.md"))
+	if err != nil {
+		t.Fatalf("reading the deployment runbook: %v", err)
+	}
+	for _, line := range strings.Split(string(runbook), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ">") {
+			continue
+		}
+		// Any step that writes the token into the environment file, however it is
+		// spelled - the runbook used a printf into tee, and could use install or
+		// an editor next.
+		writesToken := strings.Contains(trimmed, "ASTRAEUS_AUTH_TOKEN") &&
+			(strings.Contains(trimmed, "astraeus.env") || strings.Contains(trimmed, "tee"))
+		if writesToken {
+			t.Error("the deployment runbook tells an operator to write ASTRAEUS_AUTH_TOKEN, " +
+				"which is the token step that paired with the unit's token mode. The unit " +
+				"does not read it, and creating it does not secure anything on its own")
+		}
+	}
+}
