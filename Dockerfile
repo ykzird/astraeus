@@ -8,7 +8,7 @@
 # The builder runs on the *build* platform and cross-compiles for the target
 # one, so a multi-arch build needs no emulation: the Go toolchain is native and
 # only the runtime base image differs per architecture.
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 
 # The official image pins GOTOOLCHAIN=local, so it uses the Go it ships and never
 # reads go.mod's `toolchain` line. That is how a lagging image silently builds a
