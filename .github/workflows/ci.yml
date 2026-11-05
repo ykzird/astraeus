@@ -171,7 +171,7 @@ jobs:
       # `--results=verified,unknown` reports credentials it could prove are live
       # and ones it could not check, which is the honest pair; `unverified` is
       # left out because it is mostly entropy false positives.
-      - uses: trufflesecurity/trufflehog@31ce31ee1abbcc7dc8eee5764c17121c3044c8b2 # v3.99.7
+      - uses: trufflesecurity/trufflehog@ea68ca03c865c5f324e86e849ced20ed3cf9dbbb # v3.99.8
         with:
           # The action passes --no-update itself, and repeating a flag is an error.
           extra_args: --results=verified,unknown
