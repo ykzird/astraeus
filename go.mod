@@ -15,7 +15,7 @@ toolchain go1.26.9
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jmoiron/sqlx v1.4.0
-	modernc.org/sqlite v1.61.0
+	modernc.org/sqlite v1.61.1
 )
 
 require (
